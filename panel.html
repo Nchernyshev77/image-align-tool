@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Image Grid Aligner – панель</title>
+  <title>Image Grid Aligner – panel</title>
 
   <script src="https://miro.com/app/static/sdk/v2/miro.js"></script>
   <script src="app.js" defer></script>
@@ -17,17 +17,25 @@
     body {
       margin: 16px;
       font-size: 14px;
+      color: #111827;
     }
 
     h1 {
       font-size: 18px;
-      margin: 0 0 12px;
+      margin: 0 0 4px;
+    }
+
+    .subtitle {
+      font-size: 12px;
+      opacity: 0.7;
+      margin-bottom: 12px;
     }
 
     .section-title {
       font-weight: 600;
       margin-top: 12px;
       margin-bottom: 4px;
+      font-size: 13px;
     }
 
     .field {
@@ -42,36 +50,35 @@
       opacity: 0.8;
     }
 
-    input[type="number"] {
+    input[type="number"],
+    select {
       width: 100%;
       box-sizing: border-box;
       padding: 6px 8px;
-      border-radius: 6px;
-      border: 1px solid rgba(0, 0, 0, 0.15);
+      border-radius: 7px;
+      border: 1px solid rgba(15, 23, 42, 0.16);
       font-size: 13px;
-      background: rgba(255, 255, 255, 0.9);
+      background: rgba(255, 255, 255, 0.95);
     }
 
-    .radio-group {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      margin-bottom: 8px;
-    }
-
-    .radio-group label {
+    .checkbox-row {
       display: flex;
       align-items: center;
-      gap: 4px;
-      font-size: 13px;
-      opacity: 1;
+      gap: 6px;
+      margin-top: 2px;
+      margin-bottom: 6px;
+      font-size: 12px;
+    }
+
+    .checkbox-row input[type="checkbox"] {
+      margin: 0;
     }
 
     button {
       margin-top: 12px;
       width: 100%;
       padding: 8px 10px;
-      border-radius: 8px;
+      border-radius: 9px;
       border: none;
       font-weight: 600;
       font-size: 14px;
@@ -95,27 +102,22 @@
 </head>
 <body>
   <h1>Image Grid Aligner</h1>
+  <div class="subtitle">Arrange selected images into a neat grid.</div>
 
   <form id="align-form">
-    <div class="section-title">Размер изображений</div>
-    <div class="radio-group">
-      <label>
-        <input type="radio" name="sizeMode" value="none" checked />
-        Не менять размер
-      </label>
-      <label>
-        <input type="radio" name="sizeMode" value="width" />
-        Выравнять по ширине
-      </label>
-      <label>
-        <input type="radio" name="sizeMode" value="height" />
-        Выравнять по высоте
-      </label>
+    <div class="section-title">Size</div>
+    <div class="field">
+      <label for="sizeMode">Resize images</label>
+      <select id="sizeMode" name="sizeMode">
+        <option value="none" selected>Don't resize</option>
+        <option value="width">Match width</option>
+        <option value="height">Match height</option>
+      </select>
     </div>
 
-    <div class="section-title">Сетка</div>
+    <div class="section-title">Grid</div>
     <div class="field">
-      <label for="imagesPerRow">Картинок в строке</label>
+      <label for="imagesPerRow">Images per row</label>
       <input
         id="imagesPerRow"
         name="imagesPerRow"
@@ -128,7 +130,7 @@
     </div>
 
     <div class="field">
-      <label for="horizontalGap">Расстояние между картинками по горизонтали (px)</label>
+      <label for="horizontalGap">Horizontal gap (px)</label>
       <input
         id="horizontalGap"
         name="horizontalGap"
@@ -139,7 +141,7 @@
     </div>
 
     <div class="field">
-      <label for="verticalGap">Расстояние между строками (px)</label>
+      <label for="verticalGap">Vertical gap (px)</label>
       <input
         id="verticalGap"
         name="verticalGap"
@@ -149,11 +151,29 @@
       />
     </div>
 
-    <button type="submit" id="align-button">Применить к выделенным</button>
+    <div class="field">
+      <label for="startCorner">Start corner</label>
+      <select id="startCorner" name="startCorner">
+        <option value="top-left">Top left</option>
+        <option value="top-right">Top right</option>
+        <option value="bottom-left">Bottom left</option>
+        <option value="bottom-right">Bottom right</option>
+      </select>
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="sortByNumber" checked />
+      <label for="sortByNumber">
+        Sort by number in image name (if present)
+      </label>
+    </div>
+
+    <button type="submit" id="align-button">Align selection</button>
 
     <p class="hint">
-      1. На доске выдели нужные изображения (Shift + клик).<br />
-      2. Нажми кнопку выше — изображения выстроятся в сетку.
+      Select images on the board, then click <b>Align selection</b>. Images will
+      be ordered by number in their name (if any) and placed into a grid
+      starting from the chosen corner.
     </p>
   </form>
 </body>
