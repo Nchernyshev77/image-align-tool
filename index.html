@@ -4,24 +4,13 @@
   <meta charset="UTF-8" />
   <title>Image Grid Aligner – entry</title>
 
-  <!-- Подключаем Miro Web SDK v2 -->
+  <!-- Подключаем Web SDK v2 -->
   <script src="https://miro.com/app/static/sdk/v2/miro.js"></script>
 
-  <script>
-    // Когда приложение загружено внутри Miro
-    miro.onReady(() => {
-      // Регистрируем обработчик клика по иконке приложения на тулбаре
-      miro.board.ui.on('icon:click', async () => {
-        // Открываем панель с нашим UI
-        await miro.board.ui.openPanel({
-          url: 'panel.html',
-        });
-      });
-    });
-  </script>
+  <!-- Логика инициализации приложения -->
+  <script src="index.js" defer></script>
 </head>
 <body>
-  <!-- Это тело почти не важно, внутри Miro оно не видно -->
-  <p>Image Grid Aligner app entry</p>
+  <!-- Тело здесь не важно, страница работает как "голова" приложения -->
 </body>
 </html>
