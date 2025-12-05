@@ -31,7 +31,7 @@ function extractIndexFromItem(item) {
 }
 
 /**
- * Fallback compare: by geometry (top -> bottom, left -> right).
+ * Compare by geometry (top -> bottom, left -> right).
  */
 function compareByGeometry(a, b) {
   const dy = a.y - b.y;
@@ -39,46 +39,6 @@ function compareByGeometry(a, b) {
     return dy;
   }
   return a.x - b.x;
-}
-
-/**
- * Sort images either by number (if present) or by geometry.
- */
-function sortImages(images, sortByNumber) {
-  const withMeta = images.map((item) => {
-    const index = extractIndexFromItem(item);
-    return { item, index };
-  });
-
-  const anyIndex = withMeta.some((m) => m.index !== null);
-
-  // Debug log — можно посмотреть в консоли порядок и индексы
-  console.groupCollapsed("Image Grid Aligner – parsed indices");
-  withMeta.forEach((m) => {
-    console.log(m.item.title || m.item.alt || m.item.id, "->", m.index);
-  });
-  console.groupEnd();
-
-  if (sortByNumber && anyIndex) {
-    withMeta.sort((a, b) => {
-      const ai = a.index;
-      const bi = b.index;
-
-      if (ai !== null && bi !== null) {
-        if (ai !== bi) return ai - bi;
-        // если числа равны, fallback к геометрии
-        return compareByGeometry(a.item, b.item);
-      }
-
-      if (ai !== null) return -1; // с номером раньше без номера
-      if (bi !== null) return 1;
-      return compareByGeometry(a.item, b.item);
-    });
-  } else {
-    withMeta.sort((a, b) => compareByGeometry(a.item, b.item));
-  }
-
-  return withMeta.map((m) => m.item);
 }
 
 /**
@@ -138,10 +98,38 @@ async function onAlignSubmit(event) {
       return;
     }
 
-    // 1. Sort images (by number if possible, otherwise by geometry)
-    images = sortImages(images, sortByNumber);
+    // ---------- 1. Стабильная сортировка ----------
 
-    // 2. Resize images if needed
+    let sortedImages;
+
+    if (sortByNumber) {
+      // Парсим номера У ВСЕХ изображений
+      const withIndex = images.map((img) => ({
+        img,
+        index: extractIndexFromItem(img),
+      }));
+
+      const someMissing = withIndex.some((m) => m.index === null);
+
+      if (someMissing) {
+        await board.notifications.showError(
+          "Some selected images do not contain a number in their name. Disable “Sort by number” or rename images."
+        );
+        return;
+      }
+
+      // Чистая сортировка только по числам
+      withIndex.sort((a, b) => a.index - b.index);
+      sortedImages = withIndex.map((m) => m.img);
+    } else {
+      // Без сортировки по номеру — просто геометрия
+      sortedImages = [...images].sort(compareByGeometry);
+    }
+
+    images = sortedImages;
+
+    // ---------- 2. Ресайз, если нужно ----------
+
     if (sizeMode === "width") {
       const targetWidth = Math.min(...images.map((img) => img.width));
       for (const img of images) {
@@ -163,7 +151,8 @@ async function onAlignSubmit(event) {
     const maxWidth = Math.max(...widths);
     const maxHeight = Math.max(...heights);
 
-    // 3. Текущий bounding box выделения
+    // ---------- 3. Текущий bounding box ----------
+
     const bounds = images.map((img) => {
       return {
         item: img,
@@ -179,7 +168,8 @@ async function onAlignSubmit(event) {
     const maxRight = Math.max(...bounds.map((b) => b.right));
     const maxBottom = Math.max(...bounds.map((b) => b.bottom));
 
-    // 4. Геометрия сетки
+    // ---------- 4. Геометрия сетки ----------
+
     const total = images.length;
     const cols = Math.max(1, imagesPerRow);
     const rows = Math.ceil(total / cols);
@@ -193,7 +183,7 @@ async function onAlignSubmit(event) {
     let originLeft;
     let originTop;
 
-    // куда «прилипает» сетка относительно старого bounding box
+    // Куда "прилипает" сетка относительно старого bounding box
     if (startCorner.startsWith("top")) {
       originTop = minTop;
     } else {
@@ -206,7 +196,8 @@ async function onAlignSubmit(event) {
       originLeft = maxRight - gridWidth;
     }
 
-    // 5. Раскладываем по сетке
+    // ---------- 5. Раскладываем по сетке ----------
+
     images.forEach((img, index) => {
       // базовые row/col для режима top-left
       let row = Math.floor(index / cols); // 0..rows-1 сверху вниз
@@ -215,7 +206,7 @@ async function onAlignSubmit(event) {
       // модифицируем row/col в зависимости от угла
       switch (startCorner) {
         case "top-left":
-          // ничего
+          // как есть
           break;
         case "top-right":
           col = cols - 1 - col;
