@@ -77,24 +77,20 @@ async function onAlignSubmit(event) {
     const selection = await board.getSelection();
     let images = selection.filter((item) => item.type === "image");
 
+    // Если нет картинок — просто выходим
     if (images.length === 0) {
-      await board.notifications.showInfo("Select at least one image.");
+      console.warn("Image Grid Aligner: no images selected");
       return;
     }
 
-    if (imagesPerRow < 1) {
-      await board.notifications.showError(
-        "Images per row must be greater than 0."
-      );
-      return;
-    }
+    // Если кривое значение — просто приводим к 1
+    const cols = Math.max(1, imagesPerRow);
 
     // ---------- 1. Стабильная сортировка ----------
 
     let sortedImages;
 
     if (sortByNumber) {
-      // Парсим номера у всех изображений
       const withIndex = images.map((img) => ({
         img,
         index: extractIndexFromItem(img),
@@ -103,17 +99,15 @@ async function onAlignSubmit(event) {
       const someMissing = withIndex.some((m) => m.index === null);
 
       if (someMissing) {
-        await board.notifications.showError(
-          "Some images have no number. Rename or disable sorting."
+        console.warn(
+          "Image Grid Aligner: some images have no number, sorting cancelled"
         );
         return;
       }
 
-      // Чистая сортировка только по числам
       withIndex.sort((a, b) => a.index - b.index);
       sortedImages = withIndex.map((m) => m.img);
     } else {
-      // Без сортировки по номеру — просто геометрия
       sortedImages = [...images].sort(compareByGeometry);
     }
 
@@ -162,7 +156,6 @@ async function onAlignSubmit(event) {
     // ---------- 4. Геометрия сетки ----------
 
     const total = images.length;
-    const cols = Math.max(1, imagesPerRow);
     const rows = Math.ceil(total / cols);
 
     const cellWidth = maxWidth + horizontalGap;
@@ -219,14 +212,12 @@ async function onAlignSubmit(event) {
 
     await Promise.all(images.map((img) => img.sync()));
 
-    await board.notifications.showInfo(
-      `Aligned ${images.length} image${images.length === 1 ? "" : "s"}.`
+    console.log(
+      `Image Grid Aligner: aligned ${images.length} image(s), corner=${startCorner}`
     );
   } catch (error) {
-    console.error(error);
-    await board.notifications.showError(
-      "Aligning images failed. See console."
-    );
+    console.error("Image Grid Aligner: error while aligning images", error);
+    // здесь уже НЕ вызываем board.notifications, чтобы не ловить лимиты по длине
   }
 }
 
