@@ -4,37 +4,45 @@
 const { board } = window.miro;
 
 /**
- * Extracts the first integer number from an image title.
- * Supports any number of leading zeros: 1, 01, 0003, 10, 011, etc.
- * Returns number or null if no digits found.
+ * Extracts the trailing integer number from an image name.
+ * - Looks at the end of the base name (without extension).
+ * - Supports "1", "01", "0003", "10", "011", etc.
+ * - Works with or without "_" before the number: "img_01", "img01".
+ * Returns number or null if no trailing digits.
  */
-function extractIndexFromTitle(title) {
-  if (!title) return null;
-  const match = String(title).match(/\d+/);
+function extractIndexFromItem(item) {
+  // In Web SDK v2, images can have a `title` property if set programmatically. 
+  const raw = item.title || item.alt || "";
+  if (!raw) return null;
+
+  // Remove file extension if present
+  const base = String(raw).replace(/\.[^/.]+$/, "");
+
+  // Take digits only at the very end
+  const match = base.match(/(\d+)\s*$/);
   if (!match) return null;
-  return Number.parseInt(match[0], 10);
+
+  return Number.parseInt(match[1], 10);
 }
 
 /**
- * Compare function for geometric ordering (top -> bottom, left -> right).
+ * Fallback compare: by geometry (top -> bottom, left -> right).
  */
 function compareByGeometry(a, b) {
   const dy = a.y - b.y;
-  // если по вертикали сильно различаются — сравниваем по Y
   if (Math.abs(dy) > Math.min(a.height, b.height) / 2) {
     return dy;
   }
-  // иначе считаем, что в одной строке, и сравниваем по X
   return a.x - b.x;
 }
 
 /**
- * Sort images either by number in title (if present) or by geometry.
+ * Sort images either by number at end of name (if present) or by geometry.
  */
 function sortImages(images, sortByNumber) {
   const withMeta = images.map((item) => ({
     item,
-    index: extractIndexFromTitle(item.title),
+    index: extractIndexFromItem(item),
   }));
 
   const anyIndex = withMeta.some((m) => m.index !== null);
@@ -46,11 +54,11 @@ function sortImages(images, sortByNumber) {
 
       if (ai !== null && bi !== null) {
         if (ai !== bi) return ai - bi;
-        // если числа равны, fallback к геометрии
+        // if numbers equal, fallback to geometry
         return compareByGeometry(a.item, b.item);
       }
 
-      if (ai !== null) return -1; // с номером раньше без номера
+      if (ai !== null) return -1; // with number comes before without
       if (bi !== null) return 1;
       return compareByGeometry(a.item, b.item);
     });
@@ -73,7 +81,7 @@ function getFormValues() {
 
   const sizeMode = form.sizeMode.value; // 'none' | 'width' | 'height'
   const startCorner = form.startCorner.value; // 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
-  const sortByNumber = form.sortByNumber.checked;
+  const sortByNumber = document.getElementById("sortByNumber").checked;
 
   return {
     imagesPerRow,
@@ -118,7 +126,6 @@ async function onAlignSubmit(event) {
       sortByNumber,
     } = getFormValues();
 
-    // Get current selection on the board
     const selection = await board.getSelection();
     let images = selection.filter((item) => item.type === "image");
 
@@ -136,22 +143,20 @@ async function onAlignSubmit(event) {
       return;
     }
 
-    // Sort images (by number in title if possible, otherwise by geometry)
+    // 1. Sort images (by number at end of name if possible, otherwise by geometry)
     images = sortImages(images, sortByNumber);
 
-    // -----------------------------
-    // 1. Resize images if needed
-    // -----------------------------
+    // 2. Resize images if needed
     if (sizeMode === "width") {
       const targetWidth = Math.min(...images.map((img) => img.width));
       for (const img of images) {
-        img.width = targetWidth; // height keeps aspect ratio
+        img.width = targetWidth;
       }
       await Promise.all(images.map((img) => img.sync()));
     } else if (sizeMode === "height") {
       const targetHeight = Math.min(...images.map((img) => img.height));
       for (const img of images) {
-        img.height = targetHeight; // width keeps aspect ratio
+        img.height = targetHeight;
       }
       await Promise.all(images.map((img) => img.sync()));
     }
@@ -163,9 +168,7 @@ async function onAlignSubmit(event) {
     const maxWidth = Math.max(...widths);
     const maxHeight = Math.max(...heights);
 
-    // -----------------------------
-    // 2. Current bounding box of selection
-    // -----------------------------
+    // 3. Current bounding box of selection
     const bounds = images.map((img) => {
       return {
         item: img,
@@ -181,9 +184,7 @@ async function onAlignSubmit(event) {
     const maxRight = Math.max(...bounds.map((b) => b.right));
     const maxBottom = Math.max(...bounds.map((b) => b.bottom));
 
-    // -----------------------------
-    // 3. Grid geometry
-    // -----------------------------
+    // 4. Grid geometry
     const total = images.length;
     const cols = Math.max(1, imagesPerRow);
     const rows = Math.ceil(total / cols);
@@ -209,9 +210,7 @@ async function onAlignSubmit(event) {
       originLeft = maxRight - gridWidth;
     }
 
-    // -----------------------------
-    // 4. Place images into grid
-    // -----------------------------
+    // 5. Place images into grid
     images.forEach((img, index) => {
       const { rowFromTop, colFromLeft } = computeGridPosition(
         index,
