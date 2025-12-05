@@ -8,13 +8,6 @@ const { board } = window.miro;
  *
  * Uses item.title or item.alt (fallback to empty string).
  * Looks for the last group of digits anywhere in the string.
- *
- * Examples:
- *  "tile_01"          -> 1
- *  "tile01"           -> 1
- *  "tile_0003.png"    -> 3
- *  "my-tile-10 (copy)"-> 10
- *  "img_42"           -> 42
  */
 function extractIndexFromItem(item) {
   const raw = (item.title || item.alt || "").toString();
@@ -85,15 +78,13 @@ async function onAlignSubmit(event) {
     let images = selection.filter((item) => item.type === "image");
 
     if (images.length === 0) {
-      await board.notifications.showInfo(
-        "Select at least one image on the board."
-      );
+      await board.notifications.showInfo("Select at least one image.");
       return;
     }
 
     if (imagesPerRow < 1) {
       await board.notifications.showError(
-        "“Images per row” must be greater than 0."
+        "Images per row must be greater than 0."
       );
       return;
     }
@@ -103,7 +94,7 @@ async function onAlignSubmit(event) {
     let sortedImages;
 
     if (sortByNumber) {
-      // Парсим номера У ВСЕХ изображений
+      // Парсим номера у всех изображений
       const withIndex = images.map((img) => ({
         img,
         index: extractIndexFromItem(img),
@@ -113,7 +104,7 @@ async function onAlignSubmit(event) {
 
       if (someMissing) {
         await board.notifications.showError(
-          "Some selected images do not contain a number in their name. Disable “Sort by number” or rename images."
+          "Some images have no number. Rename or disable sorting."
         );
         return;
       }
@@ -201,12 +192,11 @@ async function onAlignSubmit(event) {
     images.forEach((img, index) => {
       // базовые row/col для режима top-left
       let row = Math.floor(index / cols); // 0..rows-1 сверху вниз
-      let col = index % cols;            // 0..cols-1 слева направо
+      let col = index % cols; // 0..cols-1 слева направо
 
       // модифицируем row/col в зависимости от угла
       switch (startCorner) {
         case "top-left":
-          // как есть
           break;
         case "top-right":
           col = cols - 1 - col;
@@ -230,12 +220,12 @@ async function onAlignSubmit(event) {
     await Promise.all(images.map((img) => img.sync()));
 
     await board.notifications.showInfo(
-      `Done: aligned ${images.length} image${images.length === 1 ? "" : "s"}.`
+      `Aligned ${images.length} image${images.length === 1 ? "" : "s"}.`
     );
   } catch (error) {
     console.error(error);
     await board.notifications.showError(
-      "Something went wrong while aligning images. Please check the console."
+      "Aligning images failed. See console."
     );
   }
 }
