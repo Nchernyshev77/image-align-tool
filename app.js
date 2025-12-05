@@ -4,10 +4,10 @@
 const { board } = window.miro;
 
 /**
- * Extract the LAST integer number from a name (title/alt).
+ * Extract the LAST integer number from item.title.
  * Any number of leading zeros is OK: 1, 01, 0001, 10, 011…
  *
- * Примеры:
+ * Examples:
  *  "tile_01"          -> 1
  *  "tile01"           -> 1
  *  "tile_0003.png"    -> 3
@@ -15,10 +15,10 @@ const { board } = window.miro;
  *  "img_42"           -> 42
  */
 function extractIndexFromItem(item) {
-  const raw = (item.title || item.alt || "").toString();
+  const raw = (item.title || "").toString();
   if (!raw) return null;
 
-  // Берём ПОСЛЕДНЮЮ группу цифр в строке
+  // Last group of digits in the string
   const match = raw.match(/(\d+)(?!.*\d)/);
   if (!match) return null;
 
@@ -27,46 +27,43 @@ function extractIndexFromItem(item) {
 }
 
 /**
- * Строгая сортировка.
- * Если sortByNumber = true:
- *   - если у ВСЕХ есть номер -> сортируем только по номеру;
- *   - если хотя бы у одной нет номера -> бросаем ошибку (выше её перехватим
- *     и покажем пользователю), чтобы не было "каши".
- * Если sortByNumber = false:
- *   - сортируем просто по порядку выделения.
+ * STRICT sort:
+ * - If sortByNumber = true:
+ *     * every image MUST have a number in the title;
+ *     * otherwise we throw an error and do NOT move anything.
+ *     * sort = pure numeric order (1,2,3,…).
+ * - If sortByNumber = false:
+ *     * keep original selection order (no sorting).
  */
-function sortImagesStrict(images, sortByNumber) {
+function sortImages(images, sortByNumber) {
   const meta = images.map((item, i) => ({
     item,
     index: extractIndexFromItem(item),
-    orig: i, // порядок в selection
+    orig: i,
   }));
 
   console.groupCollapsed("Image Grid Aligner – parsed indices");
   meta.forEach((m) => {
-    console.log(m.item.title || m.item.alt || m.item.id, "->", m.index);
+    console.log(m.item.title || m.item.id, "->", m.index);
   });
   console.groupEnd();
 
   if (sortByNumber) {
     const missing = meta.filter((m) => m.index === null);
     if (missing.length > 0) {
-      // Скажем пользователю, какие именно объекты без номера (по возможностям).
       const examples = missing
         .slice(0, 3)
-        .map((m) => m.item.title || m.item.alt || m.item.id)
+        .map((m) => m.item.title || m.item.id)
         .join(", ");
-
       throw new Error(
         `Some selected images don't contain a number in their name. ` +
           `Examples: ${examples}`
       );
     }
 
-    // У всех есть номер -> сортируем строго по номеру.
     meta.sort((a, b) => a.index - b.index);
   } else {
-    // Без номеров -> по порядку выделения.
+    // No numeric sort – keep selection order
     meta.sort((a, b) => a.orig - b.orig);
   }
 
@@ -130,8 +127,8 @@ async function onAlignSubmit(event) {
       return;
     }
 
-    // 1. Строгая сортировка
-    images = sortImagesStrict(images, sortByNumber);
+    // 1. STRICT sort
+    images = sortImages(images, sortByNumber);
 
     // 2. Resize images if needed
     if (sizeMode === "width") {
@@ -197,11 +194,11 @@ async function onAlignSubmit(event) {
 
     // 5. Place images into grid
     images.forEach((img, index) => {
-      // row/col в режиме top-left
-      let row = Math.floor(index / cols); // 0..rows-1 сверху вниз
-      let col = index % cols; // 0..cols-1 слева направо
+      // row/col for top-left mode
+      let row = Math.floor(index / cols); // 0..rows-1, top -> bottom
+      let col = index % cols; // 0..cols-1, left -> right
 
-      // модифицируем row/col в зависимости от выбранного угла
+      // Adjust row/col depending on corner
       switch (startCorner) {
         case "top-left":
           break;
@@ -232,7 +229,6 @@ async function onAlignSubmit(event) {
   } catch (error) {
     console.error(error);
 
-    // Если проблема именно с номерами — покажем понятный текст
     if (error.message && error.message.startsWith("Some selected images")) {
       await board.notifications.showError(error.message);
     } else {
