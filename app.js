@@ -1,77 +1,81 @@
 // app.js
-// Arrange selected images into a grid.
+// Arrange selected images into a grid in Miro.
 
 const { board } = window.miro;
 
 /**
- * Extract the LAST integer number from item.title.
- * Any number of leading zeros is OK: 1, 01, 0001, 10, 011…
- *
- * Examples:
- *  "tile_01"          -> 1
- *  "tile01"           -> 1
- *  "tile_0003.png"    -> 3
- *  "my-tile-10 (copy)"-> 10
- *  "img_42"           -> 42
+ * Get readable title for an item.
+ * We rely on title; alt is just a fallback in case.
  */
-function extractIndexFromItem(item) {
-  const raw = (item.title || "").toString();
-  if (!raw) return null;
-
-  // Last group of digits in the string
-  const match = raw.match(/(\d+)(?!.*\d)/);
-  if (!match) return null;
-
-  const num = Number.parseInt(match[1], 10);
-  return Number.isNaN(num) ? null : num;
+function getTitle(item) {
+  return (item.title || item.alt || "").toString();
 }
 
 /**
- * STRICT sort:
- * - If sortByNumber = true:
- *     * every image MUST have a number in the title;
- *     * otherwise we throw an error and do NOT move anything.
- *     * sort = pure numeric order (1,2,3,…).
- * - If sortByNumber = false:
- *     * keep original selection order (no sorting).
+ * Build sorted list of images according to the rules:
+ * 1) Images whose title contains a number go first, sorted by that number (asc).
+ * 2) Images without numbers go after them, sorted alphabetically by title.
+ * 3) If titles are identical, we keep a stable order using original index.
+ *
+ * If sortByNumber is false, we ignore numbers and sort simply by title.
  */
 function sortImages(images, sortByNumber) {
-  const meta = images.map((item, i) => ({
-    item,
-    index: extractIndexFromItem(item),
-    orig: i,
-  }));
+  const meta = images.map((item, index) => {
+    const title = getTitle(item);
+    const titleLower = title.toLowerCase();
 
-  console.groupCollapsed("Image Grid Aligner – parsed indices");
+    // Last group of digits in the string (so "tile_001_02" -> 2)
+    const match = title.match(/(\d+)(?!.*\d)/);
+    const hasNumber = !!match;
+    const number = hasNumber ? parseInt(match[1], 10) : null;
+
+    return { item, index, title, titleLower, hasNumber, number };
+  });
+
+  console.groupCollapsed("Image Grid Aligner – titles & numbers");
   meta.forEach((m) => {
-    console.log(m.item.title || m.item.id, "->", m.index);
+    console.log(m.title || m.item.id, "=>", m.number);
   });
   console.groupEnd();
 
   if (sortByNumber) {
-    const missing = meta.filter((m) => m.index === null);
-    if (missing.length > 0) {
-      const examples = missing
-        .slice(0, 3)
-        .map((m) => m.item.title || m.item.id)
-        .join(", ");
-      throw new Error(
-        `Some selected images don't contain a number in their name. ` +
-          `Examples: ${examples}`
-      );
-    }
+    meta.sort((a, b) => {
+      const aNum = a.hasNumber;
+      const bNum = b.hasNumber;
 
-    meta.sort((a, b) => a.index - b.index);
+      // 1) numbered first
+      if (aNum && !bNum) return -1;
+      if (!aNum && bNum) return 1;
+
+      // 2) both numbered -> by number
+      if (aNum && bNum) {
+        if (a.number !== b.number) return a.number - b.number;
+        // tie -> by title to keep it neat
+        if (a.titleLower < b.titleLower) return -1;
+        if (a.titleLower > b.titleLower) return 1;
+        // absolute tie -> keep original index
+        return a.index - b.index;
+      }
+
+      // 3) both WITHOUT numbers -> alphabetical by title
+      if (a.titleLower < b.titleLower) return -1;
+      if (a.titleLower > b.titleLower) return 1;
+      return a.index - b.index;
+    });
   } else {
-    // No numeric sort – keep selection order
-    meta.sort((a, b) => a.orig - b.orig);
+    // Ignore numbers: pure alphabetical order by title
+    meta.sort((a, b) => {
+      if (a.titleLower < b.titleLower) return -1;
+      if (a.titleLower > b.titleLower) return 1;
+      return a.index - b.index;
+    });
   }
 
   return meta.map((m) => m.item);
 }
 
 /**
- * Read form values.
+ * Read form values from panel.html
  */
 function getFormValues() {
   const form = document.getElementById("align-form");
@@ -82,7 +86,9 @@ function getFormValues() {
 
   const sizeMode = form.sizeMode.value; // 'none' | 'width' | 'height'
   const startCorner = form.startCorner.value; // 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
-  const sortByNumber = document.getElementById("sortByNumber").checked;
+
+  const sortCheckbox = document.getElementById("sortByNumber");
+  const sortByNumber = sortCheckbox ? sortCheckbox.checked : true;
 
   return {
     imagesPerRow,
@@ -95,7 +101,7 @@ function getFormValues() {
 }
 
 /**
- * Main handler — called on form submit.
+ * Main handler — called when you click "Align selection" in the panel.
  */
 async function onAlignSubmit(event) {
   event.preventDefault();
@@ -127,10 +133,10 @@ async function onAlignSubmit(event) {
       return;
     }
 
-    // 1. STRICT sort
+    // 1. Sort images ONLY by titles (numbers + alphabet) – no geometry.
     images = sortImages(images, sortByNumber);
 
-    // 2. Resize images if needed
+    // 2. Optional resize
     if (sizeMode === "width") {
       const targetWidth = Math.min(...images.map((img) => img.width));
       for (const img of images) {
@@ -152,9 +158,8 @@ async function onAlignSubmit(event) {
     const maxWidth = Math.max(...widths);
     const maxHeight = Math.max(...heights);
 
-    // 3. Current bounding box of selection
+    // 3. Bounding box of current selection
     const bounds = images.map((img) => ({
-      item: img,
       left: img.x - img.width / 2,
       top: img.y - img.height / 2,
       right: img.x + img.width / 2,
@@ -180,6 +185,7 @@ async function onAlignSubmit(event) {
     let originLeft;
     let originTop;
 
+    // Anchor grid to existing bounding box depending on chosen corner
     if (startCorner.startsWith("top")) {
       originTop = minTop;
     } else {
@@ -194,11 +200,11 @@ async function onAlignSubmit(event) {
 
     // 5. Place images into grid
     images.forEach((img, index) => {
-      // row/col for top-left mode
-      let row = Math.floor(index / cols); // 0..rows-1, top -> bottom
-      let col = index % cols; // 0..cols-1, left -> right
+      // Base indices for top-left
+      let row = Math.floor(index / cols); // 0..rows-1 (top to bottom)
+      let col = index % cols; // 0..cols-1 (left to right)
 
-      // Adjust row/col depending on corner
+      // Adjust for corner
       switch (startCorner) {
         case "top-left":
           break;
@@ -228,21 +234,18 @@ async function onAlignSubmit(event) {
     );
   } catch (error) {
     console.error(error);
-
-    if (error.message && error.message.startsWith("Some selected images")) {
-      await board.notifications.showError(error.message);
-    } else {
-      await board.notifications.showError(
-        "Something went wrong while aligning images. Please check the console."
-      );
-    }
+    await board.notifications.showError(
+      "Something went wrong while aligning images. Please check the console."
+    );
   }
 }
 
 /**
- * Attach handler after panel DOM is ready.
+ * Hook up the form once the panel DOM is loaded.
  */
 window.addEventListener("DOMContentLoaded", () => {
   const form = document.getElementById("align-form");
-  form.addEventListener("submit", onAlignSubmit);
+  if (form) {
+    form.addEventListener("submit", onAlignSubmit);
+  }
 });
