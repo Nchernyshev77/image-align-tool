@@ -4,21 +4,31 @@
 const { board } = window.miro;
 
 /**
- * Extracts the trailing integer number from an image name.
- * - Looks at the end of the base name (without extension).
- * - Supports "1", "01", "0003", "10", "011", etc.
- * - Works with or without "_" before the number: "img_01", "img01".
- * Returns number or null if no trailing digits.
+ * Extracts trailing integer number from an image name.
+ *
+ * - Uses item.title or item.alt (fallback to empty string).
+ * - Removes file extension (.png, .jpg, etc.).
+ * - Removes copy suffixes like " (1)", "(копия)", "(copy)" at the end.
+ * - Then takes the last group of digits at the end.
+ *
+ * Examples:
+ *  "tile_01"        -> 1
+ *  "tile01"         -> 1
+ *  "tile_0003.png"  -> 3
+ *  "tile_10 (1)"    -> 10
+ *  "tile_10 (копия)"-> 10
  */
 function extractIndexFromItem(item) {
-  // In Web SDK v2, images can have a `title` property if set programmatically. 
   const raw = item.title || item.alt || "";
   if (!raw) return null;
 
-  // Remove file extension if present
-  const base = String(raw).replace(/\.[^/.]+$/, "");
+  // Remove extension
+  let base = String(raw).replace(/\.[^/.]+$/, "");
 
-  // Take digits only at the very end
+  // Remove copy suffix in parentheses with anything inside
+  base = base.replace(/\(\s*[^)]*\s*\)\s*$/, "");
+
+  // Take the last group of digits at the very end
   const match = base.match(/(\d+)\s*$/);
   if (!match) return null;
 
