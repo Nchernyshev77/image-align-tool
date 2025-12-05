@@ -5,26 +5,31 @@ const { board } = window.miro;
 
 /**
  * Get readable title for an item.
- * We rely on title; alt is just a fallback in case.
+ * We rely primarily on item.title – это то, что ты видишь в названии.
  */
 function getTitle(item) {
-  return (item.title || item.alt || "").toString();
+  return (item.title || "").toString();
 }
 
 /**
- * Build sorted list of images according to the rules:
- * 1) Images whose title contains a number go first, sorted by that number (asc).
- * 2) Images without numbers go after them, sorted alphabetically by title.
- * 3) If titles are identical, we keep a stable order using original index.
+ * Build sorted list of images:
  *
- * If sortByNumber is false, we ignore numbers and sort simply by title.
+ * 1) Images whose title contains a number go first.
+ *    - We use the LAST group of digits in the title: /(\d+)(?!.*\d)/
+ *    - Inside this group: sorted by that number ascending.
+ *    - If numbers are equal: by title alphabetically.
+ * 2) Images without numbers go after all numbered ones.
+ *    - Sorted alphabetically by title.
+ * 3) If titles are equal, we use original index to keep a stable order.
+ *
+ * If sortByNumber is false, we just sort everything by title.
  */
-function sortImages(images, sortByNumber) {
+function sortImagesByTitleAndNumber(images, sortByNumber) {
   const meta = images.map((item, index) => {
     const title = getTitle(item);
     const titleLower = title.toLowerCase();
 
-    // Last group of digits in the string (so "tile_001_02" -> 2)
+    // Last group of digits: e.g. "tile_001_02" -> "02"
     const match = title.match(/(\d+)(?!.*\d)/);
     const hasNumber = !!match;
     const number = hasNumber ? parseInt(match[1], 10) : null;
@@ -32,6 +37,7 @@ function sortImages(images, sortByNumber) {
     return { item, index, title, titleLower, hasNumber, number };
   });
 
+  // Debug log to check what we actually see as names and numbers
   console.groupCollapsed("Image Grid Aligner – titles & numbers");
   meta.forEach((m) => {
     console.log(m.title || m.item.id, "=>", m.number);
@@ -40,30 +46,27 @@ function sortImages(images, sortByNumber) {
 
   if (sortByNumber) {
     meta.sort((a, b) => {
-      const aNum = a.hasNumber;
-      const bNum = b.hasNumber;
-
       // 1) numbered first
-      if (aNum && !bNum) return -1;
-      if (!aNum && bNum) return 1;
+      if (a.hasNumber && !b.hasNumber) return -1;
+      if (!a.hasNumber && b.hasNumber) return 1;
 
       // 2) both numbered -> by number
-      if (aNum && bNum) {
+      if (a.hasNumber && b.hasNumber) {
         if (a.number !== b.number) return a.number - b.number;
-        // tie -> by title to keep it neat
+        // same number: by title
         if (a.titleLower < b.titleLower) return -1;
         if (a.titleLower > b.titleLower) return 1;
-        // absolute tie -> keep original index
+        // fully equal -> by original index (stable order)
         return a.index - b.index;
       }
 
-      // 3) both WITHOUT numbers -> alphabetical by title
+      // 3) both without numbers -> alphabetical by title
       if (a.titleLower < b.titleLower) return -1;
       if (a.titleLower > b.titleLower) return 1;
       return a.index - b.index;
     });
   } else {
-    // Ignore numbers: pure alphabetical order by title
+    // ignore numbers completely: pure alphabetical order by title
     meta.sort((a, b) => {
       if (a.titleLower < b.titleLower) return -1;
       if (a.titleLower > b.titleLower) return 1;
@@ -75,7 +78,7 @@ function sortImages(images, sortByNumber) {
 }
 
 /**
- * Read form values from panel.html
+ * Read form values from panel
  */
 function getFormValues() {
   const form = document.getElementById("align-form");
@@ -133,8 +136,8 @@ async function onAlignSubmit(event) {
       return;
     }
 
-    // 1. Sort images ONLY by titles (numbers + alphabet) – no geometry.
-    images = sortImages(images, sortByNumber);
+    // 1. Sort images ONLY by titles (numbers + alphabet), no geometry.
+    images = sortImagesByTitleAndNumber(images, sortByNumber);
 
     // 2. Optional resize
     if (sizeMode === "width") {
@@ -201,8 +204,8 @@ async function onAlignSubmit(event) {
     // 5. Place images into grid
     images.forEach((img, index) => {
       // Base indices for top-left
-      let row = Math.floor(index / cols); // 0..rows-1 (top to bottom)
-      let col = index % cols; // 0..cols-1 (left to right)
+      let row = Math.floor(index / cols); // 0..rows-1 (top -> bottom)
+      let col = index % cols; // 0..cols-1 (left -> right)
 
       // Adjust for corner
       switch (startCorner) {
