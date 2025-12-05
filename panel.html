@@ -97,8 +97,7 @@
     }
 
     input[type="number"]:focus,
-    select:focus,
-    input[type="file"]:focus {
+    select:focus {
       outline: none;
       border-color: #2563eb;
       box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.2);
@@ -127,34 +126,6 @@
       font-size: 11px;
       opacity: 0.7;
       line-height: 1.4;
-    }
-
-    /* Progress bar for Stitch */
-    .progress-container {
-      margin-top: 8px;
-      display: none;
-    }
-
-    .progress-label {
-      font-size: 11px;
-      opacity: 0.8;
-      margin-bottom: 4px;
-    }
-
-    .progress-outer {
-      width: 100%;
-      height: 6px;
-      border-radius: 999px;
-      background: #e5e7eb;
-      overflow: hidden;
-    }
-
-    .progress-inner {
-      height: 100%;
-      width: 0%;
-      background: #2563eb;
-      border-radius: inherit;
-      transition: width 0.1s linear;
     }
   </style>
 </head>
@@ -270,12 +241,12 @@
 
       <div class="section-title">Source files</div>
       <div class="field">
-        <label for="stitchFilesInput">
-          Choose image files (you can select several files from a folder)
+        <label for="stitchFolderInput">
+          Choose one or more image files (you can select multiple in the dialog)
         </label>
         <input
-          id="stitchFilesInput"
-          name="stitchFilesInput"
+          id="stitchFolderInput"
+          name="stitchFolderInput"
           type="file"
           multiple
           accept="image/*"
@@ -286,22 +257,12 @@
         Import & stitch images
       </button>
 
-      <div id="stitchProgress" class="progress-container">
-        <div id="stitchProgressText" class="progress-label">
-          Preparing…
-        </div>
-        <div class="progress-outer">
-          <div
-            class="progress-inner"
-            id="stitchProgressBar"
-          ></div>
-        </div>
-      </div>
+      <div id="stitchProgress" class="hint"></div>
 
       <p class="hint">
-        Selected files will be sorted by name (numbers at the end are taken
-        into account), created on the board and aligned into a grid using the
-        settings above. Gaps are always zero for stitching.
+        Files will be sorted by name (numbers at the end are taken into
+        account), created on the board and aligned into a grid with no gaps.
+        After import the viewport will zoom to the stitched area.
       </p>
     </form>
   </div>
