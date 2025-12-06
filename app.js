@@ -34,6 +34,104 @@ function sortByGeometry(images) {
   });
 }
 
+/* ---------- helpers: colors ---------- */
+
+/**
+ * Загружаем изображение по URL в <img>, учитываем CORS.
+ */
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+/**
+ * Считаем средний цвет картинки через canvas.
+ * Чтобы не тормозить, уменьшаем до smallSize x smallSize.
+ */
+function getAverageColorFromImageElement(img, smallSize = 50) {
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+
+  const width = smallSize;
+  const height = smallSize;
+
+  canvas.width = width;
+  canvas.height = height;
+
+  ctx.drawImage(img, 0, 0, width, height);
+
+  let data;
+  try {
+    data = ctx.getImageData(0, 0, width, height).data;
+  } catch (e) {
+    console.error("getImageData failed (CORS?):", e);
+    return null;
+  }
+
+  let r = 0,
+    g = 0,
+    b = 0;
+  const totalPixels = width * height;
+
+  for (let i = 0; i < data.length; i += 4) {
+    r += data[i];
+    g += data[i + 1];
+    b += data[i + 2];
+  }
+
+  r = Math.round(r / totalPixels);
+  g = Math.round(g / totalPixels);
+  b = Math.round(b / totalPixels);
+
+  return { r, g, b };
+}
+
+/**
+ * RGB (0-255) -> HSL (h:0-360, s:0-1, l:0-1)
+ */
+function rgbToHsl(r, g, b) {
+  r /= 255;
+  g /= 255;
+  b /= 255;
+
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  let h;
+  let s;
+  const l = (max + min) / 2;
+
+  if (max === min) {
+    h = 0;
+    s = 0;
+  } else {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+
+    switch (max) {
+      case r:
+        h = (g - b) / d + (g < b ? 6 : 0);
+        break;
+      case g:
+        h = (b - r) / d + 2;
+        break;
+      case b:
+        h = (r - g) / d + 4;
+        break;
+    }
+
+    h *= 60;
+  }
+
+  return { h, s, l };
+}
+
+/* ---------- helpers: alignment ---------- */
+
 /**
  * Align images in the order they are given in `images` array.
  * `config`:
@@ -147,14 +245,143 @@ async function alignImagesInGivenOrder(images, config) {
 /* ---------- SORTING TAB ---------- */
 
 /**
- * Для выделенных картинок:
- * 1) Проверяем title.
- * 2) Если у каких-то title пустой -> нумеруем по геометрии (top-left -> bottom-right):
- *      img.title = "1", "2", ...
- * 3) Строим порядок:
- *      - картинки с числом в конце title идут первыми, по числу
- *      - потом без числа, по алфавиту title
- * 4) Выравниваем в сетку по этому порядку.
+ * Сортировка по номеру (title / автонумерация по геометрии).
+ */
+async function sortImagesByNumber(images) {
+  // 1) если у кого-то пустой title -> нумеруем по геометрии (top-left -> bottom-right)
+  const hasAnyEmptyTitle = images.some((img) => !getTitle(img));
+
+  if (hasAnyEmptyTitle) {
+    const geoOrder = sortByGeometry(images);
+    let counter = 1;
+    for (const img of geoOrder) {
+      img.title = String(counter);
+      counter++;
+    }
+    await Promise.all(geoOrder.map((img) => img.sync()));
+    images = geoOrder;
+  }
+
+  // 2) сортировка по числу в title + алфавит
+  const meta = images.map((img, index) => {
+    const title = getTitle(img);
+    const lower = title.toLowerCase();
+    const num = extractTrailingNumber(title);
+    const hasNumber = num !== null;
+    return { img, index, title, lower, hasNumber, num };
+  });
+
+  console.groupCollapsed("Sorting (number) – titles & numbers");
+  meta.forEach((m) => {
+    console.log(m.title || m.img.id, "=>", m.num);
+  });
+  console.groupEnd();
+
+  meta.sort((a, b) => {
+    // numbered first
+    if (a.hasNumber && !b.hasNumber) return -1;
+    if (!a.hasNumber && b.hasNumber) return 1;
+
+    if (a.hasNumber && b.hasNumber) {
+      if (a.num !== b.num) return a.num - b.num;
+      if (a.lower < b.lower) return -1;
+      if (a.lower > b.lower) return 1;
+      return a.index - b.index;
+    }
+
+    // both without numbers: alphabet
+    if (a.lower < b.lower) return -1;
+    if (a.lower > b.lower) return 1;
+    return a.index - b.index;
+  });
+
+  return meta.map((m) => m.img);
+}
+
+/**
+ * Сортировка по среднему цвету:
+ *  - цветные (s >= threshold) идут первыми, по hue (0..360)
+ *  - серые / почти серые (s < threshold) — в конце, по lightness
+ */
+async function sortImagesByColor(images) {
+  const meta = [];
+
+  for (const imgItem of images) {
+    const url = imgItem.url;
+    if (!url) {
+      console.warn("No url for image:", imgItem.id);
+      continue;
+    }
+
+    try {
+      const img = await loadImage(url);
+      const avg = getAverageColorFromImageElement(img);
+      if (!avg) {
+        console.warn("Failed to compute color, fallback neutral:", imgItem.id);
+        meta.push({
+          img: imgItem,
+          h: 0,
+          s: 0,
+          l: 0.5,
+        });
+        continue;
+      }
+      const { h, s, l } = rgbToHsl(avg.r, avg.g, avg.b);
+      meta.push({ img: imgItem, h, s, l });
+    } catch (e) {
+      console.error("Error reading image for color sort", imgItem.id, e);
+      meta.push({
+        img: imgItem,
+        h: 0,
+        s: 0,
+        l: 0.5,
+      });
+    }
+  }
+
+  if (!meta.length) {
+    throw new Error("Could not compute colors for any image.");
+  }
+
+  console.groupCollapsed("Sorting (color) – HSL");
+  meta.forEach((m) => {
+    console.log(
+      m.img.title || m.img.id,
+      "=>",
+      `h=${m.h.toFixed(1)}, s=${m.s.toFixed(2)}, l=${m.l.toFixed(2)}`
+    );
+  });
+  console.groupEnd();
+
+  const SAT_GRAY_THRESHOLD = 0.1;
+
+  meta.sort((a, b) => {
+    const aGray = a.s < SAT_GRAY_THRESHOLD;
+    const bGray = b.s < SAT_GRAY_THRESHOLD;
+
+    // цветные сначала, серые потом
+    if (aGray && !bGray) return 1;
+    if (!aGray && bGray) return -1;
+
+    if (!aGray && !bGray) {
+      // оба цветные => по hue, потом по lightness
+      if (a.h !== b.h) return a.h - b.h;
+      return a.l - b.l;
+    }
+
+    // оба серые => по lightness
+    return a.l - b.l;
+  });
+
+  return meta.map((m) => m.img);
+}
+
+/**
+ * Главный handler вкладки Sorting.
+ * Выбор режима:
+ *  - sortMode = 'number' -> sortImagesByNumber
+ *  - sortMode = 'color'  -> sortImagesByColor
+ * Потом alignImagesInGivenOrder.
  */
 async function handleSortingSubmit(event) {
   event.preventDefault();
@@ -166,6 +393,7 @@ async function handleSortingSubmit(event) {
     const verticalGap = Number(form.sortingVerticalGap.value) || 0;
     const sizeMode = form.sortingSizeMode.value;
     const startCorner = form.sortingStartCorner.value;
+    const sortMode = form.sortingSortMode.value || "number";
 
     const selection = await board.getSelection();
     let images = selection.filter((i) => i.type === "image");
@@ -184,55 +412,15 @@ async function handleSortingSubmit(event) {
       return;
     }
 
-    // 1) check titles
-    const hasAnyEmptyTitle = images.some((img) => !getTitle(img));
+    let orderedImages;
 
-    if (hasAnyEmptyTitle) {
-      // 2) number by geometry
-      const geoOrder = sortByGeometry(images);
-      let counter = 1;
-      for (const img of geoOrder) {
-        img.title = String(counter);
-        counter++;
-      }
-      await Promise.all(geoOrder.map((img) => img.sync()));
-      images = geoOrder;
+    if (sortMode === "color") {
+      await board.notifications.showInfo("Sorting by average color…");
+      orderedImages = await sortImagesByColor(images);
+    } else {
+      // number mode
+      orderedImages = await sortImagesByNumber(images);
     }
-
-    // 3) sort by (number in title) + alphabet
-    const meta = images.map((img, index) => {
-      const title = getTitle(img);
-      const lower = title.toLowerCase();
-      const num = extractTrailingNumber(title);
-      const hasNumber = num !== null;
-      return { img, index, title, lower, hasNumber, num };
-    });
-
-    console.groupCollapsed("Sorting – titles & numbers");
-    meta.forEach((m) => {
-      console.log(m.title || m.img.id, "=>", m.num);
-    });
-    console.groupEnd();
-
-    meta.sort((a, b) => {
-      // numbered first
-      if (a.hasNumber && !b.hasNumber) return -1;
-      if (!a.hasNumber && b.hasNumber) return 1;
-
-      if (a.hasNumber && b.hasNumber) {
-        if (a.num !== b.num) return a.num - b.num;
-        if (a.lower < b.lower) return -1;
-        if (a.lower > b.lower) return 1;
-        return a.index - b.index;
-      }
-
-      // both without numbers: alphabet
-      if (a.lower < b.lower) return -1;
-      if (a.lower > b.lower) return 1;
-      return a.index - b.index;
-    });
-
-    const orderedImages = meta.map((m) => m.img);
 
     await alignImagesInGivenOrder(orderedImages, {
       imagesPerRow,
@@ -368,7 +556,7 @@ async function handleStitchSubmit(event) {
         url: dataUrl,
         x: baseX + (i % 5) * offsetStep,
         y: baseY + Math.floor(i / 5) * offsetStep,
-        title: file.name, // сохраним имя файла в title (может пригодиться в Sorting)
+        title: file.name, // сохраним имя файла в title
       });
 
       createdImages.push(img);
@@ -406,8 +594,6 @@ async function handleStitchSubmit(event) {
     );
   } finally {
     stitchButton.disabled = false;
-    // если хочешь, можно не очищать progress, а оставить "Done."
-    // progressEl.textContent = "";
   }
 }
 
