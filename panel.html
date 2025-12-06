@@ -198,16 +198,25 @@
         </select>
       </div>
 
+      <div class="section-title">Sort mode</div>
+      <div class="field">
+        <label for="sortingSortMode">Sort by</label>
+        <select id="sortingSortMode" name="sortingSortMode">
+          <option value="number" selected>Number (title / auto)</option>
+          <option value="color">Average color</option>
+        </select>
+      </div>
+
       <button type="submit" id="sortingAlignButton">
-        Number (if needed) & align selection
+        Align selection
       </button>
 
       <p class="hint">
-        Select images on the board and click the button.<br />
-        If some images don't have a title, they will be numbered by geometry
-        (top-left to bottom-right) and the number will be saved into the
-        title. Then all images are aligned in a grid using the numbers in
-        titles.
+        <b>Number:</b> if some images don't have a title, they will be numbered
+        by geometry (top-left to bottom-right) and the number will be saved into
+        the title. Then images are aligned in a grid using numbers in titles.<br />
+        <b>Average color:</b> images are sorted by their average color (hue),
+        grayscale images go last.
       </p>
     </form>
   </div>
