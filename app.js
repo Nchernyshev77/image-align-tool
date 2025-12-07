@@ -9,7 +9,39 @@ function getTitle(item) {
 }
 
 /**
- * Extract the LAST integer number from a string.
+ * Попробовать вытащить URL картинки из разных полей виджета.
+ * SDK в разных версиях и для разных источников картинок может класть ссылку
+ * в разные свойства — пробуем все популярные варианты.
+ */
+function getImageUrlFromWidget(widget) {
+  if (!widget) return null;
+
+  // основные варианты SDK 2.0
+  if (widget.url) return widget.url;
+  if (widget.contentUrl) return widget.contentUrl;
+
+  // иногда превью / оригинал лежит здесь
+  if (widget.previewUrl) return widget.previewUrl;
+  if (widget.originalUrl) return widget.originalUrl;
+
+  // могут быть вложенные style-поля
+  if (widget.style) {
+    if (widget.style.imageUrl) return widget.style.imageUrl;
+    if (widget.style.backgroundImage) return widget.style.backgroundImage;
+    if (widget.style.src) return widget.style.src;
+  }
+
+  // запасные варианты в metadata
+  if (widget.metadata) {
+    if (widget.metadata.imageUrl) return widget.metadata.imageUrl;
+    if (widget.metadata.url) return widget.metadata.url;
+  }
+
+  return null;
+}
+
+/**
+ * Вытянуть ПОСЛЕДНЕЕ целое число из строки.
  * "Name_01"   -> 1
  * "Name0003"  -> 3
  * "Name 10a2" -> 2 (последняя группа цифр)
@@ -22,7 +54,7 @@ function extractTrailingNumber(str) {
 }
 
 /**
- * Geometry sort: top -> bottom, then left -> right
+ * Сортировка по геометрии: сверху вниз, внутри строки слева направо.
  */
 function sortByGeometry(images) {
   return [...images].sort((a, b) => {
@@ -37,7 +69,7 @@ function sortByGeometry(images) {
 /* ---------- helpers: image loading & brightness ---------- */
 
 /**
- * Load image by URL into <img> (with CORS support).
+ * Загрузить картинку по URL в <img>.
  */
 function loadImage(url) {
   return new Promise((resolve, reject) => {
@@ -50,10 +82,10 @@ function loadImage(url) {
 }
 
 /**
- * Compute average luminance (яркость) Y в [0..1] из размытого изображения.
- * - уменьшаем картинку до smallSize x smallSize;
- * - применяем Gaussian blur radius ~ blurPx;
- * - считаем среднюю яркость по всем пикселям.
+ * Средняя яркость (luminance) Y в [0..1] из РАЗМЫТОГО изображения.
+ * 1) уменьшаем картинку до smallSize x smallSize;
+ * 2) применяем blur(blurPx);
+ * 3) считаем среднюю яркость по всем пикселям.
  */
 function getBlurredAverageLuminanceFromImageElement(
   img,
@@ -69,17 +101,16 @@ function getBlurredAverageLuminanceFromImageElement(
   canvas.width = width;
   canvas.height = height;
 
-  // включаем blur, если браузер поддерживает фильтры
   const prevFilter = ctx.filter || "none";
   try {
     ctx.filter = `blur(${blurPx}px)`;
   } catch (e) {
-    // если вдруг не поддерживается, просто игнорируем
+    // если фильтры не поддерживаются, просто игнорируем
   }
 
   ctx.drawImage(img, 0, 0, width, height);
 
-  // возвращаем filter назад, чтобы не влиять на другие операции
+  // возвращаем filter назад
   ctx.filter = prevFilter;
 
   let imageData;
@@ -98,7 +129,7 @@ function getBlurredAverageLuminanceFromImageElement(
     const r = data[i];
     const g = data[i + 1];
     const b = data[i + 2];
-    // стандарная формула яркости (sRGB)
+    // стандартная формула яркости (sRGB)
     const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
     sumY += y;
   }
@@ -110,7 +141,7 @@ function getBlurredAverageLuminanceFromImageElement(
 /* ---------- helpers: alignment ---------- */
 
 /**
- * Align images in the order they are given in `images` array.
+ * Выравнять картинки в том порядке, в котором они приходят в массиве images.
  *
  * Горизонтально: картинки в строке идут одна за другой,
  * расстояние между ними = horizontalGap.
@@ -118,7 +149,7 @@ function getBlurredAverageLuminanceFromImageElement(
  * расстояние между строками = verticalGap,
  * высота строки = max высота картинки в этой строке.
  *
- * `config`:
+ * config:
  *  - imagesPerRow
  *  - horizontalGap
  *  - verticalGap
@@ -136,7 +167,7 @@ async function alignImagesInGivenOrder(images, config) {
 
   if (!images.length) return;
 
-  // resize if needed
+  // нормализация размера при необходимости
   if (sizeMode === "width") {
     const targetWidth = Math.min(...images.map((img) => img.width));
     for (const img of images) {
@@ -155,7 +186,7 @@ async function alignImagesInGivenOrder(images, config) {
   const cols = Math.max(1, imagesPerRow);
   const rows = Math.ceil(total / cols);
 
-  // --- вычисляем размеры строк ---
+  // размеры строк
   const rowHeights = new Array(rows).fill(0);
   const rowWidths = new Array(rows).fill(0);
 
@@ -178,13 +209,13 @@ async function alignImagesInGivenOrder(images, config) {
     rowHeights.reduce((sum, h) => sum + h, 0) +
     verticalGap * Math.max(0, rows - 1);
 
-  // Y-координата верхней границы каждой строки (в top-left системе)
+  // верхняя граница каждой строки (в системе top-left)
   const rowTop = new Array(rows).fill(0);
   for (let r = 1; r < rows; r++) {
     rowTop[r] = rowTop[r - 1] + rowHeights[r - 1] + verticalGap;
   }
 
-  // базовые координаты (top-left, origin (0,0))
+  // базовые координаты (origin (0,0), ориентация top-left)
   const baseX = new Array(total).fill(0);
   const baseY = new Array(total).fill(0);
   const rowCursorX = new Array(rows).fill(0);
@@ -202,7 +233,7 @@ async function alignImagesInGivenOrder(images, config) {
     rowCursorX[r] += img.width + horizontalGap;
   }
 
-  // текущее bounding box выделения
+  // bounding box текущего выделения
   const bounds = images.map((img) => ({
     left: img.x - img.width / 2,
     top: img.y - img.height / 2,
@@ -311,21 +342,23 @@ async function sortImagesByNumber(images) {
   return meta.map((m) => m.img);
 }
 
-/* ---------- SORTING: by "color" == brightness with blur ---------- */
+/* ---------- SORTING: by color == brightness with blur ---------- */
 
 /**
  * Сортировка по средней яркости:
- *  - уменьшаем картинку, размазываем (Gaussian blur),
+ *  - уменьшаем картинку, размазываем (blur),
  *  - считаем среднюю яркость Y в [0..1],
  *  - сортируем по Y по убыванию (чем светлее плитка, тем раньше).
+ * Если ни для одной картинки не получилось посчитать яркость — fallback на геометрию.
  */
 async function sortImagesByColor(images) {
   const meta = [];
 
   for (const imgItem of images) {
-    const url = imgItem.url || imgItem.contentUrl;
+    const url = getImageUrlFromWidget(imgItem);
     if (!url) {
-      console.warn("No image URL (url/contentUrl) for image:", imgItem.id);
+      console.warn("No URL found for image:", imgItem.id);
+      console.log("Image object without URL:", imgItem);
       continue;
     }
 
@@ -361,7 +394,7 @@ async function sortImagesByColor(images) {
   });
   console.groupEnd();
 
-  // просто: ярче -> раньше
+  // ярче -> раньше
   meta.sort((a, b) => b.y - a.y);
 
   return meta.map((m) => m.img);
@@ -444,9 +477,9 @@ function readFileAsDataUrl(file) {
 }
 
 /**
- * Sort File objects by name:
- *  - files with trailing number go first, sorted by that number
- *  - then files without number, sorted alphabetically
+ * Сортировка файлов по имени:
+ *  - сначала с числовым суффиксом, внутри — по числу,
+ *  - затем без чисел, по алфавиту.
  */
 function sortFilesByNameWithNumber(files) {
   const arr = Array.from(files).map((file, index) => {
@@ -489,12 +522,12 @@ function sortFilesByNameWithNumber(files) {
 }
 
 /**
- * Handle Stitch tab:
- *  - read selected files,
- *  - sort files by name (with numeric suffix),
- *  - create images on the board,
- *  - align them into a grid with no gaps,
- *  - zoom viewport to the stitched area.
+ * Stitch:
+ *  - читаем выбранные файлы,
+ *  - сортируем по имени (с учётом чисел),
+ *  - создаём картинки на доске,
+ *  - выравниваем без gap,
+ *  - зумим в область.
  */
 async function handleStitchSubmit(event) {
   event.preventDefault();
