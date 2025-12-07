@@ -2,6 +2,9 @@
 // Image Tools: Sorting (align selection) & Stitch (import and align).
 const { board } = window.miro;
 
+// ключ в metadata, куда пишем нашу информацию
+const METADATA_KEY = "imageGridAligner";
+
 /* ---------- helpers: titles & numbers ---------- */
 
 function getTitle(item) {
@@ -10,28 +13,21 @@ function getTitle(item) {
 
 /**
  * Попробовать вытащить URL картинки из разных полей виджета.
- * SDK в разных версиях и для разных источников картинок может класть ссылку
- * в разные свойства — пробуем все популярные варианты.
  */
 function getImageUrlFromWidget(widget) {
   if (!widget) return null;
 
-  // основные варианты SDK 2.0
   if (widget.url) return widget.url;
   if (widget.contentUrl) return widget.contentUrl;
-
-  // иногда превью / оригинал лежит здесь
   if (widget.previewUrl) return widget.previewUrl;
   if (widget.originalUrl) return widget.originalUrl;
 
-  // могут быть вложенные style-поля
   if (widget.style) {
     if (widget.style.imageUrl) return widget.style.imageUrl;
     if (widget.style.backgroundImage) return widget.style.backgroundImage;
     if (widget.style.src) return widget.style.src;
   }
 
-  // запасные варианты в metadata
   if (widget.metadata) {
     if (widget.metadata.imageUrl) return widget.metadata.imageUrl;
     if (widget.metadata.url) return widget.metadata.url;
@@ -110,7 +106,6 @@ function getBlurredAverageLuminanceFromImageElement(
 
   ctx.drawImage(img, 0, 0, width, height);
 
-  // возвращаем filter назад
   ctx.filter = prevFilter;
 
   let imageData;
@@ -129,7 +124,6 @@ function getBlurredAverageLuminanceFromImageElement(
     const r = data[i];
     const g = data[i + 1];
     const b = data[i + 2];
-    // стандартная формула яркости (sRGB)
     const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
     sumY += y;
   }
@@ -142,19 +136,6 @@ function getBlurredAverageLuminanceFromImageElement(
 
 /**
  * Выравнять картинки в том порядке, в котором они приходят в массиве images.
- *
- * Горизонтально: картинки в строке идут одна за другой,
- * расстояние между ними = horizontalGap.
- * Вертикально: строки идут друг под другом,
- * расстояние между строками = verticalGap,
- * высота строки = max высота картинки в этой строке.
- *
- * config:
- *  - imagesPerRow
- *  - horizontalGap
- *  - verticalGap
- *  - sizeMode  ('none' | 'width' | 'height')
- *  - startCorner ('top-left', 'top-right', 'bottom-left', 'bottom-right')
  */
 async function alignImagesInGivenOrder(images, config) {
   const {
@@ -186,7 +167,6 @@ async function alignImagesInGivenOrder(images, config) {
   const cols = Math.max(1, imagesPerRow);
   const rows = Math.ceil(total / cols);
 
-  // размеры строк
   const rowHeights = new Array(rows).fill(0);
   const rowWidths = new Array(rows).fill(0);
 
@@ -194,13 +174,9 @@ async function alignImagesInGivenOrder(images, config) {
     const r = Math.floor(i / cols);
     const img = images[i];
 
-    if (img.height > rowHeights[r]) {
-      rowHeights[r] = img.height;
-    }
+    if (img.height > rowHeights[r]) rowHeights[r] = img.height;
 
-    if (rowWidths[r] > 0) {
-      rowWidths[r] += horizontalGap;
-    }
+    if (rowWidths[r] > 0) rowWidths[r] += horizontalGap;
     rowWidths[r] += img.width;
   }
 
@@ -209,13 +185,11 @@ async function alignImagesInGivenOrder(images, config) {
     rowHeights.reduce((sum, h) => sum + h, 0) +
     verticalGap * Math.max(0, rows - 1);
 
-  // верхняя граница каждой строки (в системе top-left)
   const rowTop = new Array(rows).fill(0);
   for (let r = 1; r < rows; r++) {
     rowTop[r] = rowTop[r - 1] + rowHeights[r - 1] + verticalGap;
   }
 
-  // базовые координаты (origin (0,0), ориентация top-left)
   const baseX = new Array(total).fill(0);
   const baseY = new Array(total).fill(0);
   const rowCursorX = new Array(rows).fill(0);
@@ -233,7 +207,6 @@ async function alignImagesInGivenOrder(images, config) {
     rowCursorX[r] += img.width + horizontalGap;
   }
 
-  // bounding box текущего выделения
   const bounds = images.map((img) => ({
     left: img.x - img.width / 2,
     top: img.y - img.height / 2,
@@ -295,7 +268,6 @@ async function alignImagesInGivenOrder(images, config) {
 /* ---------- SORTING: by number ---------- */
 
 async function sortImagesByNumber(images) {
-  // если есть картинки без title — один раз пронумеруем по геометрии
   const hasAnyEmptyTitle = images.some((img) => !getTitle(img));
 
   if (hasAnyEmptyTitle) {
@@ -342,42 +314,50 @@ async function sortImagesByNumber(images) {
   return meta.map((m) => m.img);
 }
 
-/* ---------- SORTING: by color == brightness with blur ---------- */
+/* ---------- SORTING: by color / brightness ---------- */
 
 /**
  * Сортировка по средней яркости:
- *  - уменьшаем картинку, размазываем (blur),
- *  - считаем среднюю яркость Y в [0..1],
- *  - сортируем по Y по убыванию (чем светлее плитка, тем раньше).
- * Если ни для одной картинки не получилось посчитать яркость — fallback на геометрию.
+ *  - сначала читаем brightness из metadata (для картинок, импортированных через Stitch),
+ *  - если brightness нет — пытаемся посчитать по URL (если Miro его отдаёт),
+ *  - если ни для кого не получилось — fallback на геометрию.
  */
 async function sortImagesByColor(images) {
   const meta = [];
 
   for (const imgItem of images) {
+    let y;
+
+    // 1) пытаемся взять яркость из metadata
+    const md = imgItem.metadata && imgItem.metadata[METADATA_KEY];
+    if (md && typeof md.brightness === "number") {
+      y = md.brightness;
+      meta.push({ img: imgItem, y, source: "metadata" });
+      continue;
+    }
+
+    // 2) fallback: пробуем посчитать по URL, если он есть
     const url = getImageUrlFromWidget(imgItem);
     if (!url) {
-      console.warn("No URL found for image:", imgItem.id);
-      console.log("Image object without URL:", imgItem);
+      console.warn("No URL found for image (no color data):", imgItem.id);
       continue;
     }
 
     try {
       const img = await loadImage(url);
-      const y = getBlurredAverageLuminanceFromImageElement(img);
-      if (y == null) {
+      const yy = getBlurredAverageLuminanceFromImageElement(img);
+      if (yy == null) {
         console.warn(
           "Failed to compute blurred luminance, fallback neutral:",
           imgItem.id
         );
-        meta.push({ img: imgItem, y: 0.5 });
-        continue;
+        meta.push({ img: imgItem, y: 0.5, source: "fallback" });
+      } else {
+        meta.push({ img: imgItem, y: yy, source: "url" });
       }
-
-      meta.push({ img: imgItem, y });
     } catch (e) {
       console.error("Error reading image for brightness sort", imgItem.id, e);
-      meta.push({ img: imgItem, y: 0.5 });
+      meta.push({ img: imgItem, y: 0.5, source: "error" });
     }
   }
 
@@ -388,14 +368,18 @@ async function sortImagesByColor(images) {
     return sortByGeometry(images);
   }
 
-  console.groupCollapsed("Sorting (brightness + blur) – luminance");
+  console.groupCollapsed("Sorting (brightness) – metadata/url luminance");
   meta.forEach((m) => {
-    console.log(m.img.title || m.img.id, "=>", `y=${m.y.toFixed(3)}`);
+    console.log(
+      m.img.title || m.img.id,
+      "=>",
+      `y=${m.y.toFixed(3)}`,
+      `(${m.source})`
+    );
   });
   console.groupEnd();
 
-  // ярче -> раньше
-  meta.sort((a, b) => b.y - a.y);
+  meta.sort((a, b) => b.y - a.y); // ярче -> раньше
 
   return meta.map((m) => m.img);
 }
@@ -524,7 +508,8 @@ function sortFilesByNameWithNumber(files) {
 /**
  * Stitch:
  *  - читаем выбранные файлы,
- *  - сортируем по имени (с учётом чисел),
+ *  - считаем яркость и сохраняем её в metadata,
+ *  - сортируем файлы по имени (с учётом чисел),
  *  - создаём картинки на доске,
  *  - выравниваем без gap,
  *  - зумим в область.
@@ -578,11 +563,26 @@ async function handleStitchSubmit(event) {
 
       const dataUrl = await readFileAsDataUrl(file);
 
+      // считаем яркость для metadata
+      let brightness = 0.5;
+      try {
+        const imgForColor = await loadImage(dataUrl);
+        const y = getBlurredAverageLuminanceFromImageElement(imgForColor);
+        if (y != null) brightness = y;
+      } catch (e) {
+        console.warn("Failed to compute brightness for stitched image:", e);
+      }
+
       const img = await board.createImage({
         url: dataUrl,
         x: baseX + (i % 5) * offsetStep,
         y: baseY + Math.floor(i / 5) * offsetStep,
         title: file.name,
+        metadata: {
+          [METADATA_KEY]: {
+            brightness,
+          },
+        },
       });
 
       createdImages.push(img);
