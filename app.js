@@ -34,7 +34,7 @@ function sortByGeometry(images) {
   });
 }
 
-/* ---------- helpers: colors ---------- */
+/* ---------- helpers: colors / brightness ---------- */
 
 /**
  * Load image by URL into <img> (with CORS support).
@@ -50,9 +50,18 @@ function loadImage(url) {
 }
 
 /**
- * Average color via canvas. Downscale to smallSize x smallSize for speed.
+ * Compute *trimmed* average luminance (яркость) Y в [0..1].
+ * - уменьшаем картинку до smallSize x smallSize;
+ * - считаем яркость каждого пикселя;
+ * - сортируем массив яркостей;
+ * - отбрасываем нижние и верхние trimRatio частей (например 10% и 10%);
+ * - усредняем середину.
  */
-function getAverageColorFromImageElement(img, smallSize = 50) {
+function getTrimmedLuminanceFromImageElement(
+  img,
+  smallSize = 50,
+  trimRatio = 0.1
+) {
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
 
@@ -64,71 +73,43 @@ function getAverageColorFromImageElement(img, smallSize = 50) {
 
   ctx.drawImage(img, 0, 0, width, height);
 
-  let data;
+  let imageData;
   try {
-    data = ctx.getImageData(0, 0, width, height).data;
+    imageData = ctx.getImageData(0, 0, width, height);
   } catch (e) {
     console.error("getImageData failed (CORS?):", e);
     return null;
   }
 
-  let r = 0;
-  let g = 0;
-  let b = 0;
-  const totalPixels = width * height;
+  const data = imageData.data;
+  const luminances = [];
 
   for (let i = 0; i < data.length; i += 4) {
-    r += data[i];
-    g += data[i + 1];
-    b += data[i + 2];
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    // стандарная формула яркости (sRGB)
+    const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    luminances.push(y);
   }
 
-  r = Math.round(r / totalPixels);
-  g = Math.round(g / totalPixels);
-  b = Math.round(b / totalPixels);
+  if (!luminances.length) return null;
 
-  return { r, g, b };
-}
+  luminances.sort((a, b) => a - b);
 
-/**
- * RGB (0-255) -> HSL (h:0-360, s:0-1, l:0-1)
- */
-function rgbToHsl(r, g, b) {
-  r /= 255;
-  g /= 255;
-  b /= 255;
+  const n = luminances.length;
+  const cut = Math.floor(n * trimRatio);
+  const start = cut;
+  const end = n - cut;
+  const count = Math.max(1, end - start);
 
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  let h;
-  let s;
-  const l = (max + min) / 2;
-
-  if (max === min) {
-    h = 0;
-    s = 0;
-  } else {
-    const d = max - min;
-    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-
-    switch (max) {
-      case r:
-        h = (g - b) / d + (g < b ? 6 : 0);
-        break;
-      case g:
-        h = (b - r) / d + 2;
-        break;
-      case b:
-        h = (r - g) / d + 4;
-        break;
-      default:
-        h = 0;
-    }
-
-    h *= 60;
+  let sum = 0;
+  for (let i = start; i < end; i++) {
+    sum += luminances[i];
   }
 
-  return { h, s, l };
+  const avg = sum / count;
+  return avg / 255; // в [0..1]
 }
 
 /* ---------- helpers: alignment ---------- */
@@ -335,15 +316,14 @@ async function sortImagesByNumber(images) {
   return meta.map((m) => m.img);
 }
 
-/* ---------- SORTING: by color (gray first, with luminance) ---------- */
+/* ---------- SORTING: by "color" == brightness ---------- */
 
 /**
- * Сортировка по среднему цвету:
- *  1) сначала серо-белые (низкая насыщенность),
- *  2) потом цветные.
- * Внутри каждой группы сортируем по яркости Y (luminance) от светлого к тёмному:
- *  чем выше Y, тем раньше картинка.
- * Если совсем не получилось посчитать цвет — fallback на sortByGeometry.
+ * Сортировка по средней яркости:
+ *  - считаем trimmed-luminance по всей картинке (без обрезания области),
+ *  - сортируем по яркости Y в [0..1] по убыванию:
+ *      чем светлее плитка, тем раньше.
+ * Если не получилось посчитать яркость ни для кого — fallback на sortByGeometry.
  */
 async function sortImagesByColor(images) {
   const meta = [];
@@ -357,75 +337,41 @@ async function sortImagesByColor(images) {
 
     try {
       const img = await loadImage(url);
-      const avg = getAverageColorFromImageElement(img);
-      if (!avg) {
-        console.warn("Failed to compute color, fallback neutral:", imgItem.id);
+      const y = getTrimmedLuminanceFromImageElement(img);
+      if (y == null) {
+        console.warn("Failed to compute luminance, fallback neutral:", imgItem.id);
         meta.push({
           img: imgItem,
-          h: 0,
-          s: 0,
-          l: 0.5,
           y: 0.5,
-          isGray: true,
         });
         continue;
       }
 
-      const { r, g, b } = avg;
-      const { h, s, l } = rgbToHsl(r, g, b);
-
-      // яркость (luminance) в [0..1]
-      const y = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
-
-      const SAT_GRAY_THRESHOLD = 0.1;
-      const isGray = s < SAT_GRAY_THRESHOLD;
-
-      meta.push({ img: imgItem, h, s, l, y, isGray });
+      meta.push({ img: imgItem, y });
     } catch (e) {
-      console.error("Error reading image for color sort", imgItem.id, e);
+      console.error("Error reading image for color/brightness sort", imgItem.id, e);
       meta.push({
         img: imgItem,
-        h: 0,
-        s: 0,
-        l: 0.5,
         y: 0.5,
-        isGray: true,
       });
     }
   }
 
   if (!meta.length) {
     console.warn(
-      "Could not compute colors for any image, falling back to geometry sort."
+      "Could not compute brightness for any image, falling back to geometry sort."
     );
     return sortByGeometry(images);
   }
 
-  console.groupCollapsed("Sorting (color) – HSL + luminance");
+  console.groupCollapsed("Sorting (brightness) – trimmed luminance");
   meta.forEach((m) => {
-    console.log(
-      m.img.title || m.img.id,
-      "=>",
-      `gray=${m.isGray}, h=${m.h.toFixed(1)}, s=${m.s.toFixed(
-        2
-      )}, l=${m.l.toFixed(2)}, y=${m.y.toFixed(3)}`
-    );
+    console.log(m.img.title || m.img.id, "=>", `y=${m.y.toFixed(3)}`);
   });
   console.groupEnd();
 
-  meta.sort((a, b) => {
-    // серо-белые раньше цветных
-    if (a.isGray && !b.isGray) return -1;
-    if (!a.isGray && b.isGray) return 1;
-
-    // внутри группы: по яркости (Y) от светлого к тёмному
-    if (a.y !== b.y) return b.y - a.y;
-
-    // запасной критерий — по l
-    if (a.l !== b.l) return b.l - a.l;
-
-    return 0;
-  });
+  // просто: ярче -> раньше
+  meta.sort((a, b) => b.y - a.y);
 
   return meta.map((m) => m.img);
 }
@@ -468,7 +414,7 @@ async function handleSortingSubmit(event) {
     let orderedImages;
 
     if (sortMode === "color") {
-      await board.notifications.showInfo("Sorting by average color…");
+      await board.notifications.showInfo("Sorting by brightness…");
       orderedImages = await sortImagesByColor(images);
     } else {
       orderedImages = await sortImagesByNumber(images);
