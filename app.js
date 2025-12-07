@@ -2,9 +2,6 @@
 // Image Tools: Sorting (align selection) & Stitch (import and align).
 const { board } = window.miro;
 
-// ключ в metadata, куда пишем нашу информацию
-const METADATA_KEY = "imageGridAligner";
-
 /* ---------- helpers: titles & numbers ---------- */
 
 function getTitle(item) {
@@ -79,9 +76,6 @@ function loadImage(url) {
 
 /**
  * Средняя яркость (luminance) Y в [0..1] из РАЗМЫТОГО изображения.
- * 1) уменьшаем картинку до smallSize x smallSize;
- * 2) применяем blur(blurPx);
- * 3) считаем среднюю яркость по всем пикселям.
  */
 function getBlurredAverageLuminanceFromImageElement(
   img,
@@ -105,7 +99,6 @@ function getBlurredAverageLuminanceFromImageElement(
   }
 
   ctx.drawImage(img, 0, 0, width, height);
-
   ctx.filter = prevFilter;
 
   let imageData;
@@ -318,25 +311,15 @@ async function sortImagesByNumber(images) {
 
 /**
  * Сортировка по средней яркости:
- *  - сначала читаем brightness из metadata (для картинок, импортированных через Stitch),
- *  - если brightness нет — пытаемся посчитать по URL (если Miro его отдаёт),
+ *  - пытаемся посчитать яркость по URL (для всех картинок, у которых он есть),
  *  - если ни для кого не получилось — fallback на геометрию.
+ * Для картинок, созданных через Stitch, URL всегда есть (data:…),
+ * поэтому сортировка по цвету будет работать стабильно.
  */
 async function sortImagesByColor(images) {
   const meta = [];
 
   for (const imgItem of images) {
-    let y;
-
-    // 1) пытаемся взять яркость из metadata
-    const md = imgItem.metadata && imgItem.metadata[METADATA_KEY];
-    if (md && typeof md.brightness === "number") {
-      y = md.brightness;
-      meta.push({ img: imgItem, y, source: "metadata" });
-      continue;
-    }
-
-    // 2) fallback: пробуем посчитать по URL, если он есть
     const url = getImageUrlFromWidget(imgItem);
     if (!url) {
       console.warn("No URL found for image (no color data):", imgItem.id);
@@ -345,19 +328,19 @@ async function sortImagesByColor(images) {
 
     try {
       const img = await loadImage(url);
-      const yy = getBlurredAverageLuminanceFromImageElement(img);
-      if (yy == null) {
+      const y = getBlurredAverageLuminanceFromImageElement(img);
+      if (y == null) {
         console.warn(
           "Failed to compute blurred luminance, fallback neutral:",
           imgItem.id
         );
-        meta.push({ img: imgItem, y: 0.5, source: "fallback" });
+        meta.push({ img: imgItem, y: 0.5 });
       } else {
-        meta.push({ img: imgItem, y: yy, source: "url" });
+        meta.push({ img: imgItem, y });
       }
     } catch (e) {
       console.error("Error reading image for brightness sort", imgItem.id, e);
-      meta.push({ img: imgItem, y: 0.5, source: "error" });
+      meta.push({ img: imgItem, y: 0.5 });
     }
   }
 
@@ -368,14 +351,9 @@ async function sortImagesByColor(images) {
     return sortByGeometry(images);
   }
 
-  console.groupCollapsed("Sorting (brightness) – metadata/url luminance");
+  console.groupCollapsed("Sorting (brightness) – luminance");
   meta.forEach((m) => {
-    console.log(
-      m.img.title || m.img.id,
-      "=>",
-      `y=${m.y.toFixed(3)}`,
-      `(${m.source})`
-    );
+    console.log(m.img.title || m.img.id, "=>", `y=${m.y.toFixed(3)}`);
   });
   console.groupEnd();
 
@@ -462,8 +440,9 @@ function readFileAsDataUrl(file) {
 
 /**
  * Сортировка файлов по имени:
- *  - сначала с числовым суффиксом, внутри — по числу,
- *  - затем без чисел, по алфавиту.
+ *  - если хотя бы у одного файла есть числовой суффикс — сортируем, как раньше:
+ *      сначала с числами (по числам), потом без (по алфавиту);
+ *  - если НИ У ОДНОГО файла нет числа — просто рандомно перемешиваем.
  */
 function sortFilesByNameWithNumber(files) {
   const arr = Array.from(files).map((file, index) => {
@@ -486,21 +465,32 @@ function sortFilesByNameWithNumber(files) {
   });
   console.groupEnd();
 
-  arr.sort((a, b) => {
-    if (a.hasNumber && !b.hasNumber) return -1;
-    if (!a.hasNumber && b.hasNumber) return 1;
+  const anyHasNumber = arr.some((m) => m.hasNumber);
 
-    if (a.hasNumber && b.hasNumber) {
-      if (a.num !== b.num) return a.num - b.num;
+  if (!anyHasNumber) {
+    // ни у одного файла нет числа в имени — просто рандом
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+  } else {
+    // стандартная сортировка с числами
+    arr.sort((a, b) => {
+      if (a.hasNumber && !b.hasNumber) return -1;
+      if (!a.hasNumber && b.hasNumber) return 1;
+
+      if (a.hasNumber && b.hasNumber) {
+        if (a.num !== b.num) return a.num - b.num;
+        if (a.lower < b.lower) return -1;
+        if (a.lower > b.lower) return 1;
+        return a.index - b.index;
+      }
+
       if (a.lower < b.lower) return -1;
       if (a.lower > b.lower) return 1;
       return a.index - b.index;
-    }
-
-    if (a.lower < b.lower) return -1;
-    if (a.lower > b.lower) return 1;
-    return a.index - b.index;
-  });
+    });
+  }
 
   return arr.map((m) => m.file);
 }
@@ -508,8 +498,7 @@ function sortFilesByNameWithNumber(files) {
 /**
  * Stitch:
  *  - читаем выбранные файлы,
- *  - считаем яркость и сохраняем её в metadata,
- *  - сортируем файлы по имени (с учётом чисел),
+ *  - сортируем (или рандомим) по имени,
  *  - создаём картинки на доске,
  *  - выравниваем без gap,
  *  - зумим в область.
@@ -563,26 +552,11 @@ async function handleStitchSubmit(event) {
 
       const dataUrl = await readFileAsDataUrl(file);
 
-      // считаем яркость для metadata
-      let brightness = 0.5;
-      try {
-        const imgForColor = await loadImage(dataUrl);
-        const y = getBlurredAverageLuminanceFromImageElement(imgForColor);
-        if (y != null) brightness = y;
-      } catch (e) {
-        console.warn("Failed to compute brightness for stitched image:", e);
-      }
-
       const img = await board.createImage({
         url: dataUrl,
         x: baseX + (i % 5) * offsetStep,
         y: baseY + Math.floor(i / 5) * offsetStep,
         title: file.name,
-        metadata: {
-          [METADATA_KEY]: {
-            brightness,
-          },
-        },
       });
 
       createdImages.push(img);
