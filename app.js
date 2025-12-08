@@ -2,10 +2,10 @@
 // Image Tools: Sorting (align selection) & Stitch (import and align).
 const { board } = window.miro;
 
-// --- настройка цвета ---
-const SAT_THRESHOLD = 0.15;          // порог по сатурации
-const SAT_CODE_MAX = 99;             // максимум кода сатурации (00..99)
-const SAT_GROUP_THRESHOLD = 8;      // коды 0..15 считаем "почти серыми"
+// --- color settings ---
+const SAT_CODE_MAX = 99;              // максимум кода сатурации (00..99)
+const SAT_BOOST = 4.0;                // усиливаем сатурацию, чтобы растянуть шкалу
+const SAT_GROUP_THRESHOLD = 30;       // коды 0..30 считаем "почти серыми"
 
 /* ---------- helpers: titles & numbers ---------- */
 
@@ -117,11 +117,11 @@ function getBrightnessAndSaturationFromImageElement(
     sumDiff += maxv - minv;
   }
 
-  const avgY = sumY / totalPixels; // 0..255
+  const avgY = sumY / totalPixels;       // 0..255
   const avgDiff = sumDiff / totalPixels; // 0..255
 
-  const brightness = avgY / 255; // 0..1
-  const saturationApprox = avgDiff / 255; // 0..1
+  const brightness = avgY / 255;              // 0..1
+  const saturationApprox = avgDiff / 255;     // 0..1
 
   return { brightness, saturation: saturationApprox };
 }
@@ -319,8 +319,9 @@ async function sortImagesByNumber(images) {
  * BBB = 0..999 – код яркости (000 – белое, 999 – чёрное)
  *
  * Порядок:
- *   1) все с SS <= 15 (почти серые), по яркости BBB;
- *   2) все с SS > 15 (цветные), по яркости BBB.
+ *   1) все с SS <= SAT_GROUP_THRESHOLD (почти серые), по яркости BBB;
+ *   2) все с SS > SAT_GROUP_THRESHOLD (цветные), по яркости BBB;
+ *   при равной яркости — по сатурации.
  */
 async function sortImagesByColor(images) {
   const meta = images.map((img, index) => {
@@ -367,16 +368,18 @@ async function sortImagesByColor(images) {
     console.log(
       m.title || m.img.id,
       "=>",
-      m.hasCode ? `sat=${m.satCode}, bri=${m.briCode}, group=${m.group}` : "no-code"
+      m.hasCode
+        ? `sat=${m.satCode}, bri=${m.briCode}, group=${m.group}`
+        : "no-code"
     );
   });
   console.groupEnd();
 
   meta.sort((a, b) => {
     if (a.hasCode && b.hasCode) {
-      if (a.group !== b.group) return a.group - b.group; // серые раньше цветных
-      if (a.briCode !== b.briCode) return a.briCode - b.briCode; // светлее раньше тёмных
-      if (a.satCode !== b.satCode) return a.satCode - b.satCode; // менее насыщенные раньше
+      if (a.group !== b.group) return a.group - b.group;          // серые раньше цветных
+      if (a.briCode !== b.briCode) return a.briCode - b.briCode;  // светлее раньше тёмных
+      if (a.satCode !== b.satCode) return a.satCode - b.satCode;  // менее насыщенные раньше
       return a.index - b.index;
     }
     if (a.hasCode) return -1;
@@ -525,8 +528,8 @@ function sortFilesByNameWithNumber(files) {
  *  - читаем выбранные файлы в dataURL,
  *  - считаем яркость и сатурацию для нижних 80% картинки,
  *  - кодируем:
- *       SS  = round(saturation * 99)   -> 00..99
- *       BBB = round((1-bright)*999)    -> 000..999
+ *       SS  = round( boostedSaturation * 99 )   -> 00..99
+ *       BBB = round( (1-brightness) * 999 )     -> 000..999
  *       title = "CSS/BBB originalName"
  *  - сортируем/рандомим по имени (как раньше),
  *  - создаём картинки на доске,
@@ -597,10 +600,13 @@ async function handleStitchSubmit(event) {
         );
       }
 
+      // яркость -> код 000..999 (0 – белое, 999 – чёрное)
       const briCodeRaw = Math.round((1 - brightness) * 999); // 0..999
       const briCode = Math.max(0, Math.min(999, briCodeRaw));
 
-      const satCodeRaw = Math.round(saturation * SAT_CODE_MAX); // 0..99
+      // усиливаем сатурацию, чтобы занять почти всю шкалу 0..99
+      const boostedSat = Math.min(1, saturation * SAT_BOOST);
+      const satCodeRaw = Math.round(boostedSat * SAT_CODE_MAX); // 0..99
       const satCode = Math.max(0, Math.min(SAT_CODE_MAX, satCodeRaw));
 
       fileInfos.push({ file, dataUrl, brightness, saturation, briCode, satCode });
@@ -686,8 +692,3 @@ window.addEventListener("DOMContentLoaded", () => {
   const stitchForm = document.getElementById("stitch-form");
   if (stitchForm) stitchForm.addEventListener("submit", handleStitchSubmit);
 });
-
-
-
-
-
