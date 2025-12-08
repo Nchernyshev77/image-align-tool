@@ -188,6 +188,20 @@
       background: #2563eb;
       transition: width 0.1s linear;
     }
+
+    .progress-text-main {
+      margin-top: 6px;
+      font-size: 13px; /* чуть больше, чем hint */
+      text-align: center;
+      color: #111827;
+    }
+
+    .progress-text-eta {
+      margin-top: 2px;
+      font-size: 12px;
+      text-align: center;
+      color: #4b5563;
+    }
   </style>
 </head>
 <body>
@@ -328,7 +342,8 @@
       <div class="progress-container">
         <div id="stitchProgressBar" class="progress-fill"></div>
       </div>
-      <div id="stitchProgress" class="hint"></div>
+      <div id="stitchProgressMain" class="progress-text-main"></div>
+      <div id="stitchProgressEta" class="progress-text-eta"></div>
     </form>
   </div>
 </body>
