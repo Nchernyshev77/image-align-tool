@@ -2,37 +2,15 @@
 // Image Tools: Sorting (align selection) & Stitch (import and align).
 const { board } = window.miro;
 
+// --- настройка цвета ---
+const SAT_THRESHOLD = 0.15;          // порог по сатурации
+const SAT_CODE_MAX = 99;             // максимум кода сатурации (00..99)
+const SAT_GROUP_THRESHOLD = 15;      // коды 0..15 считаем "почти серыми"
+
 /* ---------- helpers: titles & numbers ---------- */
 
 function getTitle(item) {
   return (item.title || "").toString();
-}
-
-/**
- * Попробовать вытащить URL картинки из разных полей виджета.
- * Сейчас используем только в Stitch, когда ещё есть dataURL;
- * для Sorting по цвету URL больше не нужен.
- */
-function getImageUrlFromWidget(widget) {
-  if (!widget) return null;
-
-  if (widget.url) return widget.url;
-  if (widget.contentUrl) return widget.contentUrl;
-  if (widget.previewUrl) return widget.previewUrl;
-  if (widget.originalUrl) return widget.originalUrl;
-
-  if (widget.style) {
-    if (widget.style.imageUrl) return widget.style.imageUrl;
-    if (widget.style.backgroundImage) return widget.style.backgroundImage;
-    if (widget.style.src) return widget.style.src;
-  }
-
-  if (widget.metadata) {
-    if (widget.metadata.imageUrl) return widget.metadata.imageUrl;
-    if (widget.metadata.url) return widget.metadata.url;
-  }
-
-  return null;
 }
 
 /**
@@ -77,12 +55,12 @@ function loadImage(url) {
 }
 
 /**
- * Посчитать яркость и признак "ч/б" из РАЗМЫТОГО изображения,
+ * Посчитать яркость и сатурацию из РАЗМЫТОГО изображения,
  * игнорируя верхние 20% по высоте.
  *
- * Возвращает { brightness: 0..1, isGray: boolean } или null при ошибке.
+ * Возвращает { brightness: 0..1, saturation: 0..1 } или null при ошибке.
  */
-function getBrightnessAndGrayFromImageElement(
+function getBrightnessAndSaturationFromImageElement(
   img,
   smallSize = 50,
   blurPx = 3,
@@ -145,10 +123,7 @@ function getBrightnessAndGrayFromImageElement(
   const brightness = avgY / 255; // 0..1
   const saturationApprox = avgDiff / 255; // 0..1
 
-  // если средний разброс каналов маленький — считаем ч/б.
-  const isGray = saturationApprox < 0.08;
-
-  return { brightness, isGray };
+  return { brightness, saturation: saturationApprox };
 }
 
 /* ---------- helpers: alignment ---------- */
@@ -336,24 +311,50 @@ async function sortImagesByNumber(images) {
 /* ---------- SORTING: by color code in title ---------- */
 
 /**
- * Color-sort: читаем префикс вида "C0000 " из title
+ * Color-sort: читаем префикс вида "CSS/BBB " из title
  * (он выставляется во время импорта через Stitch),
  * и сортируем по нему.
  *
- * Первая цифра: 0 – ч/б, 1 – цвет.
- * Следующие три: яркость 000..999 (000 – светлый, 999 – тёмный).
+ * SS  = 0..99  – код сатурации (0 – серое, 99 – очень цветное)
+ * BBB = 0..999 – код яркости (000 – белое, 999 – чёрное)
  *
- * Если ни у одной картинки нет такого префикса — fallback на геометрию.
+ * Порядок:
+ *   1) все с SS <= 15 (почти серые), по яркости BBB;
+ *   2) все с SS > 15 (цветные), по яркости BBB.
  */
 async function sortImagesByColor(images) {
   const meta = images.map((img, index) => {
     const title = getTitle(img);
-    const match = title.match(/^C(\d{4})\s+/); // C#### в начале
-    const code = match ? Number.parseInt(match[1], 10) : null;
-    return { img, index, title, code };
+    const match = title.match(/^C(\d{2})\/(\d{3})\s+/); // CSS/BBB в начале
+
+    if (!match) {
+      return {
+        img,
+        index,
+        title,
+        hasCode: false,
+        satCode: null,
+        briCode: null,
+        group: null,
+      };
+    }
+
+    const satCode = Number.parseInt(match[1], 10);
+    const briCode = Number.parseInt(match[2], 10);
+    const group = satCode <= SAT_GROUP_THRESHOLD ? 0 : 1; // 0 – серые, 1 – цвет
+
+    return {
+      img,
+      index,
+      title,
+      hasCode: true,
+      satCode,
+      briCode,
+      group,
+    };
   });
 
-  const anyCode = meta.some((m) => m.code !== null);
+  const anyCode = meta.some((m) => m.hasCode);
   if (!anyCode) {
     console.warn(
       "No color codes found in titles; falling back to geometry sort."
@@ -361,22 +362,25 @@ async function sortImagesByColor(images) {
     return sortByGeometry(images);
   }
 
-  console.groupCollapsed("Sorting (color-code) – titles & codes");
+  console.groupCollapsed("Sorting (color) – titles, sat & bri");
   meta.forEach((m) => {
-    console.log(m.title || m.img.id, "=>", m.code);
+    console.log(
+      m.title || m.img.id,
+      "=>",
+      m.hasCode ? `sat=${m.satCode}, bri=${m.briCode}, group=${m.group}` : "no-code"
+    );
   });
   console.groupEnd();
 
   meta.sort((a, b) => {
-    const ac = a.code;
-    const bc = b.code;
-
-    if (ac != null && bc != null) {
-      if (ac !== bc) return ac - bc; // меньше код -> раньше
+    if (a.hasCode && b.hasCode) {
+      if (a.group !== b.group) return a.group - b.group; // серые раньше цветных
+      if (a.briCode !== b.briCode) return a.briCode - b.briCode; // светлее раньше тёмных
+      if (a.satCode !== b.satCode) return a.satCode - b.satCode; // менее насыщенные раньше
       return a.index - b.index;
     }
-    if (ac != null) return -1;
-    if (bc != null) return 1;
+    if (a.hasCode) return -1;
+    if (b.hasCode) return 1;
     return a.index - b.index;
   });
 
@@ -421,7 +425,7 @@ async function handleSortingSubmit(event) {
     let orderedImages;
 
     if (sortMode === "color") {
-      await board.notifications.showInfo("Sorting by color code…");
+      await board.notifications.showInfo("Sorting by color…");
       orderedImages = await sortImagesByColor(images);
     } else {
       orderedImages = await sortImagesByNumber(images);
@@ -519,10 +523,13 @@ function sortFilesByNameWithNumber(files) {
 /**
  * Stitch:
  *  - читаем выбранные файлы в dataURL,
- *  - считаем яркость и "ч/б/цвет" для нижних 80% картинки,
- *  - кодируем это в colorCode = [0/1][000..999],
+ *  - считаем яркость и сатурацию для нижних 80% картинки,
+ *  - кодируем:
+ *       SS  = round(saturation * 99)   -> 00..99
+ *       BBB = round((1-bright)*999)    -> 000..999
+ *       title = "CSS/BBB originalName"
  *  - сортируем/рандомим по имени (как раньше),
- *  - создаём картинки на доске с title: "Cxxxx originalName",
+ *  - создаём картинки на доске,
  *  - выравниваем без gap,
  *  - зумим в область.
  */
@@ -562,7 +569,7 @@ async function handleStitchSubmit(event) {
     const filesArray = Array.from(files);
     const fileInfos = [];
 
-    // 1. читаем dataURL и считаем brightness + isGray + colorCode
+    // 1. читаем dataURL и считаем brightness + saturation + коды
     for (let i = 0; i < filesArray.length; i++) {
       const file = filesArray[i];
 
@@ -573,29 +580,30 @@ async function handleStitchSubmit(event) {
       const dataUrl = await readFileAsDataUrl(file);
 
       let brightness = 0.5;
-      let isGray = false;
+      let saturation = 0.0;
 
       try {
         const imgEl = await loadImage(dataUrl);
-        const res = getBrightnessAndGrayFromImageElement(imgEl);
+        const res = getBrightnessAndSaturationFromImageElement(imgEl);
         if (res) {
           brightness = res.brightness;
-          isGray = res.isGray;
+          saturation = res.saturation;
         }
       } catch (e) {
         console.warn(
-          "Failed to compute brightness for stitched image:",
+          "Failed to compute brightness/saturation for stitched image:",
           file.name,
           e
         );
       }
 
-      const brightnessCodeRaw = Math.round((1 - brightness) * 999); // 0..999
-      const brightnessCode = Math.max(0, Math.min(999, brightnessCodeRaw));
-      const colorFlag = isGray ? 0 : 1; // 0 – ч/б, 1 – цвет
-      const colorCode = colorFlag * 1000 + brightnessCode; // 0..1999
+      const briCodeRaw = Math.round((1 - brightness) * 999); // 0..999
+      const briCode = Math.max(0, Math.min(999, briCodeRaw));
 
-      fileInfos.push({ file, dataUrl, brightness, isGray, colorCode });
+      const satCodeRaw = Math.round(saturation * SAT_CODE_MAX); // 0..99
+      const satCode = Math.max(0, Math.min(SAT_CODE_MAX, satCodeRaw));
+
+      fileInfos.push({ file, dataUrl, brightness, saturation, briCode, satCode });
     }
 
     // 2. порядок по имени/номеру (как раньше)
@@ -615,11 +623,12 @@ async function handleStitchSubmit(event) {
     const baseY = 0;
     const offsetStep = 50;
 
-    const padColor = (n) => String(n).padStart(4, "0");
+    const pad2 = (n) => String(n).padStart(2, "0");
+    const pad3 = (n) => String(n).padStart(3, "0");
 
     for (let i = 0; i < orderedInfos.length; i++) {
       const info = orderedInfos[i];
-      const title = `C${padColor(info.colorCode)} ${info.file.name}`;
+      const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${info.file.name}`;
 
       if (progressEl) {
         progressEl.textContent = `Creating ${i + 1} / ${orderedInfos.length}…`;
