@@ -84,9 +84,18 @@
       gap: 4px;
     }
 
+    /* общий стиль для label */
     label {
-      font-size: 12px;
-      opacity: 0.8;
+      font-size: 13px;
+      opacity: 0.9;
+    }
+
+    /* строка с чекбоксом – галка и текст в одну линию */
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
     }
 
     input[type="number"],
@@ -106,6 +115,13 @@
       outline: none;
       border-color: #2563eb;
       box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.2);
+    }
+
+    /* синий чекбокс, чуть крупнее */
+    input[type="checkbox"] {
+      accent-color: #2563eb;
+      width: 14px;
+      height: 14px;
     }
 
     button.primary {
@@ -313,7 +329,7 @@
       </div>
 
       <div class="field">
-        <label>
+        <label class="checkbox-row">
           <input
             type="checkbox"
             id="stitchSkipMissing"
