@@ -5,7 +5,7 @@ const { board } = window.miro;
 // --- color settings ---
 const SAT_CODE_MAX = 99;              // максимум кода сатурации (00..99)
 const SAT_BOOST = 4.0;                // усиливаем сатурацию, чтобы растянуть шкалу
-const SAT_GROUP_THRESHOLD = 10;       // <= порога — считаем "серым", выше — "цветным"
+const SAT_GROUP_THRESHOLD = 10;       // <= порога — считаем "серым", > — цветным
 
 /* ---------- helpers: titles & numbers ---------- */
 
@@ -41,9 +41,6 @@ function sortByGeometry(images) {
 
 /* ---------- helpers: image loading & brightness ---------- */
 
-/**
- * Загрузить картинку по URL в <img>.
- */
 function loadImage(url) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -55,10 +52,8 @@ function loadImage(url) {
 }
 
 /**
- * Посчитать яркость и сатурацию из РАЗМЫТОГО изображения,
- * игнорируя верхние 30% по высоте и по 20% слева/справа.
- *
- * Возвращает { brightness: 0..1, saturation: 0..1 } или null при ошибке.
+ * Яркость + сатурация по размытой центральной части изображения.
+ * Обрезаем 30% сверху и по 20% слева/справа.
  */
 function getBrightnessAndSaturationFromImageElement(
   img,
@@ -79,9 +74,7 @@ function getBrightnessAndSaturationFromImageElement(
   const prevFilter = ctx.filter || "none";
   try {
     ctx.filter = `blur(${blurPx}px)`;
-  } catch (e) {
-    // если фильтры не поддерживаются, просто игнорируем
-  }
+  } catch (_) {}
 
   ctx.drawImage(img, 0, 0, width, height);
   ctx.filter = prevFilter;
@@ -112,30 +105,25 @@ function getBrightnessAndSaturationFromImageElement(
     const g = data[i + 1];
     const b = data[i + 2];
 
-    // яркость
-    const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    const y = 0.2126 * r + 0.7152 * g + 0.0722 * b; // яркость
     sumY += y;
 
-    // "цветность": разброс между каналами
     const maxv = Math.max(r, g, b);
     const minv = Math.min(r, g, b);
-    sumDiff += maxv - minv;
+    sumDiff += maxv - minv; // разброс каналов = цветность
   }
 
-  const avgY = sumY / totalPixels;       // 0..255
-  const avgDiff = sumDiff / totalPixels; // 0..255
+  const avgY = sumY / totalPixels;
+  const avgDiff = sumDiff / totalPixels;
 
-  const brightness = avgY / 255;              // 0..1
-  const saturationApprox = avgDiff / 255;     // 0..1
+  const brightness = avgY / 255;
+  const saturationApprox = avgDiff / 255;
 
   return { brightness, saturation: saturationApprox };
 }
 
 /* ---------- helpers: alignment ---------- */
 
-/**
- * Выравнять картинки в том порядке, в котором они приходят в массиве images.
- */
 async function alignImagesInGivenOrder(images, config) {
   const {
     imagesPerRow,
@@ -147,18 +135,14 @@ async function alignImagesInGivenOrder(images, config) {
 
   if (!images.length) return;
 
-  // нормализация размера при необходимости
+  // нормализация размера
   if (sizeMode === "width") {
     const targetWidth = Math.min(...images.map((img) => img.width));
-    for (const img of images) {
-      img.width = targetWidth;
-    }
+    for (const img of images) img.width = targetWidth;
     await Promise.all(images.map((img) => img.sync()));
   } else if (sizeMode === "height") {
     const targetHeight = Math.min(...images.map((img) => img.height));
-    for (const img of images) {
-      img.height = targetHeight;
-    }
+    for (const img of images) img.height = targetHeight;
     await Promise.all(images.map((img) => img.sync()));
   }
 
@@ -216,7 +200,9 @@ async function alignImagesInGivenOrder(images, config) {
   const minLeft = Math.min(...bounds.map((b) => b.left));
   const minTop = Math.min(...bounds.map((b) => b.top));
   const maxRight = Math.max(...bounds.map((b) => b.right));
-  const maxBottom = Math.max(...bounds.map((b) => b.bottom));
+  const maxBottom = Math.min
+    ? Math.max(...bounds.map((b) => b.bottom))
+    : Math.max(...bounds.map((b) => b.bottom));
 
   let originLeft;
   let originTop;
@@ -313,26 +299,23 @@ async function sortImagesByNumber(images) {
   return meta.map((m) => m.img);
 }
 
-/* ---------- SORTING: by color code in title (старый вариант) ---------- */
+/* ---------- SORTING: by color (через коды в title) ---------- */
 
 /**
- * Color-sort: читаем префикс вида "CSS/BBB " из title
- * (он выставляется во время импорта через Stitch),
- * и сортируем по нему.
- *
- * SS  = 0..99  – код сатурации (0 – серое/бледное, 99 – очень цветное)
- * BBB = 0..999 – код яркости (000 – белое, 999 – чёрное)
+ * Title: "CSS/BBB имя"
+ *   SS  = 0..99   – код сатурации (0 – серое/бледное, 99 – очень цветное)
+ *   BBB = 0..999  – код яркости (000 – белое, 999 – чёрное)
  *
  * Порядок:
- *   0. сначала "серые" (SS <= SAT_GROUP_THRESHOLD),
- *      потом цветные (SS > SAT_GROUP_THRESHOLD);
- *   1. внутри группы – от светлых к тёмным (BBB по возрастанию),
- *   2. при одинаковой яркости – от бледных к насыщенным (SS по возрастанию).
+ *   0. сначала серые: SS <= SAT_GROUP_THRESHOLD,
+ *      затем цветные: SS > SAT_GROUP_THRESHOLD;
+ *   1. внутри каждой группы – по яркости от белого к чёрному (BBB по возрастанию);
+ *   2. при одинаковой яркости – по сатурации (от бледных к насыщенным).
  */
 async function sortImagesByColor(images) {
   const meta = images.map((img, index) => {
     const title = getTitle(img);
-    const match = title.match(/^C(\d{2})\/(\d{3})\s+/); // CSS/BBB в начале
+    const match = title.match(/^C(\d{2})\/(\d{3})\s+/);
 
     if (!match) {
       return {
@@ -340,15 +323,15 @@ async function sortImagesByColor(images) {
         index,
         title,
         hasCode: false,
+        group: 1,
         satCode: null,
         briCode: null,
-        group: 1,
       };
     }
 
     const satCode = Number.parseInt(match[1], 10);
     const briCode = Number.parseInt(match[2], 10);
-    const group = satCode <= SAT_GROUP_THRESHOLD ? 0 : 1; // 0 – серые, 1 – цветные
+    const group = satCode <= SAT_GROUP_THRESHOLD ? 0 : 1;
 
     return {
       img,
@@ -383,12 +366,9 @@ async function sortImagesByColor(images) {
 
   meta.sort((a, b) => {
     if (a.hasCode && b.hasCode) {
-      // серые (0) раньше цветных (1)
-      if (a.group !== b.group) return a.group - b.group;
-      // светлые раньше тёмных
-      if (a.briCode !== b.briCode) return a.briCode - b.briCode;
-      // бледные раньше насыщенных
-      if (a.satCode !== b.satCode) return a.satCode - b.satCode;
+      if (a.group !== b.group) return a.group - b.group;           // серые → цветные
+      if (a.briCode !== b.briCode) return a.briCode - b.briCode;   // светлее → темнее
+      if (a.satCode !== b.satCode) return a.satCode - b.satCode;   // бледнее → насыщеннее
       return a.index - b.index;
     }
     if (a.hasCode) return -1;
@@ -475,12 +455,6 @@ function readFileAsDataUrl(file) {
   });
 }
 
-/**
- * Сортировка файлов по имени:
- *  - если хотя бы у одного файла есть числовой суффикс — сортируем, как раньше:
- *      сначала с числами (по числам), потом без (по алфавиту);
- *  - если НИ У ОДНОГО файла нет числа — просто рандомно перемешиваем.
- */
 function sortFilesByNameWithNumber(files) {
   const arr = Array.from(files).map((file, index) => {
     const name = file.name || "";
@@ -497,9 +471,7 @@ function sortFilesByNameWithNumber(files) {
   });
 
   console.groupCollapsed("Stitch – files & numbers");
-  arr.forEach((m) => {
-    console.log(m.name, "=>", m.num);
-  });
+  arr.forEach((m) => console.log(m.name, "=>", m.num));
   console.groupEnd();
 
   const anyHasNumber = arr.some((m) => m.hasNumber);
@@ -511,7 +483,6 @@ function sortFilesByNameWithNumber(files) {
       [arr[i], arr[j]] = [arr[j], arr[i]];
     }
   } else {
-    // стандартная сортировка с числами
     arr.sort((a, b) => {
       if (a.hasNumber && !b.hasNumber) return -1;
       if (!a.hasNumber && b.hasNumber) return 1;
@@ -532,19 +503,6 @@ function sortFilesByNameWithNumber(files) {
   return arr.map((m) => m.file);
 }
 
-/**
- * Stitch:
- *  - читаем выбранные файлы в dataURL,
- *  - считаем яркость и сатурацию для центральной части (30% сверху, 20% слева/справа отрезаны),
- *  - кодируем:
- *       SS  = round( boostedSaturation * 99 )   -> 00..99
- *       BBB = round( (1-brightness) * 999 )     -> 000..999
- *       title = "CSS/BBB originalName"
- *  - сортируем/рандомим по имени (как раньше),
- *  - создаём картинки на доске в центре текущего вида,
- *  - выравниваем без gap,
- *  - зумим в область.
- */
 async function handleStitchSubmit(event) {
   event.preventDefault();
 
@@ -581,7 +539,7 @@ async function handleStitchSubmit(event) {
     const filesArray = Array.from(files);
     const fileInfos = [];
 
-    // 0. Центр текущего вида (viewport)
+    // Центр текущего вида
     let baseX = 0;
     let baseY = 0;
     try {
@@ -592,7 +550,7 @@ async function handleStitchSubmit(event) {
       console.warn("Could not get viewport, falling back to (0,0):", e);
     }
 
-    // 1. читаем dataURL и считаем brightness + saturation + коды
+    // читаем и считаем яркость/сатурацию
     for (let i = 0; i < filesArray.length; i++) {
       const file = filesArray[i];
 
@@ -621,27 +579,24 @@ async function handleStitchSubmit(event) {
       }
 
       // яркость -> код 000..999 (0 – белое, 999 – чёрное)
-      const briCodeRaw = Math.round((1 - brightness) * 999); // 0..999
+      const briCodeRaw = Math.round((1 - brightness) * 999);
       const briCode = Math.max(0, Math.min(999, briCodeRaw));
 
-      // усиливаем сатурацию, чтобы занять почти всю шкалу 0..99
+      // сатурация -> код 00..99 (усиленная)
       const boostedSat = Math.min(1, saturation * SAT_BOOST);
-      const satCodeRaw = Math.round(boostedSat * SAT_CODE_MAX); // 0..99
+      const satCodeRaw = Math.round(boostedSat * SAT_CODE_MAX);
       const satCode = Math.max(0, Math.min(SAT_CODE_MAX, satCodeRaw));
 
       fileInfos.push({ file, dataUrl, brightness, saturation, briCode, satCode });
     }
 
-    // 2. порядок по имени/номеру (как раньше)
     if (progressEl) progressEl.textContent = "Ordering files…";
 
     const orderedFiles = sortFilesByNameWithNumber(filesArray);
     const infoByFile = new Map();
     fileInfos.forEach((info) => infoByFile.set(info.file, info));
-
     const orderedInfos = orderedFiles.map((f) => infoByFile.get(f));
 
-    // 3. создаём виджеты
     if (progressEl) progressEl.textContent = "Creating images…";
 
     const createdImages = [];
@@ -701,10 +656,9 @@ async function handleStitchSubmit(event) {
   }
 }
 
-/* ---------- init (tabs + forms + file button + description) ---------- */
+/* ---------- init (tabs + forms + file button) ---------- */
 
 window.addEventListener("DOMContentLoaded", () => {
-  // формы
   const sortingForm = document.getElementById("sorting-form");
   if (sortingForm) sortingForm.addEventListener("submit", handleSortingSubmit);
 
@@ -717,14 +671,6 @@ window.addEventListener("DOMContentLoaded", () => {
     sorting: document.getElementById("tab-sorting"),
     stitch: document.getElementById("tab-stitch"),
   };
-  const descEl = document.getElementById("tab-description");
-
-  const descriptions = {
-    sorting:
-      "Sorting: align selected images into a grid using numbers or color codes in the title.",
-    stitch:
-      "Stitch: import image files, place them in the current view and arrange them into a grid with color codes.",
-  };
 
   function activateTab(name) {
     tabButtons.forEach((btn) => {
@@ -736,10 +682,6 @@ window.addEventListener("DOMContentLoaded", () => {
       if (!el) return;
       el.classList.toggle("active", key === name);
     });
-
-    if (descEl && descriptions[name]) {
-      descEl.textContent = descriptions[name];
-    }
   }
 
   if (tabButtons.length && tabContents.sorting && tabContents.stitch) {
