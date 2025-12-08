@@ -1,5 +1,5 @@
 // app.js
-// Image Align Tool: Sorting (align selection) & Stitch (import and align).
+// Image Align Tool: Sorting (align selection), Stitch (import grid), Slice (cut big images into 4096x4096 tiles).
 const { board } = window.miro;
 
 // --- color settings ---
@@ -7,6 +7,7 @@ const SAT_CODE_MAX = 99;
 const SAT_BOOST = 4.0;
 // <= порога — "серые", > — цветные
 const SAT_GROUP_THRESHOLD = 35;
+const SLICE_TILE_SIZE = 4096;
 
 /* ---------- helpers: titles & numbers ---------- */
 
@@ -240,7 +241,15 @@ async function alignImagesInGivenOrder(images, config) {
  * tileIndices[i] — "номер" тайла (1,2,4...) для images[i].
  * Пропущенные номера дают пустые клетки в сетке (место того же размера).
  */
-async function alignImagesWithGaps(images, tileIndices, config, cellWidth, cellHeight, baseX, baseY) {
+async function alignImagesWithGaps(
+  images,
+  tileIndices,
+  config,
+  cellWidth,
+  cellHeight,
+  baseX,
+  baseY
+) {
   const { imagesPerRow, startCorner } = config;
 
   if (!images.length) return;
@@ -298,26 +307,21 @@ async function alignImagesWithGaps(images, tileIndices, config, cellWidth, cellH
     let row = Math.floor(pos / cols);
     let col = pos % cols;
 
-    // направление чтения в зависимости от угла
     let finalRow = row;
     let finalCol = col;
 
     switch (startCorner) {
       case "top-left":
-        // слева-направо, сверху-вниз — уже так
         break;
       case "top-right":
-        // справа-налево, сверху-вниз
-        finalCol = (cols - 1) - col;
+        finalCol = cols - 1 - col;
         break;
       case "bottom-left":
-        // слева-направо, снизу-вверх
-        finalRow = (rows - 1) - row;
+        finalRow = rows - 1 - row;
         break;
       case "bottom-right":
-        // справа-налево, снизу-вверх
-        finalRow = (rows - 1) - row;
-        finalCol = (cols - 1) - col;
+        finalRow = rows - 1 - row;
+        finalCol = cols - 1 - col;
         break;
       default:
         break;
@@ -436,7 +440,7 @@ async function sortImagesByColor(images) {
 
   meta.sort((a, b) => {
     if (a.hasCode && b.hasCode) {
-      if (a.group !== b.group) return a.group - b.group;         // серые → цветные
+      if (a.group !== b.group) return a.group - b.group; // серые → цветные
       if (a.briCode !== b.briCode) return a.briCode - b.briCode; // светлее → темнее
       if (a.satCode !== b.satCode) return a.satCode - b.satCode; // бледнее → насыщеннее
       return a.index - b.index;
@@ -734,14 +738,12 @@ async function handleStitchSubmit(event) {
         const minNum = Math.min(...numbered.map((m) => m.num));
         const maxNum = Math.max(...numbered.map((m) => m.num));
 
-        // тайлы с номером: берем их num как tileIndex
         meta.forEach((m) => {
           if (m.hasNumber) {
             m.tileIndex = m.num;
           }
         });
 
-        // без номера — ставим после последнего нумерованного, без пропусков
         let current = maxNum;
         meta.forEach((m) => {
           if (!m.hasNumber) {
@@ -752,7 +754,6 @@ async function handleStitchSubmit(event) {
 
         tileIndices = meta.map((m) => m.tileIndex);
       } else {
-        // если номеров вообще нет — skipMissing смысла не имеет
         tileIndices = null;
       }
     }
@@ -868,6 +869,220 @@ async function handleStitchSubmit(event) {
   }
 }
 
+/* ---------- SLICE handler (режим Slice: режем на 4096x4096 и собираем) ---------- */
+
+async function handleSliceSubmit(event) {
+  event.preventDefault();
+
+  const sliceButton = document.getElementById("sliceButton");
+  const progressBarEl = document.getElementById("sliceProgressBar");
+  const progressMainEl = document.getElementById("sliceProgressMain");
+  const progressEtaEl = document.getElementById("sliceProgressEta");
+
+  const updateBarAndText = (label, done, total) => {
+    const frac = total > 0 ? done / total : 0;
+    if (progressBarEl) {
+      progressBarEl.style.width = `${(frac * 100).toFixed(1)}%`;
+    }
+    if (progressMainEl) {
+      progressMainEl.textContent = label || "";
+    }
+  };
+
+  const setEtaText = (ms) => {
+    if (!progressEtaEl) return;
+    if (ms == null || !Number.isFinite(ms) || ms < 0) {
+      progressEtaEl.textContent = "";
+      return;
+    }
+    const totalSeconds = Math.round(ms / 1000);
+    const mins = Math.floor(totalSeconds / 60);
+    const secs = totalSeconds % 60;
+    const secsStr = secs.toString().padStart(2, "0");
+    const text = mins ? `${mins}m ${secsStr}s left` : `${secsStr}s left`;
+    progressEtaEl.textContent = text;
+  };
+
+  try {
+    const form = document.getElementById("slice-form");
+    if (!form) return;
+
+    const input = document.getElementById("sliceFileInput");
+    const files = input ? input.files : null;
+
+    if (!files || !files.length) {
+      await board.notifications.showError("Please select one or more image files.");
+      return;
+    }
+
+    if (sliceButton) sliceButton.disabled = true;
+
+    if (progressBarEl) progressBarEl.style.width = "0%";
+    if (progressMainEl) progressMainEl.textContent = "";
+    if (progressEtaEl) progressEtaEl.textContent = "";
+
+    const filesArray = Array.from(files);
+
+    // центр текущего вида — вокруг него будем раскладывать мозаики
+    let viewCenterX = 0;
+    let viewCenterY = 0;
+    try {
+      const viewport = await board.viewport.get();
+      viewCenterX = viewport.x + viewport.width / 2;
+      viewCenterY = viewport.y + viewport.height / 2;
+    } catch (e) {
+      console.warn("Could not get viewport, fallback to 0,0", e);
+    }
+
+    // 1. Подготовка: читаем файлы, узнаём размеры и считаем общее число тайлов
+    const fileInfos = [];
+    let totalTiles = 0;
+
+    for (let i = 0; i < filesArray.length; i++) {
+      const file = filesArray[i];
+      updateBarAndText(`Preparing ${i + 1} / ${filesArray.length}`, 0, 1);
+      setEtaText(null);
+
+      const dataUrl = await readFileAsDataUrl(file);
+      const imgEl = await loadImage(dataUrl);
+
+      const width = imgEl.naturalWidth || imgEl.width;
+      const height = imgEl.naturalHeight || imgEl.height;
+      const tilesX = Math.ceil(width / SLICE_TILE_SIZE);
+      const tilesY = Math.ceil(height / SLICE_TILE_SIZE);
+      const numTiles = tilesX * tilesY;
+
+      totalTiles += numTiles;
+
+      fileInfos.push({
+        file,
+        dataUrl,
+        imgEl,
+        width,
+        height,
+        tilesX,
+        tilesY,
+        numTiles,
+      });
+    }
+
+    if (!totalTiles) {
+      updateBarAndText("Nothing to slice.", 1, 1);
+      setEtaText(null);
+      return;
+    }
+
+    // 2. Режем и создаём тайлы
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    canvas.width = SLICE_TILE_SIZE;
+    canvas.height = SLICE_TILE_SIZE;
+
+    let createdTiles = 0;
+    let creationCount = 0;
+    let creationTimeSumMs = 0;
+    const allCreatedTiles = [];
+
+    for (let fi = 0; fi < fileInfos.length; fi++) {
+      const info = fileInfos[fi];
+      const { imgEl, width, height, tilesX, tilesY } = info;
+
+      const tilesForThisFile = [];
+
+      // базовый центр мозаики для этого файла
+      const mosaicCenterX = viewCenterX;
+      const mosaicCenterY = viewCenterY + fi * (SLICE_TILE_SIZE + 512);
+
+      for (let ty = 0; ty < tilesY; ty++) {
+        for (let tx = 0; tx < tilesX; tx++) {
+          const sx = tx * SLICE_TILE_SIZE;
+          const sy = ty * SLICE_TILE_SIZE;
+          const sw = Math.min(SLICE_TILE_SIZE, width - sx);
+          const sh = Math.min(SLICE_TILE_SIZE, height - sy);
+
+          ctx.clearRect(0, 0, SLICE_TILE_SIZE, SLICE_TILE_SIZE);
+          ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, sw, sh);
+
+          const tileDataUrl = canvas.toDataURL("image/png");
+
+          const t0 = performance.now();
+          const tileWidget = await board.createImage({
+            url: tileDataUrl,
+            x: 0,
+            y: 0,
+          });
+          const t1 = performance.now();
+
+          tilesForThisFile.push(tileWidget);
+          allCreatedTiles.push(tileWidget);
+
+          createdTiles++;
+          creationCount++;
+          creationTimeSumMs += t1 - t0;
+
+          const avgPerTile = creationTimeSumMs / creationCount;
+          const remaining = totalTiles - createdTiles;
+          const etaMs = remaining > 0 ? avgPerTile * remaining : null;
+
+          updateBarAndText(
+            `Slicing ${createdTiles} / ${totalTiles} tiles`,
+            createdTiles,
+            totalTiles
+          );
+          setEtaText(etaMs);
+        }
+      }
+
+      // выравниваем тайлы этого файла в сетку, чтобы собрать картинку
+      const cellWidth = Math.max(...tilesForThisFile.map((t) => t.width));
+      const cellHeight = Math.max(...tilesForThisFile.map((t) => t.height));
+
+      const gridWidth = tilesX * cellWidth;
+      const gridHeight = tilesY * cellHeight;
+
+      const baseLeft = mosaicCenterX - gridWidth / 2;
+      const baseTop = mosaicCenterY - gridHeight / 2;
+
+      let idx = 0;
+      for (let ty = 0; ty < tilesY; ty++) {
+        for (let tx = 0; tx < tilesX; tx++) {
+          const tile = tilesForThisFile[idx++];
+          const cx = baseLeft + tx * cellWidth + tile.width / 2;
+          const cy = baseTop + ty * cellHeight + tile.height / 2;
+          tile.x = cx;
+          tile.y = cy;
+        }
+      }
+      await Promise.all(tilesForThisFile.map((t) => t.sync()));
+    }
+
+    updateBarAndText("Done!", totalTiles, totalTiles);
+    setEtaText(null);
+
+    if (allCreatedTiles.length) {
+      try {
+        await board.viewport.zoomTo(allCreatedTiles);
+      } catch (e) {
+        console.warn("zoomTo failed in slice:", e);
+      }
+    }
+
+    await board.notifications.showInfo(
+      `Sliced into ${totalTiles} tile${totalTiles === 1 ? "" : "s"}.`
+    );
+  } catch (err) {
+    console.error(err);
+    if (progressMainEl) progressMainEl.textContent = "Error";
+    if (progressEtaEl) progressEtaEl.textContent = "";
+    if (progressBarEl) progressBarEl.style.width = "0%";
+    await board.notifications.showError(
+      "Something went wrong while slicing images. Please check the console."
+    );
+  } finally {
+    if (sliceButton) sliceButton.disabled = false;
+  }
+}
+
 /* ---------- init ---------- */
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -877,11 +1092,15 @@ window.addEventListener("DOMContentLoaded", () => {
   const stitchForm = document.getElementById("stitch-form");
   if (stitchForm) stitchForm.addEventListener("submit", handleStitchSubmit);
 
+  const sliceForm = document.getElementById("slice-form");
+  if (sliceForm) sliceForm.addEventListener("submit", handleSliceSubmit);
+
   // табы
   const tabButtons = document.querySelectorAll(".tab-btn");
   const tabContents = {
     sorting: document.getElementById("tab-sorting"),
     stitch: document.getElementById("tab-stitch"),
+    slice: document.getElementById("tab-slice"),
   };
 
   function activateTab(name) {
@@ -896,14 +1115,15 @@ window.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  if (tabButtons.length && tabContents.sorting && tabContents.stitch) {
+  if (tabButtons.length) {
     tabButtons.forEach((btn) => {
       btn.addEventListener("click", () => activateTab(btn.dataset.tab));
     });
-    activateTab("sorting");
+    // дефолтная вкладка — Stitch
+    activateTab("stitch");
   }
 
-  // кастомный файл-пикер
+  // кастомный файл-пикер для Stitch
   const fileButton = document.getElementById("stitchFileButton");
   const fileInput = document.getElementById("stitchFolderInput");
   const fileLabel = document.getElementById("stitchFileLabel");
@@ -924,5 +1144,28 @@ window.addEventListener("DOMContentLoaded", () => {
 
     fileInput.addEventListener("change", updateLabel);
     updateLabel();
+  }
+
+  // кастомный файл-пикер для Slice
+  const sliceFileButton = document.getElementById("sliceFileButton");
+  const sliceFileInput = document.getElementById("sliceFileInput");
+  const sliceFileLabel = document.getElementById("sliceFileLabel");
+
+  if (sliceFileButton && sliceFileInput && sliceFileLabel) {
+    sliceFileButton.addEventListener("click", () => sliceFileInput.click());
+
+    const updateSliceLabel = () => {
+      const files = sliceFileInput.files;
+      if (!files || files.length === 0) {
+        sliceFileLabel.textContent = "No files selected";
+      } else if (files.length === 1) {
+        sliceFileLabel.textContent = files[0].name;
+      } else {
+        sliceFileLabel.textContent = `${files.length} files selected`;
+      }
+    };
+
+    sliceFileInput.addEventListener("change", updateSliceLabel);
+    updateSliceLabel();
   }
 });
