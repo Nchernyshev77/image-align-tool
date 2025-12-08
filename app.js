@@ -5,7 +5,7 @@ const { board } = window.miro;
 // --- color settings ---
 const SAT_CODE_MAX = 99;              // максимум кода сатурации (00..99)
 const SAT_BOOST = 4.0;                // усиливаем сатурацию, чтобы растянуть шкалу
-const SAT_GROUP_THRESHOLD = 30;       // коды 0..30 считаем "почти серыми"
+const SAT_GROUP_THRESHOLD = 30;       // сейчас не используем в сортировке, но оставим на будущее
 
 /* ---------- helpers: titles & numbers ---------- */
 
@@ -320,13 +320,12 @@ async function sortImagesByNumber(images) {
  * (он выставляется во время импорта через Stitch),
  * и сортируем по нему.
  *
- * SS  = 0..99  – код сатурации (0 – серое, 99 – очень цветное)
+ * SS  = 0..99  – код сатурации (0 – серое/бледное, 99 – очень цветное)
  * BBB = 0..999 – код яркости (000 – белое, 999 – чёрное)
  *
  * Порядок:
- *   1) все с SS <= SAT_GROUP_THRESHOLD (почти серые), по яркости BBB;
- *   2) все с SS > SAT_GROUP_THRESHOLD (цветные), по яркости BBB;
- *   при равной яркости — по сатурации.
+ *   1) от более светлых к более тёмным (BBB по возрастанию),
+ *   2) при одинаковой яркости – от более бледных к более насыщенным (SS по возрастанию).
  */
 async function sortImagesByColor(images) {
   const meta = images.map((img, index) => {
@@ -341,13 +340,11 @@ async function sortImagesByColor(images) {
         hasCode: false,
         satCode: null,
         briCode: null,
-        group: null,
       };
     }
 
     const satCode = Number.parseInt(match[1], 10);
     const briCode = Number.parseInt(match[2], 10);
-    const group = satCode <= SAT_GROUP_THRESHOLD ? 0 : 1; // 0 – серые, 1 – цвет
 
     return {
       img,
@@ -356,7 +353,6 @@ async function sortImagesByColor(images) {
       hasCode: true,
       satCode,
       briCode,
-      group,
     };
   });
 
@@ -374,7 +370,7 @@ async function sortImagesByColor(images) {
       m.title || m.img.id,
       "=>",
       m.hasCode
-        ? `sat=${m.satCode}, bri=${m.briCode}, group=${m.group}`
+        ? `sat=${m.satCode}, bri=${m.briCode}`
         : "no-code"
     );
   });
@@ -382,9 +378,10 @@ async function sortImagesByColor(images) {
 
   meta.sort((a, b) => {
     if (a.hasCode && b.hasCode) {
-      if (a.group !== b.group) return a.group - b.group;          // серые раньше цветных
-      if (a.briCode !== b.briCode) return a.briCode - b.briCode;  // светлее раньше тёмных
-      if (a.satCode !== b.satCode) return a.satCode - b.satCode;  // менее насыщенные раньше
+      // 1) светлее раньше тёмных
+      if (a.briCode !== b.briCode) return a.briCode - b.briCode;
+      // 2) при равной яркости – бледные раньше насыщенных
+      if (a.satCode !== b.satCode) return a.satCode - b.satCode;
       return a.index - b.index;
     }
     if (a.hasCode) return -1;
@@ -425,7 +422,7 @@ async function handleSortingSubmit(event) {
 
     if (imagesPerRow < 1) {
       await board.notifications.showError(
-        "“Images per row” must be greater than 0."
+        "“Rows” must be greater than 0."
       );
       return;
     }
@@ -566,7 +563,7 @@ async function handleStitchSubmit(event) {
 
     if (imagesPerRow < 1) {
       await board.notifications.showError(
-        "“Images per row” must be greater than 0."
+        "“Rows” must be greater than 0."
       );
       return;
     }
@@ -697,12 +694,64 @@ async function handleStitchSubmit(event) {
   }
 }
 
-/* ---------- init ---------- */
+/* ---------- init (tabs + forms + file button) ---------- */
 
 window.addEventListener("DOMContentLoaded", () => {
+  // формы
   const sortingForm = document.getElementById("sorting-form");
   if (sortingForm) sortingForm.addEventListener("submit", handleSortingSubmit);
 
   const stitchForm = document.getElementById("stitch-form");
   if (stitchForm) stitchForm.addEventListener("submit", handleStitchSubmit);
+
+  // вкладки
+  const tabSorting = document.getElementById("tab-sorting");
+  const tabStitch = document.getElementById("tab-stitch");
+  const sectionSorting = document.getElementById("sorting-section");
+  const sectionStitch = document.getElementById("stitch-section");
+
+  function activateTab(name) {
+    if (!tabSorting || !tabStitch || !sectionSorting || !sectionStitch) return;
+    if (name === "sorting") {
+      tabSorting.classList.add("active");
+      tabStitch.classList.remove("active");
+      sectionSorting.classList.add("active");
+      sectionStitch.classList.remove("active");
+    } else {
+      tabSorting.classList.remove("active");
+      tabStitch.classList.add("active");
+      sectionSorting.classList.remove("active");
+      sectionStitch.classList.add("active");
+    }
+  }
+
+  if (tabSorting && tabStitch) {
+    tabSorting.addEventListener("click", () => activateTab("sorting"));
+    tabStitch.addEventListener("click", () => activateTab("stitch"));
+    // по умолчанию – Sorting
+    activateTab("sorting");
+  }
+
+  // кастомная кнопка выбора файлов
+  const fileButton = document.getElementById("stitchFileButton");
+  const fileInput = document.getElementById("stitchFolderInput");
+  const fileLabel = document.getElementById("stitchFileLabel");
+
+  if (fileButton && fileInput && fileLabel) {
+    fileButton.addEventListener("click", () => fileInput.click());
+
+    const updateLabel = () => {
+      const files = fileInput.files;
+      if (!files || files.length === 0) {
+        fileLabel.textContent = "No files chosen";
+      } else if (files.length === 1) {
+        fileLabel.textContent = files[0].name;
+      } else {
+        fileLabel.textContent = `${files.length} files selected`;
+      }
+    };
+
+    fileInput.addEventListener("change", updateLabel);
+    updateLabel();
+  }
 });
