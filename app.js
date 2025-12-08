@@ -1,10 +1,11 @@
 // app.js
-// Image Tools: Sorting (align selection) & Stitch (import and align).
+// Image Align Tool: Sorting (align selection) & Stitch (import and align).
 const { board } = window.miro;
 
 // --- color settings ---
 const SAT_CODE_MAX = 99;              // максимум кода сатурации (00..99)
 const SAT_BOOST = 4.0;                // усиливаем сатурацию, чтобы растянуть шкалу
+const SAT_GROUP_THRESHOLD = 10;       // <= порога — считаем "серым", выше — "цветным"
 
 /* ---------- helpers: titles & numbers ---------- */
 
@@ -312,7 +313,7 @@ async function sortImagesByNumber(images) {
   return meta.map((m) => m.img);
 }
 
-/* ---------- SORTING: by color code in title ---------- */
+/* ---------- SORTING: by color code in title (старый вариант) ---------- */
 
 /**
  * Color-sort: читаем префикс вида "CSS/BBB " из title
@@ -323,8 +324,10 @@ async function sortImagesByNumber(images) {
  * BBB = 0..999 – код яркости (000 – белое, 999 – чёрное)
  *
  * Порядок:
- *   1) от более светлых к более тёмным (BBB по возрастанию),
- *   2) при одинаковой яркости – от более бледных к более насыщенным (SS по возрастанию).
+ *   0. сначала "серые" (SS <= SAT_GROUP_THRESHOLD),
+ *      потом цветные (SS > SAT_GROUP_THRESHOLD);
+ *   1. внутри группы – от светлых к тёмным (BBB по возрастанию),
+ *   2. при одинаковой яркости – от бледных к насыщенным (SS по возрастанию).
  */
 async function sortImagesByColor(images) {
   const meta = images.map((img, index) => {
@@ -339,11 +342,13 @@ async function sortImagesByColor(images) {
         hasCode: false,
         satCode: null,
         briCode: null,
+        group: 1,
       };
     }
 
     const satCode = Number.parseInt(match[1], 10);
     const briCode = Number.parseInt(match[2], 10);
+    const group = satCode <= SAT_GROUP_THRESHOLD ? 0 : 1; // 0 – серые, 1 – цветные
 
     return {
       img,
@@ -352,6 +357,7 @@ async function sortImagesByColor(images) {
       hasCode: true,
       satCode,
       briCode,
+      group,
     };
   });
 
@@ -369,7 +375,7 @@ async function sortImagesByColor(images) {
       m.title || m.img.id,
       "=>",
       m.hasCode
-        ? `sat=${m.satCode}, bri=${m.briCode}`
+        ? `group=${m.group}, sat=${m.satCode}, bri=${m.briCode}`
         : "no-code"
     );
   });
@@ -377,9 +383,11 @@ async function sortImagesByColor(images) {
 
   meta.sort((a, b) => {
     if (a.hasCode && b.hasCode) {
-      // 1) светлее раньше тёмных
+      // серые (0) раньше цветных (1)
+      if (a.group !== b.group) return a.group - b.group;
+      // светлые раньше тёмных
       if (a.briCode !== b.briCode) return a.briCode - b.briCode;
-      // 2) при равной яркости – бледные раньше насыщенных
+      // бледные раньше насыщенных
       if (a.satCode !== b.satCode) return a.satCode - b.satCode;
       return a.index - b.index;
     }
@@ -555,7 +563,7 @@ async function handleStitchSubmit(event) {
 
     if (!files || !files.length) {
       await board.notifications.showError(
-        "Please choose one or more image files."
+        "Please select one or more image files."
       );
       return;
     }
@@ -693,7 +701,7 @@ async function handleStitchSubmit(event) {
   }
 }
 
-/* ---------- init (tabs + forms + file button) ---------- */
+/* ---------- init (tabs + forms + file button + description) ---------- */
 
 window.addEventListener("DOMContentLoaded", () => {
   // формы
@@ -709,6 +717,14 @@ window.addEventListener("DOMContentLoaded", () => {
     sorting: document.getElementById("tab-sorting"),
     stitch: document.getElementById("tab-stitch"),
   };
+  const descEl = document.getElementById("tab-description");
+
+  const descriptions = {
+    sorting:
+      "Sorting: align selected images into a grid using numbers or color codes in the title.",
+    stitch:
+      "Stitch: import image files, place them in the current view and arrange them into a grid with color codes.",
+  };
 
   function activateTab(name) {
     tabButtons.forEach((btn) => {
@@ -720,6 +736,10 @@ window.addEventListener("DOMContentLoaded", () => {
       if (!el) return;
       el.classList.toggle("active", key === name);
     });
+
+    if (descEl && descriptions[name]) {
+      descEl.textContent = descriptions[name];
+    }
   }
 
   if (tabButtons.length && tabContents.sorting && tabContents.stitch) {
@@ -740,7 +760,7 @@ window.addEventListener("DOMContentLoaded", () => {
     const updateLabel = () => {
       const files = fileInput.files;
       if (!files || files.length === 0) {
-        fileLabel.textContent = "No files chosen";
+        fileLabel.textContent = "No files selected";
       } else if (files.length === 1) {
         fileLabel.textContent = files[0].name;
       } else {
