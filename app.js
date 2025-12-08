@@ -92,12 +92,12 @@ function getBrightnessAndSaturationFromImageElement(
     const g = data[i + 1];
     const b = data[i + 2];
 
-    const y = 0.2126 * r + 0.7152 * g + 0.0722 * b; // яркость
+    const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
     sumY += y;
 
     const maxv = Math.max(r, g, b);
     const minv = Math.min(r, g, b);
-    sumDiff += maxv - minv; // "цветность"
+    sumDiff += maxv - minv;
   }
 
   const avgY = sumY / totalPixels;
@@ -122,7 +122,6 @@ async function alignImagesInGivenOrder(images, config) {
 
   if (!images.length) return;
 
-  // нормализация размера
   if (sizeMode === "width") {
     const targetWidth = Math.min(...images.map((img) => img.width));
     for (const img of images) img.width = targetWidth;
@@ -338,9 +337,9 @@ async function sortImagesByColor(images) {
 
   meta.sort((a, b) => {
     if (a.hasCode && b.hasCode) {
-      if (a.group !== b.group) return a.group - b.group;
-      if (a.briCode !== b.briCode) return a.briCode - b.briCode;
-      if (a.satCode !== b.satCode) return a.satCode - b.satCode;
+      if (a.group !== b.group) return a.group - b.group;         // серые → цветные
+      if (a.briCode !== b.briCode) return a.briCode - b.briCode; // светлее → темнее
+      if (a.satCode !== b.satCode) return a.satCode - b.satCode; // бледнее → насыщеннее
       return a.index - b.index;
     }
     if (a.hasCode) return -1;
@@ -474,37 +473,38 @@ function sortFilesByNameWithNumber(files) {
   return arr.map((m) => m.file);
 }
 
-/* ---------- STITCH handler с простым прогресс-баром и ETA ---------- */
+/* ---------- STITCH handler (прогресс-бар + ETA по средней скорости создания) ---------- */
 
 async function handleStitchSubmit(event) {
   event.preventDefault();
 
   const stitchButton = document.getElementById("stitchButton");
-  const progressTextEl = document.getElementById("stitchProgress");
   const progressBarEl = document.getElementById("stitchProgressBar");
+  const progressMainEl = document.getElementById("stitchProgressMain");
+  const progressEtaEl = document.getElementById("stitchProgressEta");
 
-  const setProgress = (label, doneSteps, totalSteps, startTime) => {
+  const updateBarAndText = (label, doneSteps, totalSteps) => {
     const frac = totalSteps > 0 ? doneSteps / totalSteps : 0;
     if (progressBarEl) {
       progressBarEl.style.width = `${(frac * 100).toFixed(1)}%`;
     }
-
-    let etaText = "";
-    if (doneSteps > 0 && doneSteps < totalSteps) {
-      const elapsed = (performance.now() - startTime) / 1000;
-      const remaining = (elapsed * (totalSteps - doneSteps)) / doneSteps;
-      const mins = Math.floor(remaining / 60);
-      const secs = Math.round(remaining % 60);
-      const secsStr = secs.toString().padStart(2, "0");
-      etaText =
-        " · ~" +
-        (mins ? `${mins}m ${secsStr}s` : `${secsStr}s`) +
-        " left";
+    if (progressMainEl) {
+      progressMainEl.textContent = label || "";
     }
+  };
 
-    if (progressTextEl) {
-      progressTextEl.textContent = label + (etaText || "");
+  const setEtaText = (ms) => {
+    if (!progressEtaEl) return;
+    if (ms == null || !Number.isFinite(ms) || ms < 0) {
+      progressEtaEl.textContent = "";
+      return;
     }
+    const totalSeconds = Math.round(ms / 1000);
+    const mins = Math.floor(totalSeconds / 60);
+    const secs = totalSeconds % 60;
+    const secsStr = secs.toString().padStart(2, "0");
+    const text = mins ? `${mins}m ${secsStr}s left` : `${secsStr}s left`;
+    progressEtaEl.textContent = text;
   };
 
   try {
@@ -532,13 +532,15 @@ async function handleStitchSubmit(event) {
     }
 
     if (stitchButton) stitchButton.disabled = true;
+
+    // reset progress UI
     if (progressBarEl) progressBarEl.style.width = "0%";
-    if (progressTextEl) progressTextEl.textContent = "";
+    if (progressMainEl) progressMainEl.textContent = "";
+    if (progressEtaEl) progressEtaEl.textContent = "";
 
     const filesArray = Array.from(files);
     const totalSteps = filesArray.length * 2 + 1; // чтение+анализ, создание, выравнивание
     let doneSteps = 0;
-    const startTime = performance.now();
 
     const fileInfos = [];
 
@@ -553,11 +555,16 @@ async function handleStitchSubmit(event) {
       console.warn("Could not get viewport, falling back to (0,0):", e);
     }
 
-    // чтение и анализ
+    // --- 1. чтение и анализ файлов (ETA здесь не считаем, только прогресс) ---
     for (let i = 0; i < filesArray.length; i++) {
       const file = filesArray[i];
-      const label = `Processing ${i + 1} / ${filesArray.length}…`;
-      setProgress(label, doneSteps, totalSteps, startTime);
+
+      updateBarAndText(
+        `Processing ${i + 1} / ${filesArray.length}`,
+        doneSteps,
+        totalSteps
+      );
+      setEtaText(null); // без времени на этом этапе
 
       const dataUrl = await readFileAsDataUrl(file);
 
@@ -589,45 +596,75 @@ async function handleStitchSubmit(event) {
       fileInfos.push({ file, dataUrl, brightness, saturation, briCode, satCode });
 
       doneSteps++;
-      setProgress(label, doneSteps, totalSteps, startTime);
+      updateBarAndText(
+        `Processing ${i + 1} / ${filesArray.length}`,
+        doneSteps,
+        totalSteps
+      );
     }
 
-    // сортировка файлов
-    setProgress("Ordering files…", doneSteps, totalSteps, startTime);
+    // --- 2. сортировка файлов ---
+    updateBarAndText("Ordering files…", doneSteps, totalSteps);
+    setEtaText(null);
 
     const orderedFiles = sortFilesByNameWithNumber(filesArray);
     const infoByFile = new Map();
     fileInfos.forEach((info) => infoByFile.set(info.file, info));
     const orderedInfos = orderedFiles.map((f) => infoByFile.get(f));
 
-    // создание виджетов
+    // --- 3. создание виджетов + ETA по средней скорости создания ---
     const createdImages = [];
     const offsetStep = 50;
-
     const pad2 = (n) => String(n).padStart(2, "0");
     const pad3 = (n) => String(n).padStart(3, "0");
+
+    const totalImages = orderedInfos.length;
+    let creationCount = 0;
+    let creationTimeSumMs = 0;
 
     for (let i = 0; i < orderedInfos.length; i++) {
       const info = orderedInfos[i];
       const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${info.file.name}`;
-      const label = `Creating ${i + 1} / ${orderedInfos.length}…`;
-      setProgress(label, doneSteps, totalSteps, startTime);
 
+      const indexHuman = i + 1;
+      updateBarAndText(
+        `Creating ${indexHuman} / ${totalImages}`,
+        doneSteps,
+        totalSteps
+      );
+
+      const t0 = performance.now();
       const img = await board.createImage({
         url: info.dataUrl,
         x: baseX + (i % 5) * offsetStep,
         y: baseY + Math.floor(i / 5) * offsetStep,
         title,
       });
+      const t1 = performance.now();
 
       createdImages.push(img);
 
+      const duration = t1 - t0; // ms
+      creationCount += 1;
+      creationTimeSumMs += duration;
+      const avgPerImageMs = creationTimeSumMs / creationCount;
+      const remainingImages = totalImages - creationCount;
+      const etaMs =
+        remainingImages > 0 ? avgPerImageMs * remainingImages : null;
+
       doneSteps++;
-      setProgress(label, doneSteps, totalSteps, startTime);
+      updateBarAndText(
+        `Creating ${indexHuman} / ${totalImages}`,
+        doneSteps,
+        totalSteps
+      );
+      setEtaText(etaMs);
     }
 
-    // выравнивание
-    setProgress("Aligning images…", doneSteps, totalSteps, startTime);
+    // --- 4. выравнивание ---
+    updateBarAndText("Aligning images…", doneSteps, totalSteps);
+    setEtaText(null);
+
     await alignImagesInGivenOrder(createdImages, {
       imagesPerRow,
       horizontalGap: 0,
@@ -635,8 +672,10 @@ async function handleStitchSubmit(event) {
       sizeMode: "none",
       startCorner,
     });
+
     doneSteps++;
-    setProgress("Done.", doneSteps, totalSteps, startTime);
+    updateBarAndText("Done!", doneSteps, totalSteps);
+    setEtaText(null);
 
     try {
       await board.viewport.zoomTo(createdImages);
@@ -651,7 +690,8 @@ async function handleStitchSubmit(event) {
     );
   } catch (err) {
     console.error(err);
-    if (progressTextEl) progressTextEl.textContent = "Error.";
+    if (progressMainEl) progressMainEl.textContent = "Error";
+    if (progressEtaEl) progressEtaEl.textContent = "";
     if (progressBarEl) progressBarEl.style.width = "0%";
     await board.notifications.showError(
       "Something went wrong while importing images. Please check the console."
