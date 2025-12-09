@@ -1,5 +1,5 @@
 // app.js
-// Image Align Tool: Sorting (align selection), Stitch (import grid), Slice (cut big images into tiles)
+// Image Align Tool: Sorting (align selection) + Stitch/Slice (импорт + автослайс больших изображений)
 
 const { board } = window.miro;
 
@@ -7,8 +7,10 @@ const { board } = window.miro;
 const SAT_CODE_MAX = 99;
 const SAT_BOOST = 4.0;
 const SAT_GROUP_THRESHOLD = 35;      // порог сатурации: <= серые, > цветные
-const SLICE_TILE_SIZE = 4096;        // размер тайла в Slice
-let   MAX_SLICE_DIM = 16384;         // будет уточнён через WebGL (16k / 32k)
+const SLICE_TILE_SIZE = 4096;        // размер тайла при слайсе
+const SLICE_THRESHOLD_WIDTH = 8192;  // если ширина > этого, режем
+const SLICE_THRESHOLD_HEIGHT = 4096; // если высота > этого, режем
+let   MAX_SLICE_DIM = 16384;         // уточняется через WebGL (16k / 32k)
 const MAX_URL_BYTES = 30000000;      // лимит размера поля url в Miro (из ошибки)
 
 // ---------- авто-детект лимита по стороне через WebGL ----------
@@ -28,7 +30,6 @@ function detectMaxSliceDim() {
     const maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     console.log("Slice: MAX_TEXTURE_SIZE =", maxTexSize);
 
-    // ограничиваем сверху разумным значением
     MAX_SLICE_DIM = Math.min(maxTexSize || 16384, 32767);
   } catch (e) {
     console.warn("Slice: failed to detect MAX_TEXTURE_SIZE, using fallback.", e);
@@ -143,7 +144,7 @@ function getBrightnessAndSaturationFromImageElement(
   return { brightness, saturation: saturationApprox };
 }
 
-// ---------- helpers: alignment ----------
+// ---------- helpers: alignment (используется в Sorting) ----------
 
 async function alignImagesInGivenOrder(images, config) {
   const {
@@ -156,7 +157,6 @@ async function alignImagesInGivenOrder(images, config) {
 
   if (!images.length) return;
 
-  // 1. выравниваем размер (если нужно)
   if (sizeMode === "width") {
     const targetWidth = Math.min(...images.map((img) => img.width));
     for (const img of images) img.width = targetWidth;
@@ -174,7 +174,6 @@ async function alignImagesInGivenOrder(images, config) {
   const rowHeights = new Array(rows).fill(0);
   const rowWidths = new Array(rows).fill(0);
 
-  // собираем размеры строк
   for (let i = 0; i < total; i++) {
     const r = Math.floor(i / cols);
     const img = images[i];
@@ -212,7 +211,6 @@ async function alignImagesInGivenOrder(images, config) {
     rowCursorX[r] += img.width + horizontalGap;
   }
 
-  // bounding box исходного набора картинок
   const bounds = images.map((img) => ({
     left: img.x - img.width / 2,
     top: img.y - img.height / 2,
@@ -271,112 +269,11 @@ async function alignImagesInGivenOrder(images, config) {
   await Promise.all(images.map((img) => img.sync()));
 }
 
-/**
- * Выравнивание с пропусками тайлов (Stitch, skip missing tiles).
- * tileIndices[i] — "номер" тайла (1,2,4...) для images[i].
- */
-async function alignImagesWithGaps(
-  images,
-  tileIndices,
-  config,
-  cellWidth,
-  cellHeight,
-  baseX,
-  baseY
-) {
-  const { imagesPerRow, startCorner } = config;
-
-  if (!images.length) return;
-  if (!tileIndices || tileIndices.length !== images.length) {
-    console.warn("alignImagesWithGaps: invalid tileIndices, fallback.");
-    await alignImagesInGivenOrder(images, {
-      ...config,
-      horizontalGap: 0,
-      verticalGap: 0,
-      sizeMode: "none",
-    });
-    return;
-  }
-
-  const cols = Math.max(1, imagesPerRow);
-
-  const minIndex = Math.min(...tileIndices);
-  const maxIndex = Math.max(...tileIndices);
-  const maxPos = maxIndex - minIndex; // 0-based
-  const rows = Math.floor(maxPos / cols) + 1;
-
-  const gridWidth = cols * cellWidth;
-  const gridHeight = rows * cellHeight;
-
-  let originLeft;
-  let originTop;
-
-  switch (startCorner) {
-    case "top-left":
-      originLeft = baseX;
-      originTop = baseY;
-      break;
-    case "top-right":
-      originLeft = baseX - gridWidth;
-      originTop = baseY;
-      break;
-    case "bottom-left":
-      originLeft = baseX;
-      originTop = baseY - gridHeight;
-      break;
-    case "bottom-right":
-      originLeft = baseX - gridWidth;
-      originTop = baseY - gridHeight;
-      break;
-    default:
-      originLeft = baseX;
-      originTop = baseY;
-  }
-
-  for (let i = 0; i < images.length; i++) {
-    const img = images[i];
-    const tIndex = tileIndices[i];
-
-    const pos = tIndex - minIndex; // 0-based
-    let row = Math.floor(pos / cols);
-    let col = pos % cols;
-
-    let finalRow = row;
-    let finalCol = col;
-
-    switch (startCorner) {
-      case "top-left":
-        break;
-      case "top-right":
-        finalCol = cols - 1 - col;
-        break;
-      case "bottom-left":
-        finalRow = rows - 1 - row;
-        break;
-      case "bottom-right":
-        finalRow = rows - 1 - row;
-        finalCol = cols - 1 - col;
-        break;
-      default:
-        break;
-    }
-
-    const centerX = originLeft + finalCol * cellWidth + cellWidth / 2;
-    const centerY = originTop + finalRow * cellHeight + cellHeight / 2;
-
-    img.x = centerX;
-    img.y = centerY;
-  }
-
-  await Promise.all(images.map((img) => img.sync()));
-}
-
 // ---------- SORTING: by number ----------
 
 async function sortImagesByNumber(images) {
   const hasAnyEmptyTitle = images.some((img) => !getTitle(img));
 
-  // если у части картинок нет заголовка — нумеруем по геометрии
   if (hasAnyEmptyTitle) {
     const geoOrder = sortByGeometry(images);
     let counter = 1;
@@ -419,7 +316,7 @@ async function sortImagesByNumber(images) {
   return meta.map((m) => m.img);
 }
 
-// ---------- SORTING: by color ----------
+// ---------- SORTING: by color (по Cxx/yyy в title) ----------
 
 async function sortImagesByColor(images) {
   const meta = images.map((img, index) => {
@@ -473,12 +370,11 @@ async function sortImagesByColor(images) {
   });
   console.groupEnd();
 
-  // порядок: серые → цветные, внутри группы: светлые → тёмные, бледные → насыщенные
   meta.sort((a, b) => {
     if (a.hasCode && b.hasCode) {
-      if (a.group !== b.group) return a.group - b.group;
-      if (a.briCode !== b.briCode) return a.briCode - b.briCode;
-      if (a.satCode !== b.satCode) return a.satCode - b.satCode;
+      if (a.group !== b.group) return a.group - b.group;      // серые → цветные
+      if (a.briCode !== b.briCode) return a.briCode - b.briCode; // светлее → темнее
+      if (a.satCode !== b.satCode) return a.satCode - b.satCode; // бледнее → насыщеннее
       return a.index - b.index;
     }
     if (a.hasCode) return -1;
@@ -503,7 +399,6 @@ async function handleSortingSubmit(event) {
     const verticalGap = Number(form.sortingVerticalGap.value) || 0;
     const sizeMode = form.sortingSizeMode.value;
     const startCorner = form.sortingStartCorner.value;
-
     const sortModeEl = document.getElementById("sortingSortMode");
     const sortMode = sortModeEl ? sortModeEl.value : "number";
 
@@ -552,7 +447,7 @@ async function handleSortingSubmit(event) {
   }
 }
 
-// ---------- STITCH helpers ----------
+// ---------- STITCH/S SLICE helpers ----------
 
 function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
@@ -578,7 +473,7 @@ function sortFilesByNameWithNumber(files) {
     };
   });
 
-  console.groupCollapsed("Stitch – files & numbers");
+  console.groupCollapsed("Stitch/Slice – files & numbers");
   arr.forEach((m) => console.log(m.name, "=>", m.num));
   console.groupEnd();
 
@@ -611,7 +506,182 @@ function sortFilesByNameWithNumber(files) {
   return arr.map((m) => m.file);
 }
 
-// ---------- STITCH handler (прогресс + ETA + skip missing tiles) ----------
+/**
+ * Кодирует canvas в JPEG и, при необходимости, понижает качество,
+ * чтобы строка dataURL была меньше maxBytes. Если не получилось — возвращает null.
+ */
+function canvasToDataUrlUnderLimit(canvas, maxBytes = MAX_URL_BYTES) {
+  let quality = 0.9;
+  let dataUrl = canvas.toDataURL("image/jpeg", quality);
+
+  while (dataUrl.length > maxBytes && quality > 0.3) {
+    quality -= 0.1;
+    dataUrl = canvas.toDataURL("image/jpeg", quality);
+  }
+
+  if (dataUrl.length > maxBytes) {
+    console.error(
+      "Slice: tile dataURL is still too large after compression:",
+      dataUrl.length,
+      "bytes"
+    );
+    return null;
+  }
+
+  return dataUrl;
+}
+
+/**
+ * Вычисляет центры "слотов" для файлов (все размеры разные),
+ * без пропусков, с учётом startCorner.
+ */
+function computeVariableSlotCenters(orderedInfos, imagesPerRow, startCorner, viewCenterX, viewCenterY) {
+  const totalSlots = orderedInfos.length;
+  if (!totalSlots) return [];
+
+  const cols = Math.max(1, imagesPerRow);
+  const rows = Math.ceil(totalSlots / cols);
+  const horizontalGap = 0;
+  const verticalGap = 0;
+
+  const rowHeights = new Array(rows).fill(0);
+  const rowWidths = new Array(rows).fill(0);
+
+  for (let i = 0; i < totalSlots; i++) {
+    const r = Math.floor(i / cols);
+    const info = orderedInfos[i];
+    const w = info.width;
+    const h = info.height;
+
+    if (h > rowHeights[r]) rowHeights[r] = h;
+    if (rowWidths[r] > 0) rowWidths[r] += horizontalGap;
+    rowWidths[r] += w;
+  }
+
+  const gridWidth = rowWidths.length ? Math.max(...rowWidths) : 0;
+  const gridHeight =
+    rowHeights.reduce((sum, h) => sum + h, 0) +
+    verticalGap * Math.max(0, rows - 1);
+
+  const rowTop = new Array(rows).fill(0);
+  for (let r = 1; r < rows; r++) {
+    rowTop[r] = rowTop[r - 1] + rowHeights[r - 1] + verticalGap;
+  }
+
+  const baseX = new Array(totalSlots).fill(0);
+  const baseY = new Array(totalSlots).fill(0);
+  const rowCursorX = new Array(rows).fill(0);
+
+  for (let i = 0; i < totalSlots; i++) {
+    const r = Math.floor(i / cols);
+    const info = orderedInfos[i];
+    const w = info.width;
+
+    const centerY = rowTop[r] + rowHeights[r] / 2;
+    const centerX = rowCursorX[r] + w / 2;
+
+    baseX[i] = centerX;
+    baseY[i] = centerY;
+
+    rowCursorX[r] += w + horizontalGap;
+  }
+
+  let flipX = false;
+  let flipY = false;
+  switch (startCorner) {
+    case "top-right":
+      flipX = true;
+      break;
+    case "bottom-left":
+      flipY = true;
+      break;
+    case "bottom-right":
+      flipX = true;
+      flipY = true;
+      break;
+    default:
+      break;
+  }
+
+  const centers = [];
+  for (let i = 0; i < totalSlots; i++) {
+    let x0 = baseX[i] - gridWidth / 2;
+    let y0 = baseY[i] - gridHeight / 2;
+
+    if (flipX) x0 = -x0;
+    if (flipY) y0 = -y0;
+
+    const cx = viewCenterX + x0;
+    const cy = viewCenterY + y0;
+    centers.push({ x: cx, y: cy });
+  }
+
+  return centers;
+}
+
+/**
+ * Вычисляет центры "слотов" при Skip missing tiles.
+ * Все тайлы считаются одного размера (по первому).
+ */
+function computeSkipMissingSlotCenters(tileInfos, imagesPerRow, startCorner, viewCenterX, viewCenterY) {
+  if (!tileInfos.length) return [];
+
+  const numbered = tileInfos.map(({ info, num }) => ({ info, num }));
+
+  const nums = numbered.map((n) => n.num);
+  const minNum = Math.min(...nums);
+  const maxNum = Math.max(...nums);
+
+  const cols = Math.max(1, imagesPerRow);
+  const cellWidth = tileInfos[0].info.width;
+  const cellHeight = tileInfos[0].info.height;
+
+  const totalSlots = maxNum - minNum + 1;
+  const rows = Math.ceil(totalSlots / cols);
+
+  const gridWidth = cols * cellWidth;
+  const gridHeight = rows * cellHeight;
+
+  let flipX = false;
+  let flipY = false;
+  switch (startCorner) {
+    case "top-right":
+      flipX = true;
+      break;
+    case "bottom-left":
+      flipY = true;
+      break;
+    case "bottom-right":
+      flipX = true;
+      flipY = true;
+      break;
+    default:
+      break;
+  }
+
+  const centersByFileId = new Map();
+
+  for (const { info, num } of tileInfos) {
+    const pos = num - minNum; // 0-based
+    let row = Math.floor(pos / cols);
+    let col = pos % cols;
+
+    if (flipX) col = cols - 1 - col;
+    if (flipY) row = rows - 1 - row;
+
+    const left = viewCenterX - gridWidth / 2 + col * cellWidth;
+    const top = viewCenterY - gridHeight / 2 + row * cellHeight;
+
+    const cx = left + cellWidth / 2;
+    const cy = top + cellHeight / 2;
+
+    centersByFileId.set(info.file, { x: cx, y: cy });
+  }
+
+  return centersByFileId;
+}
+
+// ---------- STITCH/S SLICE handler ----------
 
 async function handleStitchSubmit(event) {
   event.preventDefault();
@@ -621,13 +691,22 @@ async function handleStitchSubmit(event) {
   const progressMainEl = document.getElementById("stitchProgressMain");
   const progressEtaEl = document.getElementById("stitchProgressEta");
 
-  const updateBarAndText = (label, doneSteps, totalSteps) => {
-    const frac = totalSteps > 0 ? doneSteps / totalSteps : 0;
+  const setProgress = (done, total, labelOverride) => {
+    const frac = total > 0 ? done / total : 0;
     if (progressBarEl) {
       progressBarEl.style.width = `${(frac * 100).toFixed(1)}%`;
     }
     if (progressMainEl) {
-      progressMainEl.textContent = label || "";
+      if (labelOverride !== undefined) {
+        progressMainEl.textContent = labelOverride;
+      } else if (total > 0) {
+        progressMainEl.textContent =
+          done < total
+            ? `Creating ${done} / ${total}`
+            : "Done!";
+      } else {
+        progressMainEl.textContent = "";
+      }
     }
   };
 
@@ -669,46 +748,70 @@ async function handleStitchSubmit(event) {
     }
 
     if (stitchButton) stitchButton.disabled = true;
-
-    if (progressBarEl) progressBarEl.style.width = "0%";
-    if (progressMainEl) progressMainEl.textContent = "";
-    if (progressEtaEl) progressEtaEl.textContent = "";
+    setProgress(0, 0, "");
+    setEtaText(null);
 
     const filesArray = Array.from(files);
-    const totalSteps = filesArray.length * 2 + 1; // чтение+анализ, создание, выравнивание
-    let doneSteps = 0;
-
-    const fileInfos = [];
 
     // центр текущего вида
-    let baseX = 0;
-    let baseY = 0;
+    let viewCenterX = 0;
+    let viewCenterY = 0;
     try {
       const viewport = await board.viewport.get();
-      baseX = viewport.x + viewport.width / 2;
-      baseY = viewport.y + viewport.height / 2;
+      viewCenterX = viewport.x + viewport.width / 2;
+      viewCenterY = viewport.y + viewport.height / 2;
     } catch (e) {
-      console.warn("Could not get viewport, falling back to (0,0):", e);
+      console.warn("Stitch/Slice: could not get viewport, fallback to 0,0", e);
     }
 
-    // --- 1. чтение и анализ ---
+    // --- 1. подготовка: читаем файлы, узнаём размеры, считаем brightness/sat, классифицируем ---
+    const fileInfos = [];
+    let anySliced = false;
+
+    setProgress(0, 0, "Preparing files…");
+
     for (let i = 0; i < filesArray.length; i++) {
       const file = filesArray[i];
 
-      updateBarAndText(
-        `Processing ${i + 1} / ${filesArray.length}`,
-        doneSteps,
-        totalSteps
-      );
-      setEtaText(null);
-
       const dataUrl = await readFileAsDataUrl(file);
+
+      let imgEl;
+      try {
+        imgEl = await loadImage(dataUrl);
+      } catch (e) {
+        console.error("Stitch/Slice: browser failed to decode image", file.name, e);
+        await board.notifications.showError(
+          `Cannot import "${file.name}": browser failed to decode the image.`
+        );
+        continue;
+      }
+
+      const width = imgEl.naturalWidth || imgEl.width;
+      const height = imgEl.naturalHeight || imgEl.height;
+
+      if (!width || !height) {
+        console.error("Stitch/Slice: invalid dimensions", width, height, file.name);
+        await board.notifications.showError(
+          `Cannot import "${file.name}": image has invalid dimensions.`
+        );
+        continue;
+      }
+
+      if (width > MAX_SLICE_DIM || height > MAX_SLICE_DIM) {
+        console.warn(
+          `Stitch/Slice: image too large (${width}x${height}), limit is ${MAX_SLICE_DIM}px per side.`
+        );
+        await board.notifications.showError(
+          `Image "${file.name}" is too large (${width}×${height}). ` +
+            `Stitch/Slice supports up to ${MAX_SLICE_DIM}px per side on this device. ` +
+            `Please downscale or pre-slice it externally.`
+        );
+        continue;
+      }
 
       let brightness = 0.5;
       let saturation = 0.0;
-
       try {
-        const imgEl = await loadImage(dataUrl);
         const res = getBrightnessAndSaturationFromImageElement(imgEl);
         if (res) {
           brightness = res.brightness;
@@ -716,7 +819,7 @@ async function handleStitchSubmit(event) {
         }
       } catch (e) {
         console.warn(
-          "Failed to compute brightness/saturation for stitched image:",
+          "Stitch/Slice: brightness/saturation calc failed for",
           file.name,
           e
         );
@@ -729,321 +832,19 @@ async function handleStitchSubmit(event) {
       const satCodeRaw = Math.round(boostedSat * SAT_CODE_MAX);
       const satCode = Math.max(0, Math.min(SAT_CODE_MAX, satCodeRaw));
 
-      fileInfos.push({ file, dataUrl, brightness, saturation, briCode, satCode });
+      const needsSlice =
+        width > SLICE_THRESHOLD_WIDTH || height > SLICE_THRESHOLD_HEIGHT;
 
-      doneSteps++;
-      updateBarAndText(
-        `Processing ${i + 1} / ${filesArray.length}`,
-        doneSteps,
-        totalSteps
-      );
-    }
+      if (needsSlice) anySliced = true;
 
-    // --- 2. сортировка файлов по имени/номеру ---
-    updateBarAndText("Ordering files…", doneSteps, totalSteps);
-    setEtaText(null);
-
-    const orderedFiles = sortFilesByNameWithNumber(filesArray);
-    const infoByFile = new Map();
-    fileInfos.forEach((info) => infoByFile.set(info.file, info));
-    const orderedInfos = orderedFiles.map((f) => infoByFile.get(f));
-
-    // подготовка номеров тайлов для skipMissing
-    let tileIndices = null;
-    if (skipMissingTiles) {
-      const meta = orderedFiles.map((file, idx) => {
-        const info = orderedInfos[idx];
-        const name = file.name || "";
-        const num = extractTrailingNumber(name);
-        return {
-          file,
-          info,
-          name,
-          hasNumber: num !== null,
-          num,
-          tileIndex: null,
-        };
-      });
-
-      const numbered = meta.filter((m) => m.hasNumber);
-      if (numbered.length > 0) {
-        const minNum = Math.min(...numbered.map((m) => m.num));
-        const maxNum = Math.max(...numbered.map((m) => m.num));
-
-        meta.forEach((m) => {
-          if (m.hasNumber) {
-            m.tileIndex = m.num;
-          }
-        });
-
-        let current = maxNum;
-        meta.forEach((m) => {
-          if (!m.hasNumber) {
-            current += 1;
-            m.tileIndex = current;
-          }
-        });
-
-        tileIndices = meta.map((m) => m.tileIndex);
-      } else {
-        tileIndices = null;
+      let tilesX = 1;
+      let tilesY = 1;
+      let numTiles = 1;
+      if (needsSlice) {
+        tilesX = Math.ceil(width / SLICE_TILE_SIZE);
+        tilesY = Math.ceil(height / SLICE_TILE_SIZE);
+        numTiles = tilesX * tilesY;
       }
-    }
-
-    // --- 3. создание виджетов + ETA ---
-    const createdImages = [];
-    const offsetStep = 50;
-    const pad2 = (n) => String(n).padStart(2, "0");
-    const pad3 = (n) => String(n).padStart(3, "0");
-
-    const totalImages = orderedInfos.length;
-    let creationCount = 0;
-    let creationTimeSumMs = 0;
-    let baseCellWidth = null;
-    let baseCellHeight = null;
-
-    for (let i = 0; i < orderedInfos.length; i++) {
-      const info = orderedInfos[i];
-      const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${info.file.name}`;
-
-      const indexHuman = i + 1;
-      updateBarAndText(
-        `Creating ${indexHuman} / ${totalImages}`,
-        doneSteps,
-        totalSteps
-      );
-
-      const t0 = performance.now();
-      const img = await board.createImage({
-        url: info.dataUrl,
-        x: baseX + (i % 5) * offsetStep,
-        y: baseY + Math.floor(i / 5) * offsetStep,
-        title,
-      });
-      const t1 = performance.now();
-
-      createdImages.push(img);
-
-      if (baseCellWidth == null || baseCellHeight == null) {
-        baseCellWidth = img.width;
-        baseCellHeight = img.height;
-      }
-
-      const duration = t1 - t0;
-      creationCount += 1;
-      creationTimeSumMs += duration;
-      const avgPerImageMs = creationTimeSumMs / creationCount;
-      const remainingImages = totalImages - creationCount;
-      const etaMs =
-        remainingImages > 0 ? avgPerImageMs * remainingImages : null;
-
-      doneSteps++;
-      updateBarAndText(
-        `Creating ${indexHuman} / ${totalImages}`,
-        doneSteps,
-        totalSteps
-      );
-      setEtaText(etaMs);
-    }
-
-    // --- 4. выравнивание (с пропусками или без) ---
-    updateBarAndText("Aligning images…", doneSteps, totalSteps);
-    setEtaText(null);
-
-    if (skipMissingTiles && tileIndices && baseCellWidth && baseCellHeight) {
-      await alignImagesWithGaps(
-        createdImages,
-        tileIndices,
-        {
-          imagesPerRow,
-          startCorner,
-        },
-        baseCellWidth,
-        baseCellHeight,
-        baseX,
-        baseY
-      );
-    } else {
-      await alignImagesInGivenOrder(createdImages, {
-        imagesPerRow,
-        horizontalGap: 0,
-        verticalGap: 0,
-        sizeMode: "none",
-        startCorner,
-      });
-    }
-
-    doneSteps++;
-    updateBarAndText("Done!", doneSteps, totalSteps);
-    setEtaText(null);
-
-    try {
-      await board.viewport.zoomTo(createdImages);
-    } catch (e) {
-      console.warn("zoomTo failed or not supported with items:", e);
-    }
-
-    await board.notifications.showInfo(
-      `Imported and stitched ${createdImages.length} image${
-        createdImages.length === 1 ? "" : "s"
-      }.`
-    );
-  } catch (err) {
-    console.error(err);
-    if (progressMainEl) progressMainEl.textContent = "Error";
-    if (progressEtaEl) progressEtaEl.textContent = "";
-    if (progressBarEl) progressBarEl.style.width = "0%";
-    await board.notifications.showError(
-      "Something went wrong while importing images. Please check the console."
-    );
-  } finally {
-    if (stitchButton) stitchButton.disabled = false;
-  }
-}
-
-// ---------- SLICE helpers ----------
-
-/**
- * Кодирует canvas в JPEG и, при необходимости, понижает качество,
- * чтобы строка dataURL была меньше maxBytes. Если не получилось — возвращает null.
- */
-function canvasToDataUrlUnderLimit(canvas, maxBytes = MAX_URL_BYTES) {
-  let quality = 0.9;
-  let dataUrl = canvas.toDataURL("image/jpeg", quality);
-
-  while (dataUrl.length > maxBytes && quality > 0.3) {
-    quality -= 0.1;
-    dataUrl = canvas.toDataURL("image/jpeg", quality);
-  }
-
-  if (dataUrl.length > maxBytes) {
-    console.error(
-      "Slice: tile dataURL is still too large after compression:",
-      dataUrl.length,
-      "bytes"
-    );
-    return null;
-  }
-
-  return dataUrl;
-}
-
-// ---------- SLICE handler ----------
-
-async function handleSliceSubmit(event) {
-  event.preventDefault();
-
-  const sliceButton = document.getElementById("sliceButton");
-  const progressBarEl = document.getElementById("sliceProgressBar");
-  const progressMainEl = document.getElementById("sliceProgressMain");
-  const progressEtaEl = document.getElementById("sliceProgressEta");
-
-  const updateBarAndText = (label, done, total) => {
-    const frac = total > 0 ? done / total : 0;
-    if (progressBarEl) {
-      progressBarEl.style.width = `${(frac * 100).toFixed(1)}%`;
-    }
-    if (progressMainEl) {
-      progressMainEl.textContent = label || "";
-    }
-  };
-
-  const setEtaText = (ms) => {
-    if (!progressEtaEl) return;
-    if (ms == null || !Number.isFinite(ms) || ms < 0) {
-      progressEtaEl.textContent = "";
-      return;
-    }
-    const totalSeconds = Math.round(ms / 1000);
-    const mins = Math.floor(totalSeconds / 60);
-    const secs = totalSeconds % 60;
-    const secsStr = secs.toString().padStart(2, "0");
-    const text = mins ? `${mins}m ${secsStr}s left` : `${secsStr}s left`;
-    progressEtaEl.textContent = text;
-  };
-
-  try {
-    const form = document.getElementById("slice-form");
-    if (!form) return;
-
-    const input = document.getElementById("sliceFileInput");
-    const files = input ? input.files : null;
-
-    if (!files || !files.length) {
-      await board.notifications.showError("Please select one or more image files.");
-      return;
-    }
-
-    if (sliceButton) sliceButton.disabled = true;
-
-    if (progressBarEl) progressBarEl.style.width = "0%";
-    if (progressMainEl) progressMainEl.textContent = "";
-    if (progressEtaEl) progressEtaEl.textContent = "";
-
-    const filesArray = Array.from(files);
-
-    // центр текущего вида — вокруг него будем раскладывать мозаики
-    let viewCenterX = 0;
-    let viewCenterY = 0;
-    try {
-      const viewport = await board.viewport.get();
-      viewCenterX = viewport.x + viewport.width / 2;
-      viewCenterY = viewport.y + viewport.height / 2;
-    } catch (e) {
-      console.warn("Slice: could not get viewport, fallback to 0,0", e);
-    }
-
-    // 1. Подготовка: читаем файлы, узнаём размеры и считаем общее число тайлов
-    const fileInfos = [];
-    let totalTiles = 0;
-
-    for (let i = 0; i < filesArray.length; i++) {
-      const file = filesArray[i];
-      updateBarAndText(`Preparing ${i + 1} / ${filesArray.length}`, 0, 1);
-      setEtaText(null);
-
-      const dataUrl = await readFileAsDataUrl(file);
-
-      let imgEl;
-      try {
-        imgEl = await loadImage(dataUrl);
-      } catch (e) {
-        console.error("Slice: browser failed to decode image", file.name, e);
-        await board.notifications.showError(
-          `Cannot slice "${file.name}": browser failed to decode the image.`
-        );
-        continue;
-      }
-
-      const width = imgEl.naturalWidth || imgEl.width;
-      const height = imgEl.naturalHeight || imgEl.height;
-
-      if (!width || !height) {
-        console.error("Slice: image has invalid dimensions", width, height, file.name);
-        await board.notifications.showError(
-          `Cannot slice "${file.name}": image has invalid dimensions.`
-        );
-        continue;
-      }
-
-      // предупреждение и пропуск, если картинка превышает лимит для этого устройства
-      if (width > MAX_SLICE_DIM || height > MAX_SLICE_DIM) {
-        console.warn(
-          `Slice: image too large (${width}x${height}), limit is ${MAX_SLICE_DIM}px per side.`
-        );
-        await board.notifications.showError(
-          `Image "${file.name}" is too large (${width}×${height}). ` +
-            `Slice supports up to ${MAX_SLICE_DIM}px per side on this device. ` +
-            `Please downscale or pre-slice it externally.`
-        );
-        continue;
-      }
-
-      const tilesX = Math.ceil(width / SLICE_TILE_SIZE);
-      const tilesY = Math.ceil(height / SLICE_TILE_SIZE);
-      const numTiles = tilesX * tilesY;
-
-      totalTiles += numTiles;
 
       fileInfos.push({
         file,
@@ -1051,128 +852,268 @@ async function handleSliceSubmit(event) {
         imgEl,
         width,
         height,
+        briCode,
+        satCode,
+        needsSlice,
         tilesX,
         tilesY,
         numTiles,
       });
     }
 
-    if (!totalTiles || !fileInfos.length) {
-      updateBarAndText("Nothing to slice.", 1, 1);
+    if (!fileInfos.length) {
+      setProgress(0, 0, "Nothing to import.");
       setEtaText(null);
       return;
     }
 
-    // 2. Режем и создаём тайлы сразу в нужных координатах
+    // сортировка файлов по имени/номеру
+    const orderedFiles = sortFilesByNameWithNumber(filesArray);
+    const infoByFile = new Map();
+    fileInfos.forEach((info) => infoByFile.set(info.file, info));
+
+    const orderedInfos = orderedFiles
+      .map((f) => infoByFile.get(f))
+      .filter(Boolean);
+
+    if (!orderedInfos.length) {
+      setProgress(0, 0, "Nothing to import.");
+      setEtaText(null);
+      return;
+    }
+
+    const totalTiles = orderedInfos.reduce(
+      (sum, info) => sum + (info.needsSlice ? info.numTiles : 1),
+      0
+    );
+
+    if (anySliced && form.stitchSkipMissing.checked) {
+      await board.notifications.showInfo(
+        '“Skip missing tiles” is ignored for large images (Stitch/Slice).'
+      );
+    }
+
+    // --- 2. считаем центры слотов для файлов ---
+
+    let slotCentersByFile = null; // Map(file -> {x,y}) для режима skipMissing
+    let slotCentersArray = null;  // [{x,y}] для общего случая
+
+    const hasAnyNumber = orderedInfos.some((info) => {
+      const name = info.file.name || "";
+      return extractTrailingNumber(name) !== null;
+    });
+
+    if (!anySliced && form.stitchSkipMissing.checked && hasAnyNumber) {
+      // режим Skip missing tiles (все файлы маленькие, есть номера)
+      const tileInfos = [];
+      let minNum = Infinity;
+      let maxNum = -Infinity;
+
+      for (const info of orderedInfos) {
+        const name = info.file.name || "";
+        const num = extractTrailingNumber(name);
+        if (num === null) continue;
+        tileInfos.push({ info, num });
+        if (num < minNum) minNum = num;
+        if (num > maxNum) maxNum = num;
+      }
+
+      if (!tileInfos.length) {
+        // номеров нет — fallback к обычной сетке
+        slotCentersArray = computeVariableSlotCenters(
+          orderedInfos,
+          imagesPerRow,
+          startCorner,
+          viewCenterX,
+          viewCenterY
+        );
+      } else {
+        // для тайлов без номера — добавим после maxNum
+        let current = maxNum;
+        for (const info of orderedInfos) {
+          const already = tileInfos.find((t) => t.info.file === info.file);
+          if (!already) {
+            current += 1;
+            tileInfos.push({ info, num: current });
+          }
+        }
+        slotCentersByFile = computeSkipMissingSlotCenters(
+          tileInfos,
+          imagesPerRow,
+          startCorner,
+          viewCenterX,
+          viewCenterY
+        );
+      }
+    } else {
+      // обычная сетка (в том числе, когда есть большие картинки)
+      slotCentersArray = computeVariableSlotCenters(
+        orderedInfos,
+        imagesPerRow,
+        startCorner,
+        viewCenterX,
+        viewCenterY
+      );
+    }
+
+    // --- 3. создаём тайлы (обычные и слайс), считаем прогресс и ETA ---
+
+    const allCreatedTiles = [];
+    let createdTiles = 0;
+    let creationCount = 0;
+    let creationTimeSumMs = 0;
+
+    const pad2 = (n) => String(n).padStart(2, "0");
+    const pad3 = (n) => String(n).padStart(3, "0");
+
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d");
     canvas.width = SLICE_TILE_SIZE;
     canvas.height = SLICE_TILE_SIZE;
 
-    let createdTiles = 0;
-    let creationCount = 0;
-    let creationTimeSumMs = 0;
-    const allCreatedTiles = [];
+    const updateCreationProgress = () => {
+      setProgress(createdTiles, totalTiles);
+      if (creationCount > 0) {
+        const avgPerTile = creationTimeSumMs / creationCount;
+        const remaining = totalTiles - createdTiles;
+        const etaMs = remaining > 0 ? avgPerTile * remaining : null;
+        setEtaText(etaMs);
+      } else {
+        setEtaText(null);
+      }
+    };
 
-    for (let fi = 0; fi < fileInfos.length; fi++) {
-      const info = fileInfos[fi];
-      const { imgEl, width, height, tilesX, tilesY } = info;
+    for (let i = 0; i < orderedInfos.length; i++) {
+      const info = orderedInfos[i];
+      const { file, needsSlice, imgEl, width, height, tilesX, tilesY } = info;
 
-      // базовый центр мозаики для этого файла
-      const mosaicCenterX = viewCenterX;
-      const mosaicCenterY = viewCenterY + fi * (SLICE_TILE_SIZE + 512);
+      let center;
+      if (slotCentersByFile) {
+        center =
+          slotCentersByFile.get(file) ||
+          { x: viewCenterX, y: viewCenterY };
+      } else if (slotCentersArray) {
+        center = slotCentersArray[i];
+      } else {
+        center = { x: viewCenterX, y: viewCenterY };
+      }
 
-      const cellWidth = SLICE_TILE_SIZE;
-      const cellHeight = SLICE_TILE_SIZE;
+      if (!needsSlice) {
+        // обычный маленький тайл
+        const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${file.name}`;
 
-      const gridWidth = tilesX * cellWidth;
-      const gridHeight = tilesY * cellHeight;
+        const t0 = performance.now();
+        const imgWidget = await board.createImage({
+          url: info.dataUrl,
+          x: center.x,
+          y: center.y,
+          title,
+        });
+        const t1 = performance.now();
 
-      const baseLeft = mosaicCenterX - gridWidth / 2;
-      const baseTop = mosaicCenterY - gridHeight / 2;
+        allCreatedTiles.push(imgWidget);
+        createdTiles += 1;
+        creationCount += 1;
+        creationTimeSumMs += t1 - t0;
+        updateCreationProgress();
+      } else {
+        // большой тайл → режем, собираем в пределах "слота" с габаритами исходной картинки
+        const colWidths = [];
+        const rowHeights = [];
 
-      for (let ty = 0; ty < tilesY; ty++) {
         for (let tx = 0; tx < tilesX; tx++) {
-          const sx = tx * SLICE_TILE_SIZE;
-          const sy = ty * SLICE_TILE_SIZE;
-          const sw = Math.min(SLICE_TILE_SIZE, width - sx);
-          const sh = Math.min(SLICE_TILE_SIZE, height - sy);
+          const sw = Math.min(SLICE_TILE_SIZE, width - tx * SLICE_TILE_SIZE);
+          colWidths.push(sw);
+        }
+        for (let ty = 0; ty < tilesY; ty++) {
+          const sh = Math.min(SLICE_TILE_SIZE, height - ty * SLICE_TILE_SIZE);
+          rowHeights.push(sh);
+        }
 
-          ctx.clearRect(0, 0, SLICE_TILE_SIZE, SLICE_TILE_SIZE);
-          ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, sw, sh);
+        const mosaicWidth = colWidths.reduce((a, b) => a + b, 0);
+        const mosaicHeight = rowHeights.reduce((a, b) => a + b, 0);
 
-          const tileDataUrl = canvasToDataUrlUnderLimit(canvas);
-          if (!tileDataUrl) {
-            await board.notifications.showError(
-              `One of the tiles from "${info.file.name}" is too large even after compression. Skipped.`
-            );
+        const mosaicLeft = center.x - mosaicWidth / 2;
+        const mosaicTop = center.y - mosaicHeight / 2;
+
+        // префиксные суммы для удобства:
+        const colPrefix = [0];
+        for (let tx = 0; tx < tilesX; tx++) {
+          colPrefix.push(colPrefix[colPrefix.length - 1] + colWidths[tx]);
+        }
+        const rowPrefix = [0];
+        for (let ty = 0; ty < tilesY; ty++) {
+          rowPrefix.push(rowPrefix[rowPrefix.length - 1] + rowHeights[ty]);
+        }
+
+        for (let ty = 0; ty < tilesY; ty++) {
+          for (let tx = 0; tx < tilesX; tx++) {
+            const sx = tx * SLICE_TILE_SIZE;
+            const sy = ty * SLICE_TILE_SIZE;
+            const sw = Math.min(SLICE_TILE_SIZE, width - sx);
+            const sh = Math.min(SLICE_TILE_SIZE, height - sy);
+
+            ctx.clearRect(0, 0, SLICE_TILE_SIZE, SLICE_TILE_SIZE);
+            ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, sw, sh);
+
+            const tileDataUrl = canvasToDataUrlUnderLimit(canvas);
+            if (!tileDataUrl) {
+              await board.notifications.showError(
+                `One of the tiles from "${file.name}" is too large even after compression. Skipped.`
+              );
+              createdTiles++;
+              updateCreationProgress();
+              continue;
+            }
+
+            const tileLeft = mosaicLeft + colPrefix[tx];
+            const tileTop = mosaicTop + rowPrefix[ty];
+            const centerX = tileLeft + sw / 2;
+            const centerY = tileTop + sh / 2;
+
+            const t0 = performance.now();
+            const tileWidget = await board.createImage({
+              url: tileDataUrl,
+              x: centerX,
+              y: centerY,
+            });
+            const t1 = performance.now();
+
+            allCreatedTiles.push(tileWidget);
             createdTiles++;
-            updateBarAndText(
-              `Slicing ${createdTiles} / ${totalTiles} tiles`,
-              createdTiles,
-              totalTiles
-            );
-            setEtaText(null);
-            continue;
+            creationCount++;
+            creationTimeSumMs += t1 - t0;
+            updateCreationProgress();
           }
-
-          const centerX =
-            baseLeft + tx * cellWidth + cellWidth / 2;
-          const centerY =
-            baseTop + ty * cellHeight + cellHeight / 2;
-
-          const t0 = performance.now();
-          const tileWidget = await board.createImage({
-            url: tileDataUrl,
-            x: centerX,
-            y: centerY,
-          });
-          const t1 = performance.now();
-
-          allCreatedTiles.push(tileWidget);
-
-          createdTiles++;
-          creationCount++;
-          creationTimeSumMs += t1 - t0;
-
-          const avgPerTile = creationTimeSumMs / creationCount;
-          const remaining = totalTiles - createdTiles;
-          const etaMs = remaining > 0 ? avgPerTile * remaining : null;
-
-          updateBarAndText(
-            `Slicing ${createdTiles} / ${totalTiles} tiles`,
-            createdTiles,
-            totalTiles
-          );
-          setEtaText(etaMs);
         }
       }
     }
 
-    updateBarAndText("Done!", totalTiles, totalTiles);
+    setProgress(totalTiles, totalTiles);
     setEtaText(null);
 
     if (allCreatedTiles.length) {
       try {
         await board.viewport.zoomTo(allCreatedTiles);
       } catch (e) {
-        console.warn("zoomTo failed in slice:", e);
+        console.warn("zoomTo failed in Stitch/Slice:", e);
       }
     }
 
     await board.notifications.showInfo(
-      `Sliced into ${totalTiles} tile${totalTiles === 1 ? "" : "s"}.`
+      `Imported ${fileInfos.length} source image${
+        fileInfos.length === 1 ? "" : "s"
+      } into ${totalTiles} tile${totalTiles === 1 ? "" : "s"}.`
     );
   } catch (err) {
     console.error(err);
-    if (progressMainEl) progressMainEl.textContent = "Error";
-    if (progressEtaEl) progressEtaEl.textContent = "";
-    if (progressBarEl) progressBarEl.style.width = "0%";
+    setProgress(0, 0, "Error");
+    setEtaText(null);
     await board.notifications.showError(
-      "Something went wrong while slicing images. Please check the console."
+      "Something went wrong while importing images. Please check the console."
     );
   } finally {
-    if (sliceButton) sliceButton.disabled = false;
+    if (stitchButton) stitchButton.disabled = false;
   }
 }
 
@@ -1188,15 +1129,11 @@ window.addEventListener("DOMContentLoaded", () => {
   const stitchForm = document.getElementById("stitch-form");
   if (stitchForm) stitchForm.addEventListener("submit", handleStitchSubmit);
 
-  const sliceForm = document.getElementById("slice-form");
-  if (sliceForm) sliceForm.addEventListener("submit", handleSliceSubmit);
-
   // табы
   const tabButtons = document.querySelectorAll(".tab-btn");
   const tabContents = {
     sorting: document.getElementById("tab-sorting"),
     stitch: document.getElementById("tab-stitch"),
-    slice: document.getElementById("tab-slice"),
   };
 
   function activateTab(name) {
@@ -1215,11 +1152,11 @@ window.addEventListener("DOMContentLoaded", () => {
     tabButtons.forEach((btn) => {
       btn.addEventListener("click", () => activateTab(btn.dataset.tab));
     });
-    // дефолтная вкладка — Stitch
+    // дефолтная вкладка — Stitch/Slice
     activateTab("stitch");
   }
 
-  // кастомный файл-пикер для Stitch
+  // кастомный файл-пикер для Stitch/Slice
   const fileButton = document.getElementById("stitchFileButton");
   const fileInput = document.getElementById("stitchFolderInput");
   const fileLabel = document.getElementById("stitchFileLabel");
@@ -1240,28 +1177,5 @@ window.addEventListener("DOMContentLoaded", () => {
 
     fileInput.addEventListener("change", updateLabel);
     updateLabel();
-  }
-
-  // кастомный файл-пикер для Slice
-  const sliceFileButton = document.getElementById("sliceFileButton");
-  const sliceFileInput = document.getElementById("sliceFileInput");
-  const sliceFileLabel = document.getElementById("sliceFileLabel");
-
-  if (sliceFileButton && sliceFileInput && sliceFileLabel) {
-    sliceFileButton.addEventListener("click", () => sliceFileInput.click());
-
-    const updateSliceLabel = () => {
-      const files = sliceFileInput.files;
-      if (!files || files.length === 0) {
-        sliceFileLabel.textContent = "No files selected";
-      } else if (files.length === 1) {
-        sliceFileLabel.textContent = files[0].name;
-      } else {
-        sliceFileLabel.textContent = `${files.length} files selected`;
-      }
-    };
-
-    sliceFileInput.addEventListener("change", updateSliceLabel);
-    updateSliceLabel();
   }
 });
