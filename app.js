@@ -13,6 +13,9 @@ const SLICE_THRESHOLD_HEIGHT = 4096; // если высота > этого, ре
 let   MAX_SLICE_DIM = 16384;         // уточняется через WebGL (16k / 32k)
 const MAX_URL_BYTES = 30000000;      // лимит размера поля url в Miro (из ошибки)
 
+// appId для metadata нашего приложения
+const META_APP_ID = "image-align-tool";
+
 // ---------- авто-детект лимита по стороне через WebGL ----------
 
 function detectMaxSliceDim() {
@@ -1007,9 +1010,15 @@ async function handleStitchSubmit(event) {
         center = { x: viewCenterX, y: viewCenterY };
       }
 
+      // разберём имя файла: baseName без расширения и ext
+      const originalName = file.name || "image";
+      const nameMatch = originalName.match(/^(.*?)(\.[^.]*$|$)/);
+      const baseName = nameMatch ? nameMatch[1] : originalName;
+      const originalExt = nameMatch && nameMatch[2] ? nameMatch[2] : "";
+
       if (!needsSlice) {
         // обычный маленький тайл
-        const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${file.name}`;
+        const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${originalName}`;
 
         const t0 = performance.now();
         const imgWidget = await board.createImage({
@@ -1019,6 +1028,17 @@ async function handleStitchSubmit(event) {
           title,
         });
         const t1 = performance.now();
+
+        // пишем metadata: имя файла + цвет
+        try {
+          await imgWidget.setMetadata(META_APP_ID, {
+            fileName: originalName,
+            satCode: info.satCode,
+            briCode: info.briCode,
+          });
+        } catch (e) {
+          console.warn("setMetadata failed (small image):", e);
+        }
 
         allCreatedTiles.push(imgWidget);
         createdTiles += 1;
@@ -1031,12 +1051,12 @@ async function handleStitchSubmit(event) {
         const rowHeights = [];
 
         for (let tx = 0; tx < tilesX; tx++) {
-          const sw = Math.min(SLICE_TILE_SIZE, width - tx * SLICE_TILE_SIZE);
-          colWidths.push(sw);
+          const sw0 = Math.min(SLICE_TILE_SIZE, width - tx * SLICE_TILE_SIZE);
+          colWidths.push(sw0);
         }
         for (let ty = 0; ty < tilesY; ty++) {
-          const sh = Math.min(SLICE_TILE_SIZE, height - ty * SLICE_TILE_SIZE);
-          rowHeights.push(sh);
+          const sh0 = Math.min(SLICE_TILE_SIZE, height - ty * SLICE_TILE_SIZE);
+          rowHeights.push(sh0);
         }
 
         const mosaicWidth = colWidths.reduce((a, b) => a + b, 0);
@@ -1055,6 +1075,8 @@ async function handleStitchSubmit(event) {
           rowPrefix.push(rowPrefix[rowPrefix.length - 1] + rowHeights[ty]);
         }
 
+        let tileIndexForName = 0;
+
         for (let ty = 0; ty < tilesY; ty++) {
           for (let tx = 0; tx < tilesX; tx++) {
             const sx = tx * SLICE_TILE_SIZE;
@@ -1062,7 +1084,7 @@ async function handleStitchSubmit(event) {
             const sw = Math.min(SLICE_TILE_SIZE, width - sx);
             const sh = Math.min(SLICE_TILE_SIZE, height - sy);
 
-            // 👇 ключевое изменение: холст подгоняем под реальный размер тайла
+            // динамический размер холста под каждую плитку
             canvas.width = sw;
             canvas.height = sh;
             ctx.clearRect(0, 0, sw, sh);
@@ -1084,13 +1106,34 @@ async function handleStitchSubmit(event) {
             const centerX = tileLeft + sw / 2;
             const centerY = tileTop + sh / 2;
 
+            tileIndexForName++;
+            const tileSuffix = pad2(tileIndexForName);   // 01, 02, 03...
+            const tileBaseName = `${baseName}_${tileSuffix}`;
+            const tileFullName = originalExt
+              ? `${tileBaseName}${originalExt}`
+              : tileBaseName;
+
+            const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${tileFullName}`;
+
             const t0 = performance.now();
             const tileWidget = await board.createImage({
               url: tileDataUrl,
               x: centerX,
               y: centerY,
+              title,
             });
             const t1 = performance.now();
+
+            // metadata: имя тайла + цвет
+            try {
+              await tileWidget.setMetadata(META_APP_ID, {
+                fileName: tileFullName,
+                satCode: info.satCode,
+                briCode: info.briCode,
+              });
+            } catch (e) {
+              console.warn("setMetadata failed (slice tile):", e);
+            }
 
             allCreatedTiles.push(tileWidget);
             createdTiles++;
