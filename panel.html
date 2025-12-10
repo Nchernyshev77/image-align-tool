@@ -2,362 +2,410 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Image Align Tool – panel</title>
-
-  <script src="https://miro.com/app/static/sdk/v2/miro.js"></script>
-  <script src="app.js" defer></script>
-
+  <title>Image Align Tool</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root {
+      --bg: #ffffff;
+      --text: #111111;
+      --muted: #888888;
+      --border: #dddddd;
+      --accent: #2563eb;
+      --accent-soft: rgba(37, 99, 235, 0.08);
+      --radius: 10px;
+    }
+
+    * {
+      box-sizing: border-box;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
         sans-serif;
-      color-scheme: light; /* всегда светлая тема */
     }
 
     body {
-      margin: 16px;
-      font-size: 14px;
-      color: #111827;
-      background: #f9fafb;
+      margin: 0;
+      padding: 12px;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 12px;
+    }
+
+    .card {
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      padding: 10px;
     }
 
     .tabs {
       display: flex;
-      gap: 4px;
-      margin-bottom: 8px;
+      gap: 6px;
+      margin-bottom: 10px;
     }
 
     .tab-btn {
       flex: 1;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      background: #f5f5f5;
       padding: 6px 8px;
-      font-size: 13px;
-      border-radius: 999px;
-      border: 1px solid rgba(15, 23, 42, 0.15);
-      background: #e5e7eb;
+      font-size: 12px;
       cursor: pointer;
+      text-align: center;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
       color: #000;
-      transition: background 0.15s ease, color 0.15s ease, transform 0.05s ease;
     }
 
     .tab-btn.active {
-      background: #2563eb;
-      color: #ffffff;
-      border-color: #2563eb;
-    }
-
-    .tab-btn:active {
-      transform: translateY(1px);
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: #000;
+      font-weight: 600;
     }
 
     .tab-content {
       display: none;
+      margin-top: 6px;
     }
 
     .tab-content.active {
       display: block;
     }
 
-    .section-title {
-      font-weight: 600;
-      margin-top: 12px;
-      margin-bottom: 4px;
+    h2 {
+      margin: 0 0 8px 0;
       font-size: 13px;
-      color: #111827;
+      font-weight: 600;
     }
 
-    .field {
+    form {
       display: flex;
       flex-direction: column;
-      gap: 4px;
-      margin-bottom: 8px;
-    }
-
-    .field-row-two {
-      flex-direction: row;
       gap: 8px;
     }
 
-    .field-row-two .subfield {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-
-    label {
-      font-size: 13px;
-      opacity: 0.9;
-    }
-
-    .checkbox-row {
+    .field-row {
       display: flex;
       align-items: center;
+      justify-content: space-between;
       gap: 6px;
-      font-size: 13px;
+    }
+
+    .field-row label {
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .field-row > *:last-child {
+      flex: 1;
+    }
+
+    .inputs-inline {
+      display: flex;
+      gap: 6px;
+    }
+
+    .inputs-inline > div {
+      flex: 1;
     }
 
     input[type="number"],
     select {
       width: 100%;
-      box-sizing: border-box;
-      padding: 6px 8px;
-      border-radius: 7px;
-      border: 1px solid rgba(15, 23, 42, 0.16);
-      font-size: 13px;
-      background: #ffffff;
-      color: #0f172a;
+      padding: 4px 6px;
+      font-size: 12px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #fff;
+      color: var(--text);
     }
 
-    input[type="number"]:focus,
-    select:focus {
-      outline: none;
-      border-color: #2563eb;
-      box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.2);
+    input[type="number"]::-webkit-outer-spin-button,
+    input[type="number"]::-webkit-inner-spin-button {
+      -webkit-appearance: none;
+      margin: 0;
     }
 
-    input[type="checkbox"] {
-      accent-color: #2563eb;
-      width: 14px;
-      height: 14px;
+    input[type="number"] {
+      -moz-appearance: textfield;
     }
 
-    button.primary {
-      margin-top: 12px;
-      width: 100%;
-      padding: 8px 10px;
-      border-radius: 9px;
-      border: none;
-      font-weight: 600;
-      font-size: 14px;
+    .radio-row {
+      display: flex;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .radio-row label {
+      display: flex;
+      align-items: center;
+      gap: 3px;
       cursor: pointer;
-      background: #2563eb;
+    }
+
+    .btn-primary {
+      width: 100%;
+      padding: 7px 10px;
+      font-size: 12px;
+      border-radius: 999px;
+      border: none;
+      background: var(--accent);
       color: #ffffff;
-      transition: background 0.15s ease, transform 0.05s ease;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 4px;
     }
 
-    button.primary:disabled {
-      opacity: 0.6;
+    .btn-primary:disabled {
+      opacity: 0.5;
       cursor: default;
-    }
-
-    button.primary:active:not(:disabled) {
-      transform: translateY(1px);
     }
 
     .file-picker {
       display: flex;
       align-items: center;
       gap: 8px;
-      flex-wrap: wrap;
+      margin-top: 2px;
     }
 
-    .file-picker-button {
-      padding: 6px 12px;
+    .file-btn {
+      padding: 5px 10px;
       border-radius: 999px;
-      border: 1px solid #111827;
-      background: #ffffff;
-      font-size: 13px;
-      font-weight: 500;
+      border: 1px solid var(--border);
+      background: #f5f5f5;
       cursor: pointer;
-      transition: background 0.15s ease, transform 0.05s ease;
-      color: #000;
-    }
-
-    .file-picker-button:active {
-      transform: translateY(1px);
-    }
-
-    .file-picker-label {
       font-size: 12px;
-      color: #6b7280;
     }
 
-    #stitchFolderInput {
-      display: none;
+    .file-label {
+      font-size: 11px;
+      color: var(--muted);
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      margin-top: 4px;
+    }
+
+    .checkbox-row input[type="checkbox"] {
+      width: 14px;
+      height: 14px;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+
+    .checkbox-row span {
+      cursor: pointer;
+      font-size: 11px;
+      color: var(--text);
     }
 
     .progress-container {
       margin-top: 8px;
-      height: 6px;
-      border-radius: 999px;
-      background: #e5e7eb;
-      overflow: hidden;
     }
 
-    .progress-fill {
-      height: 100%;
+    .progress-bar-outer {
+      width: 100%;
+      height: 6px;
+      border-radius: 999px;
+      background: #f3f3f3;
+      overflow: hidden;
+      border: 1px solid #e0e0e0;
+    }
+
+    .progress-bar-inner {
       width: 0%;
-      background: #2563eb;
-      transition: width 0.1s linear;
+      height: 100%;
+      background: var(--accent);
+      border-radius: 999px;
+      transition: width 0.15s linear;
+    }
+
+    .progress-text-main,
+    .progress-text-eta {
+      text-align: center;
+      margin-top: 4px;
+      font-size: 11px;
+      color: var(--text);
     }
 
     .progress-text-main {
-      margin-top: 6px;
-      font-size: 13px;
-      text-align: center;
-      color: #111827;
-    }
-
-    .progress-text-eta {
-      margin-top: 2px;
-      font-size: 12px;
-      text-align: center;
-      color: #4b5563;
+      font-weight: 600;
     }
   </style>
 </head>
 <body>
-  <div class="tabs">
-    <button class="tab-btn" data-tab="sorting">Sorting</button>
-    <button class="tab-btn active" data-tab="stitch">Stitch/Slice</button>
-  </div>
+  <div class="card">
+    <div class="tabs">
+      <button type="button" class="tab-btn" data-tab="sorting">Sorting</button>
+      <button type="button" class="tab-btn" data-tab="stitch">Stitch / Slice</button>
+    </div>
 
-  <!-- TAB 1: SORTING -->
-  <div id="tab-sorting" class="tab-content">
-    <form id="sorting-form">
-      <div class="section-title">Grid</div>
-
-      <div class="field">
-        <label for="sortingImagesPerRow">Rows</label>
-        <input
-          id="sortingImagesPerRow"
-          name="sortingImagesPerRow"
-          type="number"
-          min="1"
-          step="1"
-          value="8"
-          required
-        />
-      </div>
-
-      <div class="field field-row-two">
-        <div class="subfield">
-          <label for="sortingHorizontalGap">Gap X</label>
+    <!-- SORTING TAB -->
+    <div id="tab-sorting" class="tab-content">
+      <h2>Align selection</h2>
+      <form id="sorting-form">
+        <div class="field-row">
+          <label for="sortingImagesPerRow">Rows</label>
           <input
-            id="sortingHorizontalGap"
-            name="sortingHorizontalGap"
+            id="sortingImagesPerRow"
+            name="sortingImagesPerRow"
             type="number"
-            step="1"
-            value="0"
+            min="1"
+            value="8"
           />
         </div>
-        <div class="subfield">
-          <label for="sortingVerticalGap">Gap Y</label>
+
+        <div class="inputs-inline">
+          <div>
+            <div class="field-row">
+              <label for="sortingHorizontalGap">Gap X</label>
+              <input
+                id="sortingHorizontalGap"
+                name="sortingHorizontalGap"
+                type="number"
+                value="0"
+              />
+            </div>
+          </div>
+          <div>
+            <div class="field-row">
+              <label for="sortingVerticalGap">Gap Y</label>
+              <input
+                id="sortingVerticalGap"
+                name="sortingVerticalGap"
+                type="number"
+                value="0"
+              />
+            </div>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <label>Resize</label>
+          <div class="radio-row">
+            <label>
+              <input
+                type="radio"
+                name="sortingSizeMode"
+                value="none"
+                checked
+              />
+              none
+            </label>
+            <label>
+              <input type="radio" name="sortingSizeMode" value="width" />
+              width
+            </label>
+            <label>
+              <input type="radio" name="sortingSizeMode" value="height" />
+              height
+            </label>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <label for="sortingStartCorner">Start corner</label>
+          <select id="sortingStartCorner" name="sortingStartCorner">
+            <option value="top-left">Top left</option>
+            <option value="top-right">Top right</option>
+            <option value="bottom-left">Bottom left</option>
+            <option value="bottom-right">Bottom right</option>
+          </select>
+        </div>
+
+        <div class="field-row">
+          <label for="sortingSortMode">Sort by</label>
+          <select id="sortingSortMode" name="sortingSortMode">
+            <option value="number">Number</option>
+            <option value="color">Color</option>
+          </select>
+        </div>
+
+        <button type="submit" class="btn-primary">Align selection</button>
+      </form>
+    </div>
+
+    <!-- STITCH / SLICE TAB -->
+    <div id="tab-stitch" class="tab-content">
+      <h2>Import images</h2>
+      <form id="stitch-form">
+        <div class="field-row">
+          <label for="stitchImagesPerRow">Rows</label>
           <input
-            id="sortingVerticalGap"
-            name="sortingVerticalGap"
+            id="stitchImagesPerRow"
+            name="stitchImagesPerRow"
             type="number"
-            step="1"
-            value="0"
+            min="1"
+            value="8"
           />
         </div>
-      </div>
 
-      <div class="field">
-        <label for="sortingSizeMode">Resize</label>
-        <select id="sortingSizeMode" name="sortingSizeMode">
-          <option value="none" selected>Do not resize</option>
-          <option value="width">Match width</option>
-          <option value="height">Match height</option>
-        </select>
-      </div>
+        <div class="field-row">
+          <label for="stitchStartCorner">Start corner</label>
+          <select id="stitchStartCorner" name="stitchStartCorner">
+            <option value="top-left">Top left</option>
+            <option value="top-right">Top right</option>
+            <option value="bottom-left">Bottom left</option>
+            <option value="bottom-right">Bottom right</option>
+          </select>
+        </div>
 
-      <div class="field">
-        <label for="sortingStartCorner">Start corner</label>
-        <select id="sortingStartCorner" name="sortingStartCorner">
-          <option value="top-left">Top left</option>
-          <option value="top-right">Top right</option>
-          <option value="bottom-left">Bottom left</option>
-          <option value="bottom-right">Bottom right</option>
-        </select>
-      </div>
-
-      <div class="field">
-        <label for="sortingSortMode">Sort by</label>
-        <select id="sortingSortMode" name="sortingSortMode">
-          <option value="number" selected>Number</option>
-          <option value="color">Color</option>
-        </select>
-      </div>
-
-      <button type="submit" id="sortingAlignButton" class="primary">
-        Align selection
-      </button>
-    </form>
-  </div>
-
-  <!-- TAB 2: STITCH/SLICE -->
-  <div id="tab-stitch" class="tab-content active">
-    <form id="stitch-form">
-      <div class="section-title">Grid</div>
-
-      <div class="field">
-        <label for="stitchImagesPerRow">Rows</label>
-        <input
-          id="stitchImagesPerRow"
-          name="stitchImagesPerRow"
-          type="number"
-          min="1"
-          step="1"
-          value="8"
-          required
-        />
-      </div>
-
-      <div class="field">
-        <label for="stitchStartCorner">Start corner</label>
-        <select id="stitchStartCorner" name="stitchStartCorner">
-          <option value="top-left">Top left</option>
-          <option value="top-right">Top right</option>
-          <option value="bottom-left">Bottom left</option>
-          <option value="bottom-right">Bottom right</option>
-        </select>
-      </div>
-
-      <div class="field">
-        <label class="checkbox-row">
-          <input
-            type="checkbox"
-            id="stitchSkipMissing"
-            name="stitchSkipMissing"
-          />
-          Skip missing tiles
-        </label>
-      </div>
-
-      <div class="section-title">Source files</div>
-      <div class="field">
         <div class="file-picker">
-          <button
-            type="button"
-            id="stitchFileButton"
-            class="file-picker-button"
-          >
+          <button type="button" id="stitchFileButton" class="file-btn">
             Select files
           </button>
-          <span id="stitchFileLabel" class="file-picker-label">
-            No files selected
-          </span>
+          <span id="stitchFileLabel" class="file-label">No files selected</span>
           <input
             id="stitchFolderInput"
-            name="stitchFolderInput"
             type="file"
             multiple
+            style="display: none"
             accept="image/*"
           />
         </div>
-      </div>
 
-      <button type="submit" id="stitchButton" class="primary">
-        Stitch / Slice
-      </button>
+        <label class="checkbox-row">
+          <input id="stitchSkipMissing" type="checkbox" />
+          <span>Skip missing tiles</span>
+        </label>
 
-      <div class="progress-container">
-        <div id="stitchProgressBar" class="progress-fill"></div>
-      </div>
-      <div id="stitchProgressMain" class="progress-text-main"></div>
-      <div id="stitchProgressEta" class="progress-text-eta"></div>
-    </form>
+        <button
+          type="submit"
+          id="stitchButton"
+          class="btn-primary"
+          style="margin-top: 6px"
+        >
+          Stitch / Slice
+        </button>
+
+        <div class="progress-container">
+          <div class="progress-bar-outer">
+            <div
+              id="stitchProgressBar"
+              class="progress-bar-inner"
+            ></div>
+          </div>
+          <div
+            id="stitchProgressMain"
+            class="progress-text-main"
+          ></div>
+          <div
+            id="stitchProgressEta"
+            class="progress-text-eta"
+          ></div>
+        </div>
+      </form>
+    </div>
   </div>
+
+  <script src="app.js"></script>
 </body>
 </html>
