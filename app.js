@@ -1,19 +1,18 @@
 // app.js
-// Image Align Tool: Sorting (align selection) + Stitch/Slice (импорт + автослайс больших изображений)
+// Image Align Tool: Sorting + Stitch/Slice
 
 const { board } = window.miro;
 
 // ---- color / slice settings ----
 const SAT_CODE_MAX = 99;
 const SAT_BOOST = 4.0;
-const SAT_GROUP_THRESHOLD = 35;      // порог сатурации: <= серые, > цветные
-const SLICE_TILE_SIZE = 4096;        // размер тайла при слайсе
-const SLICE_THRESHOLD_WIDTH = 8192;  // если ширина > этого, режем
-const SLICE_THRESHOLD_HEIGHT = 4096; // если высота > этого, режем
-let   MAX_SLICE_DIM = 16384;         // уточняется через WebGL (16k / 32k)
-const MAX_URL_BYTES = 30000000;      // лимит размера поля url в Miro (из ошибки)
+const SAT_GROUP_THRESHOLD = 35;      // <= серые, > цветные
+const SLICE_TILE_SIZE = 4096;
+const SLICE_THRESHOLD_WIDTH = 8192;
+const SLICE_THRESHOLD_HEIGHT = 4096;
+let   MAX_SLICE_DIM = 16384;         // уточняем через WebGL
+const MAX_URL_BYTES = 30000000;      // лимит размера dataURL
 
-// appId для metadata нашего приложения
 const META_APP_ID = "image-align-tool";
 
 // ---------- авто-детект лимита по стороне через WebGL ----------
@@ -75,10 +74,10 @@ function loadImage(url) {
 }
 
 /**
- * Возвращает среднюю яркость и "сырую" сатурацию по ROI:
+ * Возвращает яркость и "сырую" сатурацию по ROI:
  *   - уменьшаем до smallSize
  *   - блюрим (blurPx)
- *   - обрезаем верхнюю часть и боковые поля
+ *   - обрезаем верх и боковые поля
  */
 function getBrightnessAndSaturationFromImageElement(
   img,
@@ -375,9 +374,9 @@ async function sortImagesByColor(images) {
 
   meta.sort((a, b) => {
     if (a.hasCode && b.hasCode) {
-      if (a.group !== b.group) return a.group - b.group;        // серые → цветные
-      if (a.briCode !== b.briCode) return a.briCode - b.briCode; // светлее → темнее
-      if (a.satCode !== b.satCode) return a.satCode - b.satCode; // бледнее → насыщеннее
+      if (a.group !== b.group) return a.group - b.group;
+      if (a.briCode !== b.briCode) return a.briCode - b.briCode;
+      if (a.satCode !== b.satCode) return a.satCode - b.satCode;
       return a.index - b.index;
     }
     if (a.hasCode) return -1;
@@ -509,10 +508,6 @@ function sortFilesByNameWithNumber(files) {
   return arr.map((m) => m.file);
 }
 
-/**
- * Кодирует canvas в JPEG и, при необходимости, понижает качество,
- * чтобы строка dataURL была меньше maxBytes. Если не получилось — возвращает null.
- */
 function canvasToDataUrlUnderLimit(canvas, maxBytes = MAX_URL_BYTES) {
   let quality = 0.9;
   let dataUrl = canvas.toDataURL("image/jpeg", quality);
@@ -534,10 +529,6 @@ function canvasToDataUrlUnderLimit(canvas, maxBytes = MAX_URL_BYTES) {
   return dataUrl;
 }
 
-/**
- * Вычисляет центры "слотов" для файлов (все размеры разные),
- * без пропусков, с учётом startCorner.
- */
 function computeVariableSlotCenters(
   orderedInfos,
   imagesPerRow,
@@ -628,10 +619,6 @@ function computeVariableSlotCenters(
   return centers;
 }
 
-/**
- * Вычисляет центры "слотов" при Skip missing tiles.
- * Все тайлы считаются одного размера (по первому).
- */
 function computeSkipMissingSlotCenters(
   tileInfos,
   imagesPerRow,
@@ -641,9 +628,7 @@ function computeSkipMissingSlotCenters(
 ) {
   if (!tileInfos.length) return [];
 
-  const numbered = tileInfos.map(({ info, num }) => ({ info, num }));
-
-  const nums = numbered.map((n) => n.num);
+  const nums = tileInfos.map((n) => n.num);
   const minNum = Math.min(...nums);
   const maxNum = Math.max(...nums);
 
@@ -677,7 +662,7 @@ function computeSkipMissingSlotCenters(
   const centersByFileId = new Map();
 
   for (const { info, num } of tileInfos) {
-    const pos = num - minNum; // 0-based
+    const pos = num - minNum;
     let row = Math.floor(pos / cols);
     let col = pos % cols;
 
@@ -768,7 +753,6 @@ async function handleStitchSubmit(event) {
 
     const filesArray = Array.from(files);
 
-    // центр текущего вида
     let viewCenterX = 0;
     let viewCenterY = 0;
     try {
@@ -779,7 +763,6 @@ async function handleStitchSubmit(event) {
       console.warn("Stitch/Slice: could not get viewport, fallback to 0,0", e);
     }
 
-    // --- 1. подготовка: читаем файлы, узнаём размеры, считаем brightness/sat, классифицируем ---
     const fileInfos = [];
     let anySliced = false;
 
@@ -882,7 +865,6 @@ async function handleStitchSubmit(event) {
       return;
     }
 
-    // сортировка файлов по имени/номеру
     const orderedFiles = sortFilesByNameWithNumber(filesArray);
     const infoByFile = new Map();
     fileInfos.forEach((info) => infoByFile.set(info.file, info));
@@ -908,10 +890,8 @@ async function handleStitchSubmit(event) {
       );
     }
 
-    // --- 2. считаем центры слотов для файлов ---
-
-    let slotCentersByFile = null; // Map(file -> {x,y}) для режима skipMissing
-    let slotCentersArray = null;  // [{x,y}] для общего случая
+    let slotCentersByFile = null;
+    let slotCentersArray = null;
 
     const hasAnyNumber = orderedInfos.some((info) => {
       const name = info.file.name || "";
@@ -919,7 +899,6 @@ async function handleStitchSubmit(event) {
     });
 
     if (!anySliced && skipMissingTiles && hasAnyNumber) {
-      // режим Skip missing tiles (все файлы маленькие, есть номера)
       const tileInfos = [];
       let minNum = Infinity;
       let maxNum = -Infinity;
@@ -942,7 +921,6 @@ async function handleStitchSubmit(event) {
           viewCenterY
         );
       } else {
-        // для тайлов без номера — добавим после maxNum
         let current = maxNum;
         for (const info of orderedInfos) {
           const already = tileInfos.find((t) => t.info.file === info.file);
@@ -960,7 +938,6 @@ async function handleStitchSubmit(event) {
         );
       }
     } else {
-      // обычная сетка (в том числе, когда есть большие картинки)
       slotCentersArray = computeVariableSlotCenters(
         orderedInfos,
         imagesPerRow,
@@ -969,8 +946,6 @@ async function handleStitchSubmit(event) {
         viewCenterY
       );
     }
-
-    // --- 3. создаём тайлы (обычные и слайс), считаем прогресс и ETA ---
 
     const allCreatedTiles = [];
     let createdTiles = 0;
@@ -1010,14 +985,12 @@ async function handleStitchSubmit(event) {
         center = { x: viewCenterX, y: viewCenterY };
       }
 
-      // разберём имя файла: baseName без расширения и ext
       const originalName = file.name || "image";
       const nameMatch = originalName.match(/^(.*?)(\.[^.]*$|$)/);
       const baseName = nameMatch ? nameMatch[1] : originalName;
       const originalExt = nameMatch && nameMatch[2] ? nameMatch[2] : "";
 
       if (!needsSlice) {
-        // обычный маленький тайл
         const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${originalName}`;
 
         const t0 = performance.now();
@@ -1029,7 +1002,6 @@ async function handleStitchSubmit(event) {
         });
         const t1 = performance.now();
 
-        // пишем metadata: имя файла + цвет
         try {
           await imgWidget.setMetadata(META_APP_ID, {
             fileName: originalName,
@@ -1046,7 +1018,6 @@ async function handleStitchSubmit(event) {
         creationTimeSumMs += t1 - t0;
         updateCreationProgress();
       } else {
-        // большой тайл → режем, собираем в пределах "слота" с габаритами исходной картинки
         const colWidths = [];
         const rowHeights = [];
 
@@ -1065,7 +1036,6 @@ async function handleStitchSubmit(event) {
         const mosaicLeft = center.x - mosaicWidth / 2;
         const mosaicTop = center.y - mosaicHeight / 2;
 
-        // префиксные суммы для удобства:
         const colPrefix = [0];
         for (let tx = 0; tx < tilesX; tx++) {
           colPrefix.push(colPrefix[colPrefix.length - 1] + colWidths[tx]);
@@ -1084,7 +1054,6 @@ async function handleStitchSubmit(event) {
             const sw = Math.min(SLICE_TILE_SIZE, width - sx);
             const sh = Math.min(SLICE_TILE_SIZE, height - sy);
 
-            // динамический размер холста под каждую плитку
             canvas.width = sw;
             canvas.height = sh;
             ctx.clearRect(0, 0, sw, sh);
@@ -1107,7 +1076,7 @@ async function handleStitchSubmit(event) {
             const centerY = tileTop + sh / 2;
 
             tileIndexForName++;
-            const tileSuffix = pad2(tileIndexForName);   // 01, 02, 03...
+            const tileSuffix = pad2(tileIndexForName); // 01, 02, 03...
             const tileBaseName = `${baseName}_${tileSuffix}`;
             const tileFullName = originalExt
               ? `${tileBaseName}${originalExt}`
@@ -1124,7 +1093,6 @@ async function handleStitchSubmit(event) {
             });
             const t1 = performance.now();
 
-            // metadata: имя тайла + цвет
             try {
               await tileWidget.setMetadata(META_APP_ID, {
                 fileName: tileFullName,
@@ -1177,7 +1145,6 @@ async function handleStitchSubmit(event) {
 // ---------- init ----------
 
 window.addEventListener("DOMContentLoaded", () => {
-  // авто-детект максимального размера стороны для Slice
   detectMaxSliceDim();
 
   const sortingForm = document.getElementById("sorting-form");
@@ -1186,7 +1153,6 @@ window.addEventListener("DOMContentLoaded", () => {
   const stitchForm = document.getElementById("stitch-form");
   if (stitchForm) stitchForm.addEventListener("submit", handleStitchSubmit);
 
-  // табы
   const tabButtons = document.querySelectorAll(".tab-btn");
   const tabContents = {
     sorting: document.getElementById("tab-sorting"),
@@ -1209,11 +1175,10 @@ window.addEventListener("DOMContentLoaded", () => {
     tabButtons.forEach((btn) => {
       btn.addEventListener("click", () => activateTab(btn.dataset.tab));
     });
-    // дефолтная вкладка — Stitch/Slice
+    // дефолт — Stitch/Slice
     activateTab("stitch");
   }
 
-  // кастомный файл-пикер для Stitch/Slice
   const fileButton = document.getElementById("stitchFileButton");
   const fileInput = document.getElementById("stitchFolderInput");
   const fileLabel = document.getElementById("stitchFileLabel");
