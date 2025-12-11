@@ -511,10 +511,10 @@ function sortFilesByNameWithNumber(files) {
 
 function canvasToDataUrlUnderLimit(canvas, maxBytes = TARGET_URL_BYTES) {
   // Сжимает содержимое canvas в JPEG так, чтобы dataURL не превышал maxBytes.
-  // Используем бинарный поиск по качеству в диапазоне [0.6, 0.95],
+  // Используем бинарный поиск по качеству в диапазоне [0.8, 0.85],
   // чтобы сохранить максимум качества при заданном лимите.
-  let lowQ = 0.6;
-  let highQ = 0.95;
+  let lowQ = 0.8;
+  let highQ = 0.85;
   let bestDataUrl = null;
   let bestQ = lowQ;
 
@@ -800,7 +800,7 @@ async function handleStitchSubmit(event) {
     const fileInfos = [];
     let anySliced = false;
 
-    setProgress(0, 0, "Preparing files…");
+    setProgress(0, filesArray.length, "Preparing files…");
 
     for (let i = 0; i < filesArray.length; i++) {
       const file = filesArray[i];
@@ -891,6 +891,9 @@ async function handleStitchSubmit(event) {
         tilesY,
         numTiles,
       });
+
+      const done = i + 1;
+      setProgress(done, filesArray.length, `Preparing files… (${done}/${filesArray.length})`);
     }
 
     if (!fileInfos.length) {
