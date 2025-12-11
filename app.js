@@ -979,10 +979,7 @@ async function handleStitchSubmit(event) {
       }
     };
 
-    const tileTasks = [];
-
-
-    for (let i = 0; i < orderedInfos.length; i++) {
+        for (let i = 0; i < orderedInfos.length; i++) {
       const info = orderedInfos[i];
       const { file, needsSlice, imgEl, width, height, tilesX, tilesY } = info;
 
@@ -1028,8 +1025,7 @@ async function handleStitchSubmit(event) {
           urlToUse = compressed;
         }
 
-        tileTasks.push(async () => {
-          const t0 = performance.now();
+                  const t0 = performance.now();
           const imgWidget = await board.createImage({
             url: urlToUse,
             x: center.x,
@@ -1053,7 +1049,6 @@ async function handleStitchSubmit(event) {
           creationCount += 1;
           creationTimeSumMs += t1 - t0;
           updateCreationProgress();
-        });
       } else {
         const colWidths = [];
         const rowHeights = [];
@@ -1121,14 +1116,13 @@ async function handleStitchSubmit(event) {
 
             const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${tileFullName}`;
 
-            tileTasks.push(async () => {
-              const t0 = performance.now();
+                          const t0 = performance.now();
               const tileWidget = await board.createImage({
                 url: tileDataUrl,
                 x: centerX,
                 y: centerY,
                 title,
-              });
+  
               const t1 = performance.now();
 
               try {
@@ -1150,12 +1144,6 @@ async function handleStitchSubmit(event) {
           }
         }
       }
-    }
-
-    const BATCH_SIZE = 2;
-    for (let i = 0; i < tileTasks.length; i += BATCH_SIZE) {
-      const batch = tileTasks.slice(i, i + BATCH_SIZE).map((fn) => fn());
-      await Promise.all(batch);
     }
 
     setProgress(totalTiles, totalTiles);
