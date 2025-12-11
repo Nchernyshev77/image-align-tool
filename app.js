@@ -511,56 +511,29 @@ function sortFilesByNameWithNumber(files) {
 
 function canvasToDataUrlUnderLimit(canvas, maxBytes = TARGET_URL_BYTES) {
   // Сжимает содержимое canvas в JPEG так, чтобы dataURL не превышал maxBytes.
-  // Используем бинарный поиск по качеству в диапазоне [0.8, 0.85],
-  // чтобы сохранить максимум качества при заданном лимите.
-  let lowQ = 0.8;
-  let highQ = 0.85;
-  let bestDataUrl = null;
-  let bestQ = lowQ;
+  // Стартуем с качества ~0.85 (близко к Photoshop 10–11) и постепенно уменьшаем,
+  // пока не уложимся в лимит. При необходимости можем опуститься ниже 0.8,
+  // чтобы гарантированно не вылетать по лимиту Miro, но обычно остаёмся в диапазоне 0.8–0.85.
+  const HARD_MIN_Q = 0.4; // ниже 0.4 уже заметно мылит, но это крайний случай
+  const MAX_ALLOWED_BYTES = Math.min(maxBytes, MAX_URL_BYTES);
 
-  // Сначала пробуем с верхним качеством
-  let testDataUrl = canvas.toDataURL("image/jpeg", highQ);
-  if (testDataUrl.length <= maxBytes) {
-    // Уже помещается при почти максимальном качестве
-    if (testDataUrl.length > MAX_URL_BYTES) {
-      console.error(
-        "canvasToDataUrlUnderLimit: dataURL exceeds hard limit even at initial quality",
-        testDataUrl.length,
-        "bytes"
-      );
-      return null;
-    }
-    return testDataUrl;
+  let quality = 0.85;
+  let dataUrl = canvas.toDataURL("image/jpeg", quality);
+
+  // Плавно уменьшаем качество, пока не уложимся в лимит по размеру
+  while (dataUrl.length > MAX_ALLOWED_BYTES && quality > HARD_MIN_Q) {
+    quality -= 0.05;
+    dataUrl = canvas.toDataURL("image/jpeg", quality);
   }
 
-  // Бинарный поиск по качеству
-  for (let i = 0; i < 6; i++) {
-    const q = (lowQ + highQ) / 2;
-    const dataUrl = canvas.toDataURL("image/jpeg", q);
-
-    if (dataUrl.length > maxBytes) {
-      // Всё ещё слишком большой размер — уменьшаем качество
-      highQ = q;
-    } else {
-      // Уложились в лимит — запоминаем как лучший вариант и пробуем поднять качество
-      bestDataUrl = dataUrl;
-      bestQ = q;
-      lowQ = q;
-    }
+  // На всякий случай убеждаемся, что не пробиваем жёсткий лимит Miro
+  if (dataUrl.length > MAX_URL_BYTES) {
+    // Пробуем ещё сильнее сжать, как крайний вариант
+    quality = HARD_MIN_Q;
+    dataUrl = canvas.toDataURL("image/jpeg", quality);
   }
 
-  const finalDataUrl = bestDataUrl || canvas.toDataURL("image/jpeg", lowQ);
-
-  if (finalDataUrl.length > MAX_URL_BYTES) {
-    console.error(
-      "canvasToDataUrlUnderLimit: dataURL is too large even after compression",
-      finalDataUrl.length,
-      "bytes"
-    );
-    return null;
-  }
-
-  return finalDataUrl;
+  return dataUrl;
 }
 
 function computeVariableSlotCenters(
@@ -1260,4 +1233,3 @@ window.addEventListener("DOMContentLoaded", () => {
     updateLabel();
   }
 });
-
