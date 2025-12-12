@@ -963,9 +963,7 @@ async function handleStitchSubmit(event) {
 
     const pad2 = (n) => String(n).padStart(2, "0");
     const pad3 = (n) => String(n).padStart(3, "0");
-
-    const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext("2d");
+    const padN = (n, w) => String(n).padStart(w, "0");
 
     const updateCreationProgress = () => {
       setProgress(createdTiles, totalTiles);
@@ -979,6 +977,54 @@ async function handleStitchSubmit(event) {
       }
     };
 
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    const createImageWithRetry = async (payload, attempts = 8) => {
+      let delay = 450;
+      for (let i = 0; i < attempts; i++) {
+        try {
+          return await board.createImage(payload);
+        } catch (e) {
+          const msg =
+            (e && (e.message || e.error || e.toString && e.toString())) || "";
+          console.warn(
+            `createImage failed (attempt ${i + 1}/${attempts}):`,
+            msg
+          );
+
+          if (i === attempts - 1) {
+            throw e;
+          }
+
+          // Exponential backoff + jitter (helps with Miro throttling)
+          await sleep(delay + Math.random() * 250);
+          delay = Math.min(Math.round(delay * 1.75), 6000);
+        }
+      }
+      // unreachable
+      throw new Error("createImageWithRetry: exhausted attempts");
+    };
+
+    const runPool = async (tasks, concurrency, workerFn) => {
+      let sharedIndex = 0;
+
+      const workers = Array.from({ length: concurrency }, async () => {
+        const localCanvas = document.createElement("canvas");
+        const localCtx = localCanvas.getContext("2d");
+
+        while (true) {
+          const i = sharedIndex++;
+          if (i >= tasks.length) break;
+          await workerFn(tasks[i], localCanvas, localCtx);
+        }
+      });
+
+      await Promise.all(workers);
+    };
+
+    // Build a flat list of tasks so we can upload tiles in parallel safely.
+    const creationTasks = [];
+
     for (let i = 0; i < orderedInfos.length; i++) {
       const info = orderedInfos[i];
       const { file, needsSlice, imgEl, width, height, tilesX, tilesY } = info;
@@ -986,8 +1032,7 @@ async function handleStitchSubmit(event) {
       let center;
       if (slotCentersByFile) {
         center =
-          slotCentersByFile.get(file) ||
-          { x: viewCenterX, y: viewCenterY };
+          slotCentersByFile.get(file) || { x: viewCenterX, y: viewCenterY };
       } else if (slotCentersArray) {
         center = slotCentersArray[i];
       } else {
@@ -1000,45 +1045,126 @@ async function handleStitchSubmit(event) {
       const originalExt = nameMatch && nameMatch[2] ? nameMatch[2] : "";
 
       if (!needsSlice) {
-        const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${originalName}`;
+        const title = `C${pad2(info.satCode)}/${pad3(
+          info.briCode
+        )} ${originalName}`;
 
-        let urlToUse = info.dataUrl;
+        creationTasks.push({
+          type: "single",
+          info,
+          imgEl,
+          width,
+          height,
+          center,
+          title,
+          originalName,
+        });
+        continue;
+      }
 
-        // Если dataURL слишком большой, слегка сжимаем изображение через canvas,
-        // чтобы уложиться в целевой лимит TARGET_URL_BYTES и не потерять сильно в качестве.
+      // Slice tasks
+      const colWidths = [];
+      const rowHeights = [];
+
+      for (let tx = 0; tx < tilesX; tx++) {
+        const sw0 = Math.min(SLICE_TILE_SIZE, width - tx * SLICE_TILE_SIZE);
+        colWidths.push(sw0);
+      }
+      for (let ty = 0; ty < tilesY; ty++) {
+        const sh0 = Math.min(SLICE_TILE_SIZE, height - ty * SLICE_TILE_SIZE);
+        rowHeights.push(sh0);
+      }
+
+      const mosaicWidth = colWidths.reduce((a, b) => a + b, 0);
+      const mosaicHeight = rowHeights.reduce((a, b) => a + b, 0);
+
+      const mosaicLeft = center.x - mosaicWidth / 2;
+      const mosaicTop = center.y - mosaicHeight / 2;
+
+      const colPrefix = [0];
+      for (let tx = 0; tx < tilesX; tx++) {
+        colPrefix.push(colPrefix[colPrefix.length - 1] + colWidths[tx]);
+      }
+      const rowPrefix = [0];
+      for (let ty = 0; ty < tilesY; ty++) {
+        rowPrefix.push(rowPrefix[rowPrefix.length - 1] + rowHeights[ty]);
+      }
+
+      const suffixWidth = Math.max(2, String(info.numTiles || 0).length);
+
+      for (let ty = 0; ty < tilesY; ty++) {
+        for (let tx = 0; tx < tilesX; tx++) {
+          const sx = tx * SLICE_TILE_SIZE;
+          const sy = ty * SLICE_TILE_SIZE;
+          const sw = Math.min(SLICE_TILE_SIZE, width - sx);
+          const sh = Math.min(SLICE_TILE_SIZE, height - sy);
+
+          const tileLeft = mosaicLeft + colPrefix[tx];
+          const tileTop = mosaicTop + rowPrefix[ty];
+          const centerX = tileLeft + sw / 2;
+          const centerY = tileTop + sh / 2;
+
+          const tileIndex = ty * tilesX + tx + 1;
+          const tileSuffix = padN(tileIndex, suffixWidth); // 01 / 001 ...
+          const tileBaseName = `${baseName}_${tileSuffix}`;
+          const tileFullName = originalExt
+            ? `${tileBaseName}${originalExt}`
+            : tileBaseName;
+
+          const title = `C${pad2(info.satCode)}/${pad3(
+            info.briCode
+          )} ${tileFullName}`;
+
+          creationTasks.push({
+            type: "tile",
+            info,
+            imgEl,
+            sx,
+            sy,
+            sw,
+            sh,
+            centerX,
+            centerY,
+            title,
+            tileFullName,
+          });
+        }
+      }
+    }
+
+    // Upload with limited concurrency (2) to avoid Miro throttling + keep UI responsive.
+    const CONCURRENCY = 2;
+
+    // Reset progress for creation phase
+    setProgress(0, totalTiles);
+    setEtaText(null);
+
+    await runPool(creationTasks, CONCURRENCY, async (task, canvas, ctx) => {
+      if (task.type === "single") {
+        let urlToUse = task.info.dataUrl;
+
         if (urlToUse.length > TARGET_URL_BYTES) {
-          canvas.width = width;
-          canvas.height = height;
-          ctx.clearRect(0, 0, width, height);
-          ctx.drawImage(imgEl, 0, 0, width, height);
-
-          const compressed = canvasToDataUrlUnderLimit(canvas);
-          if (!compressed) {
-            await board.notifications.showError(
-              `Image "${file.name}" is too large even after compression. Skipped.`
-            );
-            createdTiles += 1;
-            updateCreationProgress();
-            continue;
-          }
-
-          urlToUse = compressed;
+          canvas.width = task.width;
+          canvas.height = task.height;
+          ctx.clearRect(0, 0, task.width, task.height);
+          ctx.drawImage(task.imgEl, 0, 0, task.width, task.height);
+          urlToUse = canvasToDataUrlUnderLimit(canvas);
         }
 
         const t0 = performance.now();
-        const imgWidget = await board.createImage({
+        const imgWidget = await createImageWithRetry({
           url: urlToUse,
-          x: center.x,
-          y: center.y,
-          title,
+          x: task.center.x,
+          y: task.center.y,
+          title: task.title,
         });
         const t1 = performance.now();
 
         try {
           await imgWidget.setMetadata(META_APP_ID, {
-            fileName: originalName,
-            satCode: info.satCode,
-            briCode: info.briCode,
+            fileName: task.originalName,
+            satCode: task.info.satCode,
+            briCode: task.info.briCode,
           });
         } catch (e) {
           console.warn("setMetadata failed (small image):", e);
@@ -1049,102 +1175,52 @@ async function handleStitchSubmit(event) {
         creationCount += 1;
         creationTimeSumMs += t1 - t0;
         updateCreationProgress();
-      } else {
-        const colWidths = [];
-        const rowHeights = [];
-
-        for (let tx = 0; tx < tilesX; tx++) {
-          const sw0 = Math.min(SLICE_TILE_SIZE, width - tx * SLICE_TILE_SIZE);
-          colWidths.push(sw0);
-        }
-        for (let ty = 0; ty < tilesY; ty++) {
-          const sh0 = Math.min(SLICE_TILE_SIZE, height - ty * SLICE_TILE_SIZE);
-          rowHeights.push(sh0);
-        }
-
-        const mosaicWidth = colWidths.reduce((a, b) => a + b, 0);
-        const mosaicHeight = rowHeights.reduce((a, b) => a + b, 0);
-
-        const mosaicLeft = center.x - mosaicWidth / 2;
-        const mosaicTop = center.y - mosaicHeight / 2;
-
-        const colPrefix = [0];
-        for (let tx = 0; tx < tilesX; tx++) {
-          colPrefix.push(colPrefix[colPrefix.length - 1] + colWidths[tx]);
-        }
-        const rowPrefix = [0];
-        for (let ty = 0; ty < tilesY; ty++) {
-          rowPrefix.push(rowPrefix[rowPrefix.length - 1] + rowHeights[ty]);
-        }
-
-        let tileIndexForName = 0;
-
-        for (let ty = 0; ty < tilesY; ty++) {
-          for (let tx = 0; tx < tilesX; tx++) {
-            const sx = tx * SLICE_TILE_SIZE;
-            const sy = ty * SLICE_TILE_SIZE;
-            const sw = Math.min(SLICE_TILE_SIZE, width - sx);
-            const sh = Math.min(SLICE_TILE_SIZE, height - sy);
-
-            canvas.width = sw;
-            canvas.height = sh;
-            ctx.clearRect(0, 0, sw, sh);
-
-            ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, sw, sh);
-
-            const tileDataUrl = canvasToDataUrlUnderLimit(canvas);
-            if (!tileDataUrl) {
-              await board.notifications.showError(
-                `One of the tiles from "${file.name}" is too large even after compression. Skipped.`
-              );
-              createdTiles++;
-              updateCreationProgress();
-              continue;
-            }
-
-            const tileLeft = mosaicLeft + colPrefix[tx];
-            const tileTop = mosaicTop + rowPrefix[ty];
-            const centerX = tileLeft + sw / 2;
-            const centerY = tileTop + sh / 2;
-
-            tileIndexForName++;
-            const tileSuffix = pad2(tileIndexForName); // 01, 02, 03...
-            const tileBaseName = `${baseName}_${tileSuffix}`;
-            const tileFullName = originalExt
-              ? `${tileBaseName}${originalExt}`
-              : tileBaseName;
-
-            const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${tileFullName}`;
-
-            const t0 = performance.now();
-            const tileWidget = await board.createImage({
-              url: tileDataUrl,
-              x: centerX,
-              y: centerY,
-              title,
-            });
-            const t1 = performance.now();
-
-            try {
-              await tileWidget.setMetadata(META_APP_ID, {
-                fileName: tileFullName,
-                satCode: info.satCode,
-                briCode: info.briCode,
-              });
-            } catch (e) {
-              console.warn("setMetadata failed (slice tile):", e);
-            }
-
-            allCreatedTiles.push(tileWidget);
-            createdTiles++;
-            creationCount++;
-            creationTimeSumMs += t1 - t0;
-            updateCreationProgress();
-          }
-        }
+        return;
       }
-    }
 
+      // task.type === "tile"
+      canvas.width = task.sw;
+      canvas.height = task.sh;
+      ctx.clearRect(0, 0, task.sw, task.sh);
+      ctx.drawImage(
+        task.imgEl,
+        task.sx,
+        task.sy,
+        task.sw,
+        task.sh,
+        0,
+        0,
+        task.sw,
+        task.sh
+      );
+
+      const tileDataUrl = canvasToDataUrlUnderLimit(canvas);
+
+      const t0 = performance.now();
+      const tileWidget = await createImageWithRetry({
+        url: tileDataUrl,
+        x: task.centerX,
+        y: task.centerY,
+        title: task.title,
+      });
+      const t1 = performance.now();
+
+      try {
+        await tileWidget.setMetadata(META_APP_ID, {
+          fileName: task.tileFullName,
+          satCode: task.info.satCode,
+          briCode: task.info.briCode,
+        });
+      } catch (e) {
+        console.warn("setMetadata failed (slice tile):", e);
+      }
+
+      allCreatedTiles.push(tileWidget);
+      createdTiles += 1;
+      creationCount += 1;
+      creationTimeSumMs += t1 - t0;
+      updateCreationProgress();
+    });
     setProgress(totalTiles, totalTiles);
     setEtaText(null);
 
