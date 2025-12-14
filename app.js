@@ -960,23 +960,30 @@ setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
 // Используем object URL вместо dataURL, чтобы не держать гигантские base64-строки в памяти.
 const objectUrl = URL.createObjectURL(file);
 
-let imgEl;
+let imgEl = null;
+let width = 0;
+let height = 0;
 try {
-  // Для objectUrl crossOrigin не нужен, но в loadImage он выставлен — это ок.
+  // Fast path: decode via <img> from objectUrl.
   imgEl = await loadImage(objectUrl);
-        URL.revokeObjectURL(objectUrl);
+  width = imgEl.naturalWidth || imgEl.width;
+  height = imgEl.naturalHeight || imgEl.height;
 } catch (e) {
-        URL.revokeObjectURL(objectUrl);
+  console.warn("Stitch/Slice: <img> decode failed, will try ImageBitmap for dimensions:", file.name, e);
+  if (typeof createImageBitmap === "function") {
+    try {
+      const bmp = await createImageBitmap(file);
+      width = bmp.width;
+      height = bmp.height;
+      try { bmp.close && bmp.close(); } catch (_) {}
+    } catch (e2) {
+      console.error("Stitch/Slice: ImageBitmap decode also failed", file.name, e2);
+    }
+  }
+} finally {
+  URL.revokeObjectURL(objectUrl);
+}
 
-        console.error("Stitch/Slice: browser failed to decode image", file.name, e);
-        await board.notifications.showError(
-          `Cannot import "${file.name}": browser failed to decode the image.`
-        );
-        continue;
-      }
-
-      const width = imgEl.naturalWidth || imgEl.width;
-      const height = imgEl.naturalHeight || imgEl.height;
 
       if (!width || !height) {
         console.error("Stitch/Slice: invalid dimensions", width, height, file.name);
@@ -986,16 +993,12 @@ try {
         continue;
       }
 
-      if (width > MAX_SLICE_DIM || height > MAX_SLICE_DIM) {
+      const exceedsDeviceLimit = width > MAX_SLICE_DIM || height > MAX_SLICE_DIM;
+      if (exceedsDeviceLimit) {
         console.warn(
-          `Stitch/Slice: image too large (${width}x${height}), limit is ${MAX_SLICE_DIM}px per side.`
+          `Stitch/Slice: image exceeds device MAX_TEXTURE_SIZE (${width}x${height} > ${MAX_SLICE_DIM}). ` +
+            `Will try tile slicing anyway (ImageBitmap fallback may be used).`
         );
-        await board.notifications.showError(
-          `Image "${file.name}" is too large (${width}×${height}). ` +
-            `Stitch/Slice supports up to ${MAX_SLICE_DIM}px per side on this device. ` +
-            `Please downscale or pre-slice it externally.`
-        );
-        continue;
       }
 
       let brightness = 0.5;
@@ -1022,7 +1025,9 @@ try {
       const satCode = Math.max(0, Math.min(SAT_CODE_MAX, satCodeRaw));
 
       const needsSlice =
-        width > SLICE_THRESHOLD_WIDTH || height > SLICE_THRESHOLD_HEIGHT;
+        width > SLICE_THRESHOLD_WIDTH ||
+        height > SLICE_THRESHOLD_HEIGHT ||
+        exceedsDeviceLimit;
 
       if (needsSlice) anySliced = true;
 
@@ -1045,6 +1050,7 @@ try {
         briCode,
         satCode,
         needsSlice,
+        exceedsDeviceLimit,
         tilesX,
         tilesY,
         numTiles,
@@ -1811,6 +1817,9 @@ const getDecodedImage = async (file) => {
     try {
       const imgEl = await loadImage(objectUrl);
       return imgEl;
+    } catch (e) {
+      console.warn("Stitch/Slice: getDecodedImage <img> decode failed, will use ImageBitmap fallback:", file.name, e);
+      return null;
     } finally {
       URL.revokeObjectURL(objectUrl);
     }
@@ -1838,32 +1847,117 @@ const releaseDecodedImageIfDone = (file) => {
   remainingJobsByFile.set(file, left);
 };
 
-const processOneJob = async (job) => {
-  const { file, info } = job;
-  const imgEl = await getDecodedImage(file);
+let renderModeImgCount = 0;
+let renderModeBitmapCount = 0;
 
-  // Per-job canvas (safe for concurrency)
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
+const canUseCreateImageBitmap = typeof createImageBitmap === "function";
 
-  let urlToUse;
-  let title;
+async function drawJobUsingBitmap(job, canvas, ctx) {
+  const { file } = job;
+  let bitmap;
+  try {
+    if (job.kind === "full") {
+      bitmap = await createImageBitmap(file);
+      canvas.width = job.width;
+      canvas.height = job.height;
+      ctx.clearRect(0, 0, job.width, job.height);
+      ctx.drawImage(bitmap, 0, 0, job.width, job.height);
+    } else {
+      bitmap = await createImageBitmap(file, job.sx, job.sy, job.sw, job.sh);
+      canvas.width = job.sw;
+      canvas.height = job.sh;
+      ctx.clearRect(0, 0, job.sw, job.sh);
+      ctx.drawImage(bitmap, 0, 0, job.sw, job.sh);
+    }
+  } finally {
+    try {
+      if (bitmap && bitmap.close) bitmap.close();
+    } catch (_) {}
+  }
+}
+
+function drawJobUsingImgEl(job, imgEl, canvas, ctx) {
+  if (!imgEl) throw new Error("No decoded <img> available");
 
   if (job.kind === "full") {
     canvas.width = job.width;
     canvas.height = job.height;
     ctx.clearRect(0, 0, job.width, job.height);
     ctx.drawImage(imgEl, 0, 0, job.width, job.height);
-
-    urlToUse = canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
-    title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${originalNameByFile.get(file) || "image"}`;
   } else {
     canvas.width = job.sw;
     canvas.height = job.sh;
     ctx.clearRect(0, 0, job.sw, job.sh);
     ctx.drawImage(imgEl, job.sx, job.sy, job.sw, job.sh, 0, 0, job.sw, job.sh);
+  }
+}
 
-    urlToUse = canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
+async function renderJobToDataUrl(job, imgEl, canvas, ctx) {
+  const preferBitmap = !!(job.info && job.info.exceedsDeviceLimit);
+
+  const tryImg = () => {
+    drawJobUsingImgEl(job, imgEl, canvas, ctx);
+    const url = canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
+    renderModeImgCount += 1;
+    return url;
+  };
+
+  const tryBitmap = async () => {
+    if (!canUseCreateImageBitmap) {
+      throw new Error("createImageBitmap is not available in this browser");
+    }
+    await drawJobUsingBitmap(job, canvas, ctx);
+    const url = canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
+    renderModeBitmapCount += 1;
+    return url;
+  };
+
+  if (preferBitmap) {
+    try {
+      return await tryBitmap();
+    } catch (e1) {
+      // If bitmap path fails, fall back to <img> (sometimes it works even when MAX_TEXTURE_SIZE is small).
+      return tryImg();
+    }
+  }
+
+  try {
+    return tryImg();
+  } catch (e1) {
+    return await tryBitmap();
+  }
+}
+
+const processOneJob = async (job) => {
+  const { file, info } = job;
+
+  // May be null for huge images (then we'll rely on ImageBitmap fallback).
+  const imgEl = await getDecodedImage(file);
+
+  // Per-job canvas (safe for concurrency).
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+
+  let urlToUse;
+  let title;
+
+  try {
+    urlToUse = await renderJobToDataUrl(job, imgEl, canvas, ctx);
+  } catch (e) {
+    console.error("Stitch/Slice: render failed for", file && file.name, e);
+    await board.notifications.showError(
+      `Cannot slice "${file.name}". This image is too large for your browser/GPU. ` +
+        `Try Chrome/Edge, disable hardware acceleration, or pre-slice externally.`
+    );
+    releaseDecodedImageIfDone(file);
+    return;
+  }
+
+  if (job.kind === "full") {
+    title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${
+      originalNameByFile.get(file) || "image"
+    }`;
+  } else {
     title = job.title;
   }
 
@@ -1989,6 +2083,10 @@ setProgress(totalTiles, totalTiles);
         maxSeen: maxInFlightCreateImage,
         maxAllowedSeen: maxConcurrencySeen,
         configuredMax: UPLOAD_CONCURRENCY_MAX,
+      });
+      console.log("Render modes:", {
+        imgEl: renderModeImgCount,
+        imageBitmap: renderModeBitmapCount,
       });
       if (concurrencyDecisions.length) {
         console.table(concurrencyDecisions.slice(-12));
