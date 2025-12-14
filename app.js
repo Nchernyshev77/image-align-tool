@@ -1395,24 +1395,50 @@ const runWithAdaptiveConcurrency = async (
   const GAIN_THRESHOLD = 1.10; // need ~10% throughput gain to justify higher concurrency
   const PROBE_ONLY_IF_TILES_AT_LEAST = 200;
 
-  // One-time forced probe at 5 for big imports
+  // One-time forced probe at 5 for big imports (2 windows + tail guard)
   const shouldForcedProbe = items.length >= PROBE_ONLY_IF_TILES_AT_LEAST && maxConcurrency >= 5;
   const probeCfg = shouldForcedProbe
     ? {
+        phase: "warmup", // warmup -> baseline -> probe -> done
         done: false,
-        active: false,
+
         baseConc: Math.min(concurrency, 4),
         warmupTiles: 60,
-        baselineMbps: null,
-        baselineSeen: false,
-        probeTilesTarget: 25,
-        probeTilesDone: 0,
-        probeBytes: 0,
-        probeMs: 0,
+
+        windowTiles: 20,
+        windowsTarget: 2,
+
+        // per-phase windows
+        baselineWindows: [], // { mbps, ips, msPerTile, p95WallMs }
+        probeWindows: [],
+
+        // accumulators for the current window
+        accTiles: 0,
+        accBytes: 0,
+        accMs: 0,
+        accWall: [],
+
+        // decision details (for logging/table)
+        lastGain: null,
+        lastTailFactor: null,
       }
     : null;
 
-  let idx = 0;
+  const resetProbeAcc = () => {
+    if (!probeCfg) return;
+    probeCfg.accTiles = 0;
+    probeCfg.accBytes = 0;
+    probeCfg.accMs = 0;
+    probeCfg.accWall = [];
+  };
+  const quantileMs = (arr, p) => {
+    if (!arr || !arr.length) return null;
+    const xs = arr.slice().sort((a, b) => a - b);
+    const i = Math.min(xs.length - 1, Math.max(0, Math.round((xs.length - 1) * p)));
+    return Math.round(xs[i]);
+  };
+
+let idx = 0;
   let tpEwmaMbps = null;
   let cooldownBatches = 0;
 
@@ -1431,6 +1457,7 @@ const runWithAdaptiveConcurrency = async (
     const retryBefore = uploadRetryEvents;
     const bytesBefore = uploadedBytesDone;
     const tilesBefore = createdTiles;
+    const wallBefore = createImageWallTimesMs.length;
     const t0 = performance.now();
 
     await runWithConcurrency(
@@ -1440,6 +1467,11 @@ const runWithAdaptiveConcurrency = async (
       },
       concUsed
     );
+
+    const wallAfter = createImageWallTimesMs.length;
+    const wallSlice = createImageWallTimesMs.slice(wallBefore, wallAfter);
+    const p50WallMs = quantileMs(wallSlice, 0.5);
+    const p95WallMs = quantileMs(wallSlice, 0.95);
 
     const dtMs = performance.now() - t0;
     const retries = uploadRetryEvents - retryBefore;
@@ -1458,8 +1490,8 @@ const runWithAdaptiveConcurrency = async (
     const retriesPerTile = retries / Math.max(1, tilesDelta);
 
     // Stability heuristics
-    const unstable = retriesPerTile > 0.08 || msPerTile > 15000;
-    const stable = retriesPerTile < 0.03 && msPerTile < 11000;
+    const unstable = retriesPerTile > 0.08 || msPerTile > 15000 || (p95WallMs != null && p95WallMs > 17000);
+    const stable = retriesPerTile < 0.03 && msPerTile < 11000 && (p95WallMs == null || p95WallMs < 13000);
 
     let action = "keep";
     let concNext = concurrency;
@@ -1467,57 +1499,155 @@ const runWithAdaptiveConcurrency = async (
     if (cooldownBatches > 0) cooldownBatches -= 1;
 
     // ---- Forced probe (once) ----
+    const probePhase = probeCfg ? probeCfg.phase : null;
+
     if (probeCfg && !probeCfg.done) {
-      // capture baseline after warmup, while we're at base conc
-      if (!probeCfg.baselineSeen && createdTiles >= probeCfg.warmupTiles && concUsed === probeCfg.baseConc) {
-        probeCfg.baselineMbps = tpEwmaMbps ?? mbps;
-        probeCfg.baselineSeen = true;
+      const finalizeWindow = (kind) => {
+        const sec = Math.max(0.001, probeCfg.accMs / 1000);
+        const wMbps = (probeCfg.accBytes / 1_000_000) / sec;
+        const wIps = probeCfg.accTiles / sec;
+        const wMsPerTile = probeCfg.accMs / Math.max(1, probeCfg.accTiles);
+        const wP95 = quantileMs(probeCfg.accWall, 0.95);
+
+        const obj = {
+          mbps: Number.isFinite(wMbps) ? wMbps : null,
+          ips: Number.isFinite(wIps) ? wIps : null,
+          msPerTile: Number.isFinite(wMsPerTile) ? wMsPerTile : null,
+          p95WallMs: wP95,
+        };
+
+        if (kind === "baseline") probeCfg.baselineWindows.push(obj);
+        else if (kind === "probe") probeCfg.probeWindows.push(obj);
+
+        resetProbeAcc();
+      };
+
+      // Warmup: keep at base conc to "stabilize" startup noise
+      if (probeCfg.phase === "warmup") {
+        if (concUsed !== probeCfg.baseConc) {
+          lockedMax = probeCfg.baseConc;
+          concNext = probeCfg.baseConc;
+          action = "probe-warmup";
+          cooldownBatches = 1;
+        }
+        if (createdTiles >= probeCfg.warmupTiles) {
+          probeCfg.phase = "baseline";
+          resetProbeAcc();
+        }
       }
 
-      // start probe after warmup + baseline captured
-      if (!probeCfg.active && probeCfg.baselineSeen && createdTiles >= probeCfg.warmupTiles) {
-        probeCfg.active = true;
-        probeCfg.probeTilesDone = 0;
-        probeCfg.probeBytes = 0;
-        probeCfg.probeMs = 0;
+      // Baseline: collect 2 windows at base conc
+      if (probeCfg.phase === "baseline") {
+        if (concUsed !== probeCfg.baseConc) {
+          lockedMax = probeCfg.baseConc;
+          concNext = probeCfg.baseConc;
+          action = "probe-base";
+          cooldownBatches = 1;
+        } else {
+          probeCfg.accTiles += tilesDelta;
+          probeCfg.accBytes += bytesDelta;
+          probeCfg.accMs += dtMs;
+          if (wallSlice && wallSlice.length) probeCfg.accWall.push(...wallSlice);
 
-        lockedMax = 5;
-        concNext = 5;
-        action = "force-up";
-        cooldownBatches = 1;
-      } else if (probeCfg.active) {
-        // accumulate probe stats (regardless of batch sizes)
-        probeCfg.probeTilesDone += tilesDelta;
-        probeCfg.probeBytes += bytesDelta;
-        probeCfg.probeMs += dtMs;
-
-        if (probeCfg.probeTilesDone >= probeCfg.probeTilesTarget) {
-          const probeSec = Math.max(0.001, probeCfg.probeMs / 1000);
-          const probeMbps = (probeCfg.probeBytes / 1_000_000) / probeSec;
-
-          const baseMbps = probeCfg.baselineMbps || 0.0000001;
-          const gain = probeMbps / baseMbps;
-
-          if (!Number.isFinite(gain) || gain < 1.05) {
-            // Not worth it: cap at base conc and never try 5 again this run
-            lockedMax = probeCfg.baseConc;
-            concNext = lockedMax;
-            action = "force-cap";
-          } else {
-            // Worth it: keep 5 available
-            lockedMax = 5;
-            concNext = 5;
-            action = "force-accept";
+          if (probeCfg.accTiles >= probeCfg.windowTiles) {
+            finalizeWindow("baseline");
           }
 
-          probeCfg.done = true;
-          probeCfg.active = false;
-          cooldownBatches = 2;
+          if (probeCfg.baselineWindows.length >= probeCfg.windowsTarget) {
+            probeCfg.phase = "probe";
+            resetProbeAcc();
+
+            lockedMax = 5;
+            concNext = 5;
+            action = "probe-up";
+            cooldownBatches = 1;
+          }
+        }
+      }
+
+      // Probe: collect 2 windows at conc=5, then decide using gain + p95 tail guard
+      if (probeCfg.phase === "probe") {
+        lockedMax = 5;
+
+        if (concUsed !== 5) {
+          concNext = 5;
+          action = "probe-up";
+          cooldownBatches = 1;
+        } else {
+          probeCfg.accTiles += tilesDelta;
+          probeCfg.accBytes += bytesDelta;
+          probeCfg.accMs += dtMs;
+          if (wallSlice && wallSlice.length) probeCfg.accWall.push(...wallSlice);
+
+          if (probeCfg.accTiles >= probeCfg.windowTiles) {
+            finalizeWindow("probe");
+          }
+
+          if (probeCfg.probeWindows.length >= probeCfg.windowsTarget) {
+            const median = (xs) => {
+              const ys = xs
+                .filter((v) => Number.isFinite(v))
+                .slice()
+                .sort((a, b) => a - b);
+              if (!ys.length) return null;
+              const mid = Math.floor((ys.length - 1) / 2);
+              return ys.length % 2 ? ys[mid] : (ys[mid] + ys[mid + 1]) / 2;
+            };
+
+            const baseMbpsMed = median(probeCfg.baselineWindows.map((w) => w.mbps));
+            const probeMbpsMed = median(probeCfg.probeWindows.map((w) => w.mbps));
+            const baseP95Med = median(probeCfg.baselineWindows.map((w) => w.p95WallMs));
+            const probeP95Med = median(probeCfg.probeWindows.map((w) => w.p95WallMs));
+            const baseMsMed = median(probeCfg.baselineWindows.map((w) => w.msPerTile));
+            const probeMsMed = median(probeCfg.probeWindows.map((w) => w.msPerTile));
+
+            const gain =
+              baseMbpsMed != null && probeMbpsMed != null
+                ? probeMbpsMed / Math.max(1e-9, baseMbpsMed)
+                : null;
+
+            const tailFactor =
+              baseP95Med != null && probeP95Med != null
+                ? probeP95Med / Math.max(1e-9, baseP95Med)
+                : null;
+
+            probeCfg.lastGain = gain;
+            probeCfg.lastTailFactor = tailFactor;
+
+            const strongGain = gain != null && gain >= 1.07;
+            const weakGain = gain != null && gain >= 1.03;
+
+            const tailOkStrong = tailFactor == null || tailFactor <= 1.15;
+            const tailOkWeak = tailFactor == null || tailFactor <= 1.05;
+            const tailHardBad = tailFactor != null && tailFactor >= 1.25;
+
+            // don't accept if per-tile time got worse (helps guard against noisy mbps)
+            const msNotWorse =
+              baseMsMed == null || probeMsMed == null || probeMsMed <= baseMsMed * 1.02;
+
+            let accept = false;
+            if (strongGain && tailOkStrong && msNotWorse) accept = true;
+            else if (weakGain && tailOkWeak && msNotWorse) accept = true;
+
+            if (!accept || tailHardBad) {
+              lockedMax = probeCfg.baseConc;
+              concNext = lockedMax;
+              action = "force-cap";
+            } else {
+              lockedMax = 5;
+              concNext = 5;
+              action = "force-accept";
+            }
+
+            probeCfg.done = true;
+            probeCfg.phase = "done";
+            cooldownBatches = 2;
+          }
         }
       }
     }
 
-    // ---- Normal adaptation (only if probe is done / not configured) ----
+// ---- Normal adaptation (only if probe is done / not configured) ----
     const probeBlocking = probeCfg && !probeCfg.done;
     if (!probeBlocking) {
       if (unstable && concurrency > minConcurrency) {
@@ -1542,6 +1672,11 @@ const runWithAdaptiveConcurrency = async (
       ips: Number.isFinite(ips) ? Number(ips.toFixed(2)) : null,
       retriesPerTile: Number.isFinite(retriesPerTile) ? Number(retriesPerTile.toFixed(3)) : null,
       msPerTile: Number.isFinite(msPerTile) ? Math.round(msPerTile) : null,
+      p50WallMs,
+      p95WallMs,
+      probePhase,
+      probeGain: probeCfg && probeCfg.lastGain != null ? Number(probeCfg.lastGain.toFixed(3)) : null,
+      probeTail: probeCfg && probeCfg.lastTailFactor != null ? Number(probeCfg.lastTailFactor.toFixed(3)) : null,
       action,
     });
 
