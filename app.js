@@ -713,6 +713,20 @@ function computeSkipMissingSlotCenters(
 async function handleStitchSubmit(event) {
   event.preventDefault();
 
+
+  // ---- run-level timers & stats (declared early to avoid TDZ across reruns) ----
+  var prepStartTs = performance.now();
+  var prepEndTs = null;
+  var uploadStartTs = null;
+  var uploadEndTs = null;
+  var uploadRetryEvents = 0;
+  var uploadedBytesDone = 0;
+
+  // createImage wall-time (includes retries/backoff)
+  var createImageWallTimesMs = [];
+  var createImageWallTimeSumMs = 0;
+  var createImageWallTimeCount = 0;
+
   const stitchButton = document.getElementById("stitchButton");
   const progressBarEl = document.getElementById("stitchProgressBar");
   const progressMainEl = document.getElementById("stitchProgressMain");
@@ -1161,19 +1175,6 @@ let slotCentersByFile = null;
     let createdTiles = 0;
 
     // ---- ETA: считаем по фактической пропускной способности (учитывает параллелизм) ----
-    var uploadStartTs = null;
-    var uploadRetryEvents = 0;
-
-    // ---- stats (console only) ----
-    var prepStartTs = null;
-    var prepEndTs = null;
-    var uploadEndTs = null;
-
-    // createImage wall-time (includes retries/backoff)
-    var createImageWallTimesMs = [];
-    var createImageWallTimeSumMs = 0;
-    var createImageWallTimeCount = 0;
-
     // adaptive concurrency diagnostics
     let maxConcurrencySeen = 0;
     const concurrencyDecisions = []; // {idx, conc, mbps, ips, retriesPerTile, msPerTile, action}
@@ -1670,6 +1671,12 @@ setProgress(totalTiles, totalTiles);
         return mins ? `${mins}m ${secsStr}s` : `${secsStr}s`;
       };
 
+
+      const fmtSec = (ms) => {
+        if (ms == null || !Number.isFinite(ms) || ms < 0) return null;
+        return `${(ms / 1000).toFixed(2)}s`;
+      };
+
       const percentile = (arr, p) => {
         if (!arr || !arr.length) return null;
         const xs = arr.slice().sort((a, b) => a - b);
@@ -1677,9 +1684,11 @@ setProgress(totalTiles, totalTiles);
         return Math.round(xs[idx]);
       };
 
-      const prepMs = prepStartTs != null && prepEndTs != null ? prepEndTs - prepStartTs : null;
+      const prepEnd = (prepEndTs != null ? prepEndTs : (uploadStartTs != null ? uploadStartTs : uploadEndTs));
+      const prepMs = prepStartTs != null && prepEnd != null ? prepEnd - prepStartTs : null;
       const uploadMs = uploadStartTs != null && uploadEndTs != null ? uploadEndTs - uploadStartTs : null;
-      const totalMs = prepStartTs != null && uploadEndTs != null ? uploadEndTs - prepStartTs : null;
+      const totalEnd = (uploadEndTs != null ? uploadEndTs : performance.now());
+      const totalMs = prepStartTs != null ? totalEnd - prepStartTs : null;
 
       const totalMB = uploadedBytesDone / 1_000_000;
       const avgMBPerTile = createdTiles ? totalMB / createdTiles : 0;
@@ -1699,11 +1708,14 @@ setProgress(totalTiles, totalTiles);
         mbps: mbps != null ? Math.round(mbps * 100) / 100 : null,
         retries: uploadRetryEvents,
       });
-      console.log("createImage wall-time (ms):", {
-        avg: avgCreateMs,
-        p50: percentile(createImageWallTimesMs, 0.5),
-        p95: percentile(createImageWallTimesMs, 0.95),
-      });
+      const p50Ms = percentile(createImageWallTimesMs, 0.5);
+      const p95Ms = percentile(createImageWallTimesMs, 0.95);
+      const wallHuman = avgCreateMs != null
+        ? `${fmtSec(avgCreateMs)} avg (p50 ${fmtSec(p50Ms)}, p95 ${fmtSec(p95Ms)})`
+        : null;
+
+      console.log("createImage wall-time:", wallHuman);
+      console.log("createImage wall-time (ms):", { avg: avgCreateMs, p50: p50Ms, p95: p95Ms });
       console.log("Concurrency:", {
         maxSeen: maxConcurrencySeen,
         configuredMax: UPLOAD_CONCURRENCY_MAX,
