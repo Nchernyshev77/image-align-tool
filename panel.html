@@ -218,7 +218,7 @@
       <div class="section-title">Grid</div>
 
       <div class="field">
-        <label for="sortingImagesPerRow">Rows</label>
+        <label for="sortingImagesPerRow">Tile in a row</label>
         <input
           id="sortingImagesPerRow"
           name="sortingImagesPerRow"
@@ -256,7 +256,7 @@
       <div class="field">
         <label for="sortingSizeMode">Resize</label>
         <select id="sortingSizeMode" name="sortingSizeMode">
-          <option value="none" selected>Do not resize</option>
+          <option value="none" selected>Original size</option>
           <option value="width">Match width</option>
           <option value="height">Match height</option>
         </select>
@@ -277,6 +277,15 @@
         <select id="sortingSortMode" name="sortingSortMode">
           <option value="number" selected>Number</option>
           <option value="color">Color</option>
+          <option value="size">Size (area)</option>
+        </select>
+      </div>
+
+      <div class="field" id="sortingSizeOrderField" style="display:none;">
+        <label for="sortingSizeOrder">Size order</label>
+        <select id="sortingSizeOrder" name="sortingSizeOrder">
+          <option value="desc" selected>Large → small</option>
+          <option value="asc">Small → large</option>
         </select>
       </div>
 
@@ -292,7 +301,7 @@
       <div class="section-title">Grid</div>
 
       <div class="field">
-        <label for="stitchImagesPerRow">Rows</label>
+        <label for="stitchImagesPerRow">Tile in a row</label>
         <input
           id="stitchImagesPerRow"
           name="stitchImagesPerRow"
