@@ -1,5 +1,5 @@
 // app.js
-// Image Align Tool_19: Sorting + Stitch/Slice
+// Image Align Tool_20: Sorting + Stitch/Slice
 // Based on Image Align Tool_14: start concurrency always 4 (removed 128-tile threshold).
 // Cleanup A+B: removed unused helpers/constants, unified sorting engine, unified start-corner flip logic. (p50/p95 metrics unchanged).
 
@@ -71,10 +71,27 @@ function sortByGeometry(images) {
 
 
 function getCornerFlip(startCorner) {
-    const { flipX, flipY } = getCornerFlip(startCorner);
+  let flipX = false;
+  let flipY = false;
 
-return { flipX, flipY };
+  switch (startCorner) {
+    case "top-right":
+      flipX = true;
+      break;
+    case "bottom-left":
+      flipY = true;
+      break;
+    case "bottom-right":
+      flipX = true;
+      flipY = true;
+      break;
+    default:
+      break;
+  }
+
+  return { flipX, flipY };
 }
+
 
 
 // ---------- helpers: image loading & brightness ----------
