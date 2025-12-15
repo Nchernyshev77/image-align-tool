@@ -1,6 +1,7 @@
 // app.js
-// Image Align Tool_16: Sorting + Stitch/Slice
+// Image Align Tool_19: Sorting + Stitch/Slice
 // Based on Image Align Tool_14: start concurrency always 4 (removed 128-tile threshold).
+// Cleanup A+B: removed unused helpers/constants, unified sorting engine, unified start-corner flip logic. (p50/p95 metrics unchanged).
 
 const { board } = window.miro;
 
@@ -16,8 +17,6 @@ const MAX_URL_BYTES = 29000000;      // лимит размера dataURL (~29 �
 const TARGET_URL_BYTES = 4500000;   // целевой размер dataURL (~4.5 МБ на тайл/изображение)
 const CREATE_IMAGE_MAX_RETRIES = 5;
 const CREATE_IMAGE_BASE_DELAY_MS = 500;
-const UPLOAD_CONCURRENCY_SMALL = 3;
-const UPLOAD_CONCURRENCY_LARGE = 4;
 
 const UPLOAD_CONCURRENCY_MIN = 2;
 const UPLOAD_CONCURRENCY_MAX = 5;
@@ -69,6 +68,14 @@ function sortByGeometry(images) {
     return 0;
   });
 }
+
+
+function getCornerFlip(startCorner) {
+    const { flipX, flipY } = getCornerFlip(startCorner);
+
+return { flipX, flipY };
+}
+
 
 // ---------- helpers: image loading & brightness ----------
 
@@ -234,38 +241,13 @@ async function alignImagesInGivenOrder(images, config) {
   const maxRight = Math.max(...bounds.map((b) => b.right));
   const maxBottom = Math.max(...bounds.map((b) => b.bottom));
 
-  let originLeft;
-  let originTop;
-  let flipX = false;
-  let flipY = false;
+  
+const { flipX, flipY } = getCornerFlip(startCorner);
 
-  switch (startCorner) {
-    case "top-left":
-      originLeft = minLeft;
-      originTop = minTop;
-      break;
-    case "top-right":
-      originLeft = maxRight - gridWidth;
-      originTop = minTop;
-      flipX = true;
-      break;
-    case "bottom-left":
-      originLeft = minLeft;
-      originTop = maxBottom - gridHeight;
-      flipY = true;
-      break;
-    case "bottom-right":
-      originLeft = maxRight - gridWidth;
-      originTop = maxBottom - gridHeight;
-      flipX = true;
-      flipY = true;
-      break;
-    default:
-      originLeft = minLeft;
-      originTop = minTop;
-  }
+const originLeft = flipX ? (maxRight - gridWidth) : minLeft;
+const originTop = flipY ? (maxBottom - gridHeight) : minTop;
 
-  for (let i = 0; i < total; i++) {
+for (let i = 0; i < total; i++) {
     let x0 = baseX[i];
     let y0 = baseY[i];
 
@@ -280,120 +262,171 @@ async function alignImagesInGivenOrder(images, config) {
   await Promise.all(images.map((img) => img.sync()));
 }
 
-// ---------- SORTING: by number ----------
 
-async function sortImagesByNumber(images) {
-  const hasAnyEmptyTitle = images.some((img) => !getTitle(img));
+// ---------- SORTING: order images ----------
 
-  if (hasAnyEmptyTitle) {
-    const geoOrder = sortByGeometry(images);
-    let counter = 1;
-    for (const img of geoOrder) {
-      img.title = String(counter);
-      counter++;
+async function orderImagesForSorting(images, { sortMode, sizeMode, sizeOrder }) {
+  if (!images.length) return [];
+
+  if (sortMode === "number") {
+    // If any image has an empty title, create numeric titles based on geometry order first.
+    const hasAnyEmptyTitle = images.some((img) => !getTitle(img));
+    if (hasAnyEmptyTitle) {
+      const geoOrder = sortByGeometry(images);
+      let counter = 1;
+      for (const img of geoOrder) {
+        img.title = String(counter);
+        counter++;
+      }
+      await Promise.all(geoOrder.map((img) => img.sync()));
+      images = geoOrder;
     }
-    await Promise.all(geoOrder.map((img) => img.sync()));
-    images = geoOrder;
-  }
 
-  const meta = images.map((img, index) => {
-    const title = getTitle(img);
-    const lower = title.toLowerCase();
-    const num = extractTrailingNumber(title);
-    const hasNumber = num !== null;
-    return { img, index, title, lower, hasNumber, num };
-  });
+    const meta = images.map((img, index) => {
+      const title = getTitle(img);
+      const lower = title.toLowerCase();
+      const num = extractTrailingNumber(title);
+      const hasNumber = num !== null;
+      return { img, index, title, lower, hasNumber, num };
+    });
 
-  console.groupCollapsed("Sorting (number) – titles & numbers");
-  meta.forEach((m) => console.log(m.title || m.img.id, "=>", m.num));
-  console.groupEnd();
+    console.groupCollapsed("Sorting (number) – titles & numbers");
+    meta.forEach((m) => console.log(m.title || m.img.id, "=>", m.num));
+    console.groupEnd();
 
-  meta.sort((a, b) => {
-    if (a.hasNumber && !b.hasNumber) return -1;
-    if (!a.hasNumber && b.hasNumber) return 1;
+    meta.sort((a, b) => {
+      if (a.hasNumber && !b.hasNumber) return -1;
+      if (!a.hasNumber && b.hasNumber) return 1;
 
-    if (a.hasNumber && b.hasNumber) {
-      if (a.num !== b.num) return a.num - b.num;
+      if (a.hasNumber && b.hasNumber) {
+        if (a.num !== b.num) return a.num - b.num;
+        if (a.lower < b.lower) return -1;
+        if (a.lower > b.lower) return 1;
+        return a.index - b.index;
+      }
+
       if (a.lower < b.lower) return -1;
       if (a.lower > b.lower) return 1;
       return a.index - b.index;
-    }
+    });
 
-    if (a.lower < b.lower) return -1;
-    if (a.lower > b.lower) return 1;
-    return a.index - b.index;
-  });
+    return meta.map((m) => m.img);
+  }
 
-  return meta.map((m) => m.img);
-}
+  if (sortMode === "color") {
+    const meta = images.map((img, index) => {
+      const title = getTitle(img);
+      const match = title.match(/^C(\d{2})\/(\d{3})\s+/);
 
-// ---------- SORTING: by color (по Cxx/yyy в title) ----------
+      if (!match) {
+        return {
+          img,
+          index,
+          title,
+          hasCode: false,
+          group: 1,
+          satCode: null,
+          briCode: null,
+        };
+      }
 
-async function sortImagesByColor(images) {
-  const meta = images.map((img, index) => {
-    const title = getTitle(img);
-    const match = title.match(/^C(\d{2})\/(\d{3})\s+/);
+      const satCode = Number.parseInt(match[1], 10);
+      const briCode = Number.parseInt(match[2], 10);
+      const group = satCode <= SAT_GROUP_THRESHOLD ? 0 : 1;
 
-    if (!match) {
       return {
         img,
         index,
         title,
-        hasCode: false,
-        group: 1,
-        satCode: null,
-        briCode: null,
+        hasCode: true,
+        satCode,
+        briCode,
+        group,
       };
+    });
+
+    const anyCode = meta.some((m) => m.hasCode);
+    if (!anyCode) {
+      console.warn("No color codes found in titles; falling back to geometry sort.");
+      return sortByGeometry(images);
     }
 
-    const satCode = Number.parseInt(match[1], 10);
-    const briCode = Number.parseInt(match[2], 10);
-    const group = satCode <= SAT_GROUP_THRESHOLD ? 0 : 1;
+    console.groupCollapsed("Sorting (color) – titles, sat & bri");
+    meta.forEach((m) => {
+      console.log(
+        m.title || m.img.id,
+        "=>",
+        m.hasCode
+          ? `group=${m.group}, sat=${m.satCode}, bri=${m.briCode}`
+          : "no-code"
+      );
+    });
+    console.groupEnd();
 
-    return {
-      img,
-      index,
-      title,
-      hasCode: true,
-      satCode,
-      briCode,
-      group,
-    };
-  });
+    meta.sort((a, b) => {
+      if (a.hasCode && b.hasCode) {
+        if (a.group !== b.group) return a.group - b.group;
+        if (a.briCode !== b.briCode) return a.briCode - b.briCode;
+        if (a.satCode !== b.satCode) return a.satCode - b.satCode;
+        return a.index - b.index;
+      }
+      if (a.hasCode) return -1;
+      if (b.hasCode) return 1;
+      return a.index - b.index;
+    });
 
-  const anyCode = meta.some((m) => m.hasCode);
-  if (!anyCode) {
-    console.warn(
-      "No color codes found in titles; falling back to geometry sort."
-    );
-    return sortByGeometry(images);
+    return meta.map((m) => m.img);
   }
 
-  console.groupCollapsed("Sorting (color) – titles, sat & bri");
-  meta.forEach((m) => {
-    console.log(
-      m.title || m.img.id,
-      "=>",
-      m.hasCode
-        ? `group=${m.group}, sat=${m.satCode}, bri=${m.briCode}`
-        : "no-code"
-    );
-  });
-  console.groupEnd();
+  if (sortMode === "size") {
+    const order = sizeOrder === "asc" ? 1 : -1;
 
-  meta.sort((a, b) => {
-    if (a.hasCode && b.hasCode) {
-      if (a.group !== b.group) return a.group - b.group;
-      if (a.briCode !== b.briCode) return a.briCode - b.briCode;
-      if (a.satCode !== b.satCode) return a.satCode - b.satCode;
-      return a.index - b.index;
+    // Sort by *effective* area after applying the selected resize mode.
+    // If resize is "Match width/height", the key reflects the size you will see after resizing.
+    let targetWidth = null;
+    let targetHeight = null;
+
+    if (sizeMode === "width") {
+      targetWidth = Math.min(...images.map((img) => img.width));
+    } else if (sizeMode === "height") {
+      targetHeight = Math.min(...images.map((img) => img.height));
     }
-    if (a.hasCode) return -1;
-    if (b.hasCode) return 1;
-    return a.index - b.index;
-  });
 
-  return meta.map((m) => m.img);
+    const withKeys = images.map((img, index) => {
+      const w0 = img.width || 0;
+      const h0 = img.height || 0;
+
+      let w = w0;
+      let h = h0;
+
+      // Miro keeps aspect ratio when setting width/height, so we simulate that here.
+      if (targetWidth && w0 > 0) {
+        const scale = targetWidth / w0;
+        w = targetWidth;
+        h = h0 * scale;
+      } else if (targetHeight && h0 > 0) {
+        const scale = targetHeight / h0;
+        h = targetHeight;
+        w = w0 * scale;
+      }
+
+      const area = w * h;
+
+      return { img, index, area, w0, h0 };
+    });
+
+    withKeys.sort((a, b) => {
+      if (a.area !== b.area) return (a.area - b.area) * order;
+      if (a.w0 !== b.w0) return (a.w0 - b.w0) * order;
+      if (a.h0 !== b.h0) return (a.h0 - b.h0) * order;
+      return a.index - b.index; // stable fallback
+    });
+
+    return withKeys.map((x) => x.img);
+  }
+
+  // Unknown mode: keep as-is.
+  return images;
 }
 
 // ---------- SORTING handler ----------
@@ -415,12 +448,10 @@ async function handleSortingSubmit(event) {
     const sizeOrder = form.sortingSizeOrder ? form.sortingSizeOrder.value : "desc";
 
     const selection = await board.getSelection();
-    let images = selection.filter((i) => i.type === "image");
+    const images = selection.filter((i) => i.type === "image");
 
     if (!images.length) {
-      await board.notifications.showInfo(
-        "Select at least one image on the board."
-      );
+      await board.notifications.showInfo("Select at least one image on the board.");
       return;
     }
 
@@ -429,17 +460,17 @@ async function handleSortingSubmit(event) {
       return;
     }
 
-    let orderedImages;
-
     if (sortMode === "color") {
       await board.notifications.showInfo("Sorting by color…");
-      orderedImages = await sortImagesByColor(images);
     } else if (sortMode === "size") {
       await board.notifications.showInfo("Sorting by size…");
-      orderedImages = sortImagesBySize(images, { sizeMode, sizeOrder });
-    } else {
-      orderedImages = await sortImagesByNumber(images);
     }
+
+    const orderedImages = await orderImagesForSorting(images, {
+      sortMode,
+      sizeMode,
+      sizeOrder,
+    });
 
     await alignImagesInGivenOrder(orderedImages, {
       imagesPerRow,
@@ -450,9 +481,7 @@ async function handleSortingSubmit(event) {
     });
 
     await board.notifications.showInfo(
-      `Done: aligned ${orderedImages.length} image${
-        orderedImages.length === 1 ? "" : "s"
-      }.`
+      `Done: aligned ${orderedImages.length} image${orderedImages.length === 1 ? "" : "s"}.`
     );
   } catch (err) {
     console.error(err);
@@ -462,66 +491,8 @@ async function handleSortingSubmit(event) {
   }
 }
 
-
-// ---------- SORTING: by size (area) ----------
-
-function sortImagesBySize(images, { sizeMode, sizeOrder }) {
-  const order = sizeOrder === "asc" ? 1 : -1;
-
-  // Sort by *effective* area after applying the selected resize mode.
-  // If resize is "Match width/height", the key reflects the size you will see after resizing.
-  let targetWidth = null;
-  let targetHeight = null;
-
-  if (sizeMode === "width") {
-    targetWidth = Math.min(...images.map((img) => img.width));
-  } else if (sizeMode === "height") {
-    targetHeight = Math.min(...images.map((img) => img.height));
-  }
-
-  const withKeys = images.map((img, index) => {
-    const w0 = img.width || 0;
-    const h0 = img.height || 0;
-
-    let w = w0;
-    let h = h0;
-
-    // Miro keeps aspect ratio when setting width/height, so we simulate that here.
-    if (targetWidth && w0 > 0) {
-      const scale = targetWidth / w0;
-      w = targetWidth;
-      h = h0 * scale;
-    } else if (targetHeight && h0 > 0) {
-      const scale = targetHeight / h0;
-      h = targetHeight;
-      w = w0 * scale;
-    }
-
-    const area = w * h;
-
-    return { img, index, area, w0, h0 };
-  });
-
-  withKeys.sort((a, b) => {
-    if (a.area !== b.area) return (a.area - b.area) * order;
-    if (a.w0 !== b.w0) return (a.w0 - b.w0) * order;
-    if (a.h0 !== b.h0) return (a.h0 - b.h0) * order;
-    return a.index - b.index; // stable fallback
-  });
-
-  return withKeys.map((x) => x.img);
-}
-
 // ---------- STITCH/S SLICE helpers ----------
 
-function readFileAsDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
 
 function sortFilesByNameWithNumber(files) {
   const arr = Array.from(files).map((file, index) => {
@@ -668,24 +639,9 @@ function computeVariableSlotCenters(
     rowCursorX[r] += w + horizontalGap;
   }
 
-  let flipX = false;
-  let flipY = false;
-  switch (startCorner) {
-    case "top-right":
-      flipX = true;
-      break;
-    case "bottom-left":
-      flipY = true;
-      break;
-    case "bottom-right":
-      flipX = true;
-      flipY = true;
-      break;
-    default:
-      break;
-  }
+    const { flipX, flipY } = getCornerFlip(startCorner);
 
-  const centers = [];
+const centers = [];
   for (let i = 0; i < totalSlots; i++) {
     let x0 = baseX[i] - gridWidth / 2;
     let y0 = baseY[i] - gridHeight / 2;
