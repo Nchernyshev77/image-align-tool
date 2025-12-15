@@ -1,6 +1,5 @@
 // app.js
-// Image Align Tool_16: Sorting + Stitch/Slice
-// Based on Image Align Tool_14: start concurrency always 4 (removed 128-tile threshold).
+// Image Align Tool: Sorting + Stitch/Slice
 
 const { board } = window.miro;
 
@@ -1182,7 +1181,7 @@ let slotCentersByFile = null;
     let lastEtaUpdateTs = null;
     let lastEtaCreated = 0;
     let ewmaRateTilesPerMs = null;
-    // uploadedBytesDone is declared at the run-level (var) and reused here
+    let uploadedBytesDone = 0;
     let lastEtaBytesDone = 0;
     let ewmaRateBytesPerMs = null;
     const ETA_EWMA_ALPHA = 0.25;
@@ -1300,60 +1299,38 @@ let slotCentersByFile = null;
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    // Real concurrency metric: how many board.createImage calls are actually in-flight
-    let inFlightCreateImage = 0;
-    let maxInFlightCreateImage = 0;
-
-
     const createImageWithRetry = async (params) => {
-  let attempt = 0;
-  let lastErr = null;
+      let attempt = 0;
+      let lastErr = null;
 
-  const tStart = performance.now();
 
-  while (attempt <= CREATE_IMAGE_MAX_RETRIES) {
-    try {
-      // Track real in-flight createImage requests (not just "allowed concurrency")
-      inFlightCreateImage += 1;
-      if (inFlightCreateImage > maxInFlightCreateImage) {
-        maxInFlightCreateImage = inFlightCreateImage;
+      const tStart = performance.now();
+      while (attempt <= CREATE_IMAGE_MAX_RETRIES) {
+        try {
+          const res = await board.createImage(params);
+          const dt = performance.now() - tStart;
+          createImageWallTimesMs.push(dt);
+          createImageWallTimeSumMs += dt;
+          createImageWallTimeCount += 1;
+          return res;
+        } catch (e) {
+          lastErr = e;
+          attempt += 1;
+          uploadRetryEvents += 1;
+
+          if (attempt > CREATE_IMAGE_MAX_RETRIES) break;
+
+          const msg = (e && e.message) ? e.message : String(e);
+          const isStackOverflow = msg.includes("Maximum call stack size exceeded");
+          const baseDelay = isStackOverflow ? Math.max(1500, CREATE_IMAGE_BASE_DELAY_MS) : CREATE_IMAGE_BASE_DELAY_MS;
+          const base = baseDelay * Math.pow(2, attempt - 1);
+          const jitter = Math.random() * 250;
+          await sleep(base + jitter);
+        }
       }
 
-      let res;
-      try {
-        res = await board.createImage(params);
-      } finally {
-        inFlightCreateImage -= 1;
-      }
-
-      const dt = performance.now() - tStart;
-      createImageWallTimesMs.push(dt);
-      createImageWallTimeSumMs += dt;
-      createImageWallTimeCount += 1;
-
-      return res;
-    } catch (e) {
-      lastErr = e;
-      attempt += 1;
-      uploadRetryEvents += 1;
-
-      if (attempt > CREATE_IMAGE_MAX_RETRIES) break;
-
-      const msg = e && e.message ? e.message : String(e);
-      const isStackOverflow = msg.includes("Maximum call stack size exceeded");
-      const baseDelay = isStackOverflow
-        ? Math.max(1500, CREATE_IMAGE_BASE_DELAY_MS)
-        : CREATE_IMAGE_BASE_DELAY_MS;
-
-      const base = baseDelay * Math.pow(2, attempt - 1);
-      const jitter = Math.random() * 250;
-      await sleep(base + jitter);
-    }
-  }
-
-  throw lastErr;
-};
-
+      throw lastErr;
+    };
 
     const runWithConcurrency = async (items, worker, concurrency) => {
       let cursor = 0;
@@ -1379,100 +1356,47 @@ const runWithAdaptiveConcurrency = async (
   minConcurrency,
   maxConcurrency
 ) => {
-  // Adaptive concurrency by tile-jobs (1 job = 1 createImage).
+  // Adaptive concurrency by "file batches".
   //
-  // Key differences vs file-based:
-  // - Real responsiveness (we can react within tens of tiles, not per whole-file).
-  // - Enables a safe one-time "forced probe" at conc=5 on big imports.
+  // Goals:
+  // - Be fast on large imports (1000+ tiles).
+  // - Avoid instability (throttling/timeouts) on weaker networks.
+  // - Auto-tune the upper bound (up to maxConcurrency) based on real throughput.
   //
-  // Notes:
-  // - Concurrency here is "how many jobs run in parallel".
-  // - Real in-flight createImage is tracked separately in createImageWithRetry.
+  // Strategy:
+  // - Run in small batches so we can react quickly.
+  // - Back off on retry spikes or very slow batches.
+  // - Probe higher concurrency and keep it only if throughput improves meaningfully.
 
   let concurrency = Math.max(minConcurrency, Math.min(maxConcurrency, initialConcurrency));
   let lockedMax = maxConcurrency;
 
+  const GAIN_THRESHOLD = 1.12; // need ~12% throughput gain to justify higher concurrency
+  const PROBE_BATCHES = 2;     // batches to evaluate a probe
   const EWMA_ALPHA = 0.25;
-  const GAIN_THRESHOLD = 1.10; // need ~10% throughput gain to justify higher concurrency
-  const PROBE_ONLY_IF_TILES_AT_LEAST = 200;
 
-  // One-time forced probe at 5 for big imports (2 windows + tail guard)
-  const shouldForcedProbe = items.length >= PROBE_ONLY_IF_TILES_AT_LEAST && maxConcurrency >= 5;
-  const probeCfg = shouldForcedProbe
-    ? {
-        phase: "warmup", // warmup -> baseline -> probe -> done
-        done: false,
-
-        baseConc: Math.min(concurrency, 4),
-        warmupTiles: 60,
-
-        windowTiles: 20,
-        windowsTarget: 2,
-
-        // per-phase windows
-        baselineWindows: [], // { mbps, ips, msPerTile, p95WallMs }
-        probeWindows: [],
-
-        // accumulators for the current window
-        accTiles: 0,
-        accBytes: 0,
-        accMs: 0,
-        accWall: [],
-
-        // decision details (for logging/table)
-        lastGain: null,
-        lastTailFactor: null,
-      }
-    : null;
-
-  const resetProbeAcc = () => {
-    if (!probeCfg) return;
-    probeCfg.accTiles = 0;
-    probeCfg.accBytes = 0;
-    probeCfg.accMs = 0;
-    probeCfg.accWall = [];
-  };
-  const quantileMs = (arr, p) => {
-    if (!arr || !arr.length) return null;
-    const xs = arr.slice().sort((a, b) => a - b);
-    const i = Math.min(xs.length - 1, Math.max(0, Math.round((xs.length - 1) * p)));
-    return Math.round(xs[i]);
-  };
-
-let idx = 0;
+  let idx = 0;
   let tpEwmaMbps = null;
+  let probe = null; // { baseConc, baseTpMbps, batchesAtProbe }
+
+  // Avoid oscillation: small cooldown after changes.
   let cooldownBatches = 0;
 
   while (idx < items.length) {
-    // Keep "allowed concurrency" metric (for diagnostics)
     maxConcurrencySeen = Math.max(maxConcurrencySeen, concurrency);
 
-    const concUsed = concurrency;
-
-    const batchSize = Math.min(
-      items.length - idx,
-      Math.max(concUsed * 4, 16)
-    );
+    // Small batches let us react faster. Each "file" may expand into many tiles.
+    const batchSize = Math.min(items.length - idx, Math.max(concurrency * 2, 4));
     const batch = items.slice(idx, idx + batchSize);
 
     const retryBefore = uploadRetryEvents;
     const bytesBefore = uploadedBytesDone;
     const tilesBefore = createdTiles;
-    const wallBefore = createImageWallTimesMs.length;
     const t0 = performance.now();
 
-    await runWithConcurrency(
-      batch,
-      async (item) => {
-        await worker(item);
-      },
-      concUsed
-    );
-
-    const wallAfter = createImageWallTimesMs.length;
-    const wallSlice = createImageWallTimesMs.slice(wallBefore, wallAfter);
-    const p50WallMs = quantileMs(wallSlice, 0.5);
-    const p95WallMs = quantileMs(wallSlice, 0.95);
+    await runWithConcurrency(batch, async (item, localI) => {
+      await worker(item, idx + localI);
+    }, concurrency);
 
     const dtMs = performance.now() - t0;
     const retries = uploadRetryEvents - retryBefore;
@@ -1482,7 +1406,7 @@ let idx = 0;
 
     const dtSec = Math.max(0.001, dtMs / 1000);
     const mbps = (bytesDelta / 1_000_000) / dtSec; // MB/sec
-    const ips = tilesDelta / dtSec; // tiles/sec
+    const ips = tilesDelta / dtSec;                // items/sec (tiles)
 
     tpEwmaMbps =
       tpEwmaMbps == null ? mbps : EWMA_ALPHA * mbps + (1 - EWMA_ALPHA) * tpEwmaMbps;
@@ -1490,428 +1414,235 @@ let idx = 0;
     const msPerTile = dtMs / Math.max(1, tilesDelta);
     const retriesPerTile = retries / Math.max(1, tilesDelta);
 
-    // Stability heuristics
-    const unstable = retriesPerTile > 0.08 || msPerTile > 15000 || (p95WallMs != null && p95WallMs > 17000);
-    const stable = retriesPerTile < 0.03 && msPerTile < 11000 && (p95WallMs == null || p95WallMs < 13000);
+    // Backoff rules: prefer stability over aggressive parallelism.
+    const unstable = (retriesPerTile > 0.08 || msPerTile > 15000);
+    const stable = (retriesPerTile < 0.03 && msPerTile < 11000);
 
     let action = "keep";
-    let concNext = concurrency;
 
     if (cooldownBatches > 0) cooldownBatches -= 1;
 
-    // ---- Forced probe (once) ----
-    const probePhase = probeCfg ? probeCfg.phase : null;
+    if (unstable && concurrency > minConcurrency) {
+      concurrency -= 1;
+      lockedMax = Math.min(lockedMax, concurrency);
+      probe = null;
+      cooldownBatches = 1;
+      action = "down";
+    } else {
+      // Probe logic: attempt to increase only when stable.
+      if (probe && concurrency === probe.baseConc + 1) {
+        probe.batchesAtProbe += 1;
 
-    if (probeCfg && !probeCfg.done) {
-      const finalizeWindow = (kind) => {
-        const sec = Math.max(0.001, probeCfg.accMs / 1000);
-        const wMbps = (probeCfg.accBytes / 1_000_000) / sec;
-        const wIps = probeCfg.accTiles / sec;
-        const wMsPerTile = probeCfg.accMs / Math.max(1, probeCfg.accTiles);
-        const wP95 = quantileMs(probeCfg.accWall, 0.95);
+        if (probe.batchesAtProbe >= PROBE_BATCHES) {
+          const gain = tpEwmaMbps / Math.max(1e-9, probe.baseTpMbps);
 
-        const obj = {
-          mbps: Number.isFinite(wMbps) ? wMbps : null,
-          ips: Number.isFinite(wIps) ? wIps : null,
-          msPerTile: Number.isFinite(wMsPerTile) ? wMsPerTile : null,
-          p95WallMs: wP95,
-        };
-
-        if (kind === "baseline") probeCfg.baselineWindows.push(obj);
-        else if (kind === "probe") probeCfg.probeWindows.push(obj);
-
-        resetProbeAcc();
-      };
-
-      // Warmup: keep at base conc to "stabilize" startup noise
-      if (probeCfg.phase === "warmup") {
-        if (concUsed !== probeCfg.baseConc) {
-          lockedMax = probeCfg.baseConc;
-          concNext = probeCfg.baseConc;
-          action = "probe-warmup";
-          cooldownBatches = 1;
-        }
-        if (createdTiles >= probeCfg.warmupTiles) {
-          probeCfg.phase = "baseline";
-          resetProbeAcc();
-        }
-      }
-
-      // Baseline: collect 2 windows at base conc
-      if (probeCfg.phase === "baseline") {
-        if (concUsed !== probeCfg.baseConc) {
-          lockedMax = probeCfg.baseConc;
-          concNext = probeCfg.baseConc;
-          action = "probe-base";
-          cooldownBatches = 1;
-        } else {
-          probeCfg.accTiles += tilesDelta;
-          probeCfg.accBytes += bytesDelta;
-          probeCfg.accMs += dtMs;
-          if (wallSlice && wallSlice.length) probeCfg.accWall.push(...wallSlice);
-
-          if (probeCfg.accTiles >= probeCfg.windowTiles) {
-            finalizeWindow("baseline");
-          }
-
-          if (probeCfg.baselineWindows.length >= probeCfg.windowsTarget) {
-            probeCfg.phase = "probe";
-            resetProbeAcc();
-
-            lockedMax = 5;
-            concNext = 5;
-            action = "probe-up";
+          if (gain < GAIN_THRESHOLD) {
+            // Not worth it: cap and return to base concurrency.
+            lockedMax = probe.baseConc;
+            concurrency = lockedMax;
+            probe = null;
             cooldownBatches = 1;
+            action = "cap";
+          } else {
+            // Worth it: accept higher concurrency as new base.
+            probe = null;
+            cooldownBatches = 1;
+            action = "accept";
           }
         }
-      }
-
-      // Probe: collect 2 windows at conc=5, then decide using gain + p95 tail guard
-      if (probeCfg.phase === "probe") {
-        lockedMax = 5;
-
-        if (concUsed !== 5) {
-          concNext = 5;
-          action = "probe-up";
-          cooldownBatches = 1;
-        } else {
-          probeCfg.accTiles += tilesDelta;
-          probeCfg.accBytes += bytesDelta;
-          probeCfg.accMs += dtMs;
-          if (wallSlice && wallSlice.length) probeCfg.accWall.push(...wallSlice);
-
-          if (probeCfg.accTiles >= probeCfg.windowTiles) {
-            finalizeWindow("probe");
-          }
-
-          if (probeCfg.probeWindows.length >= probeCfg.windowsTarget) {
-            const median = (xs) => {
-              const ys = xs
-                .filter((v) => Number.isFinite(v))
-                .slice()
-                .sort((a, b) => a - b);
-              if (!ys.length) return null;
-              const mid = Math.floor((ys.length - 1) / 2);
-              return ys.length % 2 ? ys[mid] : (ys[mid] + ys[mid + 1]) / 2;
-            };
-
-            const baseMbpsMed = median(probeCfg.baselineWindows.map((w) => w.mbps));
-            const probeMbpsMed = median(probeCfg.probeWindows.map((w) => w.mbps));
-            const baseP95Med = median(probeCfg.baselineWindows.map((w) => w.p95WallMs));
-            const probeP95Med = median(probeCfg.probeWindows.map((w) => w.p95WallMs));
-            const baseMsMed = median(probeCfg.baselineWindows.map((w) => w.msPerTile));
-            const probeMsMed = median(probeCfg.probeWindows.map((w) => w.msPerTile));
-
-            const gain =
-              baseMbpsMed != null && probeMbpsMed != null
-                ? probeMbpsMed / Math.max(1e-9, baseMbpsMed)
-                : null;
-
-            const tailFactor =
-              baseP95Med != null && probeP95Med != null
-                ? probeP95Med / Math.max(1e-9, baseP95Med)
-                : null;
-
-            probeCfg.lastGain = gain;
-            probeCfg.lastTailFactor = tailFactor;
-
-            const strongGain = gain != null && gain >= 1.07;
-            const weakGain = gain != null && gain >= 1.03;
-
-            const tailOkStrong = tailFactor == null || tailFactor <= 1.15;
-            const tailOkWeak = tailFactor == null || tailFactor <= 1.05;
-            const tailHardBad = tailFactor != null && tailFactor >= 1.25;
-
-            // don't accept if per-tile time got worse (helps guard against noisy mbps)
-            const msNotWorse =
-              baseMsMed == null || probeMsMed == null || probeMsMed <= baseMsMed * 1.02;
-
-            let accept = false;
-            if (strongGain && tailOkStrong && msNotWorse) accept = true;
-            else if (weakGain && tailOkWeak && msNotWorse) accept = true;
-
-            if (!accept || tailHardBad) {
-              lockedMax = probeCfg.baseConc;
-              concNext = lockedMax;
-              action = "force-cap";
-            } else {
-              lockedMax = 5;
-              concNext = 5;
-              action = "force-accept";
-            }
-
-            probeCfg.done = true;
-            probeCfg.phase = "done";
-            cooldownBatches = 2;
-          }
-        }
-      }
-    }
-
-// ---- Normal adaptation (only if probe is done / not configured) ----
-    const probeBlocking = probeCfg && !probeCfg.done;
-    if (!probeBlocking) {
-      if (unstable && concurrency > minConcurrency) {
-        concNext = concurrency - 1;
-        lockedMax = Math.min(lockedMax, concNext);
-        action = action === "keep" ? "down" : action;
-        cooldownBatches = Math.max(cooldownBatches, 1);
-      } else if (stable && cooldownBatches === 0 && concurrency < lockedMax) {
-        // attempt an up-step; keep it only if it doesn't destabilize later
-        concNext = concurrency + 1;
-        action = action === "keep" ? "up" : action;
+      } else if (!probe && stable && cooldownBatches === 0 && concurrency < lockedMax) {
+        // Start a probe: remember throughput at current concurrency, then increase by 1.
+        probe = { baseConc: concurrency, baseTpMbps: tpEwmaMbps ?? mbps, batchesAtProbe: 0 };
+        concurrency += 1;
+        action = "up";
         cooldownBatches = 1;
       }
     }
 
     concurrencyDecisions.push({
       idx,
-      concUsed,
-      concNext,
+      conc: concurrency,
       lockedMax,
       mbps: Number.isFinite(mbps) ? Number(mbps.toFixed(2)) : null,
       ips: Number.isFinite(ips) ? Number(ips.toFixed(2)) : null,
       retriesPerTile: Number.isFinite(retriesPerTile) ? Number(retriesPerTile.toFixed(3)) : null,
       msPerTile: Number.isFinite(msPerTile) ? Math.round(msPerTile) : null,
-      p50WallMs,
-      p95WallMs,
-      probePhase,
-      probeGain: probeCfg && probeCfg.lastGain != null ? Number(probeCfg.lastGain.toFixed(3)) : null,
-      probeTail: probeCfg && probeCfg.lastTailFactor != null ? Number(probeCfg.lastTailFactor.toFixed(3)) : null,
       action,
     });
 
-    concurrency = Math.max(minConcurrency, Math.min(lockedMax, concNext));
     idx += batch.length;
   }
 };
 ;
 
-    // ---- Build tile jobs (1 job = 1 board.createImage call) ----
-const tileJobs = [];
-const remainingJobsByFile = new Map();
+    const processOneInfo = async (info, i) => {
+      const { file, needsSlice, width, height, tilesX, tilesY } = info;
 
-const registerJobForFile = (file) => {
-  remainingJobsByFile.set(file, (remainingJobsByFile.get(file) || 0) + 1);
-};
+      let center;
+      if (slotCentersByFile) {
+        center = slotCentersByFile.get(file) || { x: viewCenterX, y: viewCenterY };
+      } else if (slotCentersArray) {
+        center = slotCentersArray[i] || { x: viewCenterX, y: viewCenterY };
+      } else {
+        center = { x: viewCenterX, y: viewCenterY };
+      }
 
-const originalNameByFile = new Map();
+      const originalName = file.name || "image";
+      const nameMatch = originalName.match(/^(.*?)(\.[^.]*$|$)/);
+      const baseName = nameMatch ? nameMatch[1] : originalName;
+      const originalExt = nameMatch && nameMatch[2] ? nameMatch[2] : "";
 
-const getFileCenter = (info, fileIndex) => {
-  if (slotCentersByFile) {
-    return slotCentersByFile.get(info.file) || { x: viewCenterX, y: viewCenterY };
-  }
-  if (slotCentersArray) {
-    return slotCentersArray[fileIndex] || { x: viewCenterX, y: viewCenterY };
-  }
-  return { x: viewCenterX, y: viewCenterY };
-};
+      // Грузим изображение из локального object URL (без base64 в памяти)
+      const objectUrl = URL.createObjectURL(file);
+      let imgEl;
+      try {
+        imgEl = await loadImage(objectUrl);
+      } finally {
+        URL.revokeObjectURL(objectUrl);
+      }
 
-for (let i = 0; i < orderedInfos.length; i++) {
-  const info = orderedInfos[i];
-  const { file, needsSlice, width, height, tilesX, tilesY } = info;
+      // Локальный canvas на воркер (не общий), чтобы можно было безопасно параллелить по файлам.
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
 
-  const center = getFileCenter(info, i);
-  const originalName = file.name || "image";
-  originalNameByFile.set(file, originalName);
+      const makeFullImageDataUrl = () => {
+        canvas.width = width;
+        canvas.height = height;
+        ctx.clearRect(0, 0, width, height);
+        ctx.drawImage(imgEl, 0, 0, width, height);
+        return canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
+      };
 
-  if (!needsSlice) {
-    registerJobForFile(file);
-    tileJobs.push({
-      kind: "full",
-      file,
-      info,
-      x: center.x,
-      y: center.y,
-      width,
-      height,
-    });
-    continue;
-  }
+      if (!needsSlice) {
+        const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${originalName}`;
 
-  const nameMatch = originalName.match(/^(.*?)(\.[^.]*$|$)/);
-  const baseName = nameMatch ? nameMatch[1] : originalName;
-  const originalExt = nameMatch && nameMatch[2] ? nameMatch[2] : "";
+        const urlToUse = makeFullImageDataUrl();
 
-  const colWidths = [];
-  const rowHeights = [];
+        const t0 = performance.now();
+        const imgWidget = await createImageWithRetry({
+          url: urlToUse,
+          x: center.x,
+          y: center.y,
+          title,
+        });
+        const t1 = performance.now();
 
-  for (let tx = 0; tx < tilesX; tx++) {
-    colWidths.push(Math.min(SLICE_TILE_SIZE, width - tx * SLICE_TILE_SIZE));
-  }
-  for (let ty = 0; ty < tilesY; ty++) {
-    rowHeights.push(Math.min(SLICE_TILE_SIZE, height - ty * SLICE_TILE_SIZE));
-  }
+        try {
+          await imgWidget.setMetadata(META_APP_ID, {
+            fileName: originalName,
+            satCode: info.satCode,
+            briCode: info.briCode,
+          });
+        } catch (e) {
+          console.warn("setMetadata failed (small image):", e);
+        }
 
-  const mosaicW = colWidths.reduce((sum, w) => sum + w, 0);
-  const mosaicH = rowHeights.reduce((sum, h) => sum + h, 0);
+        allCreatedTiles.push(imgWidget);
+        uploadedBytesDone += (urlToUse ? urlToUse.length : 0);
+        createdTiles += 1;
+        updateCreationProgress();
 
-  const mosaicLeft = center.x - mosaicW / 2;
-  const mosaicTop = center.y - mosaicH / 2;
+        return;
+      }
 
-  const colPrefix = [0];
-  for (let tx = 1; tx < tilesX; tx++) colPrefix[tx] = colPrefix[tx - 1] + colWidths[tx - 1];
+      // ---- slice case ----
 
-  const rowPrefix = [0];
-  for (let ty = 1; ty < tilesY; ty++) rowPrefix[ty] = rowPrefix[ty - 1] + rowHeights[ty - 1];
+      const colWidths = [];
+      const rowHeights = [];
 
-  let tileIndex = 0;
+      for (let tx = 0; tx < tilesX; tx++) {
+        const w = Math.min(SLICE_TILE_SIZE, width - tx * SLICE_TILE_SIZE);
+        colWidths.push(w);
+      }
+      for (let ty = 0; ty < tilesY; ty++) {
+        const h = Math.min(SLICE_TILE_SIZE, height - ty * SLICE_TILE_SIZE);
+        rowHeights.push(h);
+      }
 
-  for (let ty = 0; ty < tilesY; ty++) {
-    for (let tx = 0; tx < tilesX; tx++) {
-      tileIndex += 1;
+      const mosaicW = colWidths.reduce((sum, w) => sum + w, 0);
+      const mosaicH = rowHeights.reduce((sum, h) => sum + h, 0);
 
-      const sw = colWidths[tx];
-      const sh = rowHeights[ty];
+      const mosaicLeft = center.x - mosaicW / 2;
+      const mosaicTop = center.y - mosaicH / 2;
 
-      const sx = tx * SLICE_TILE_SIZE;
-      const sy = ty * SLICE_TILE_SIZE;
+      const colPrefix = [0];
+      for (let tx = 1; tx < tilesX; tx++) {
+        colPrefix[tx] = colPrefix[tx - 1] + colWidths[tx - 1];
+      }
+      const rowPrefix = [0];
+      for (let ty = 1; ty < tilesY; ty++) {
+        rowPrefix[ty] = rowPrefix[ty - 1] + rowHeights[ty - 1];
+      }
 
-      const tileLeft = mosaicLeft + colPrefix[tx];
-      const tileTop = mosaicTop + rowPrefix[ty];
+      let tileIndexForName = 0;
 
-      const centerX = tileLeft + sw / 2;
-      const centerY = tileTop + sh / 2;
+      for (let ty = 0; ty < tilesY; ty++) {
+        for (let tx = 0; tx < tilesX; tx++) {
+          const sx = tx * SLICE_TILE_SIZE;
+          const sy = ty * SLICE_TILE_SIZE;
+          const sw = colWidths[tx];
+          const sh = rowHeights[ty];
 
-      const tileSuffix = pad2(tileIndex); // 01, 02...
-      const tileBaseName = `${baseName}_${tileSuffix}`;
-      const tileFullName = originalExt ? `${tileBaseName}${originalExt}` : tileBaseName;
-      const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${tileFullName}`;
+          canvas.width = sw;
+          canvas.height = sh;
+          ctx.clearRect(0, 0, sw, sh);
+          ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, sw, sh);
 
-      registerJobForFile(file);
-      tileJobs.push({
-        kind: "tile",
-        file,
-        info,
-        x: centerX,
-        y: centerY,
-        sx,
-        sy,
-        sw,
-        sh,
-        tileIndex,
-        tilesX,
-        tilesY,
-        title,
-      });
-    }
-  }
-}
+          // Всегда возвращаем dataURL (не пропускаем тайлы) — при необходимости функция сжатия
+          // опустит качество ниже 0.8, чтобы уложиться в лимиты.
+          const tileDataUrl = canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
 
-// ---- Decoded image cache (so 256 tiles don't decode the same source 256 times) ----
-const imageCache = new Map(); // file -> { imgPromise, imgEl }
+          const tileLeft = mosaicLeft + colPrefix[tx];
+          const tileTop = mosaicTop + rowPrefix[ty];
+          const centerX = tileLeft + sw / 2;
+          const centerY = tileTop + sh / 2;
 
-const getDecodedImage = async (file) => {
-  const cached = imageCache.get(file);
-  if (cached) {
-    return cached.imgPromise;
-  }
+          tileIndexForName += 1;
+          const tileSuffix = pad2(tileIndexForName); // 01, 02, 03...
+          const tileBaseName = `${baseName}_${tileSuffix}`;
+          const tileFullName = originalExt ? `${tileBaseName}${originalExt}` : tileBaseName;
 
-  const objectUrl = URL.createObjectURL(file);
-  const imgPromise = (async () => {
-    try {
-      const imgEl = await loadImage(objectUrl);
-      return imgEl;
-    } finally {
-      URL.revokeObjectURL(objectUrl);
-    }
-  })();
+          const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${tileFullName}`;
 
-  imageCache.set(file, { imgPromise });
-  return imgPromise;
-};
+          const t0 = performance.now();
+          const tileWidget = await createImageWithRetry({
+            url: tileDataUrl,
+            x: centerX,
+            y: centerY,
+            title,
+          });
+          const t1 = performance.now();
 
-const releaseDecodedImageIfDone = (file) => {
-  const left = (remainingJobsByFile.get(file) || 0) - 1;
-  if (left <= 0) {
-    remainingJobsByFile.delete(file);
-    const cached = imageCache.get(file);
-    if (cached) {
-      cached.imgPromise
-        .then((imgEl) => {
-          try { imgEl.src = ""; } catch (_) {}
-        })
-        .catch(() => {});
-      imageCache.delete(file);
-    }
-    return;
-  }
-  remainingJobsByFile.set(file, left);
-};
+          try {
+            await tileWidget.setMetadata(META_APP_ID, {
+              fileName: originalName,
+              satCode: info.satCode,
+              briCode: info.briCode,
+              tileIndex: tileIndexForName,
+              tilesX,
+              tilesY,
+            });
+          } catch (e) {
+            console.warn("setMetadata failed (tile):", e);
+          }
 
-const processOneJob = async (job) => {
-  const { file, info } = job;
-  const imgEl = await getDecodedImage(file);
+          allCreatedTiles.push(tileWidget);
+          uploadedBytesDone += (tileDataUrl ? tileDataUrl.length : 0);
+          createdTiles += 1;
+          updateCreationProgress();
+        }
+      }
 
-  // Per-job canvas (safe for concurrency)
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
+      try { imgEl.src = ""; } catch (e) {}
+    };
 
-  let urlToUse;
-  let title;
-
-  if (job.kind === "full") {
-    canvas.width = job.width;
-    canvas.height = job.height;
-    ctx.clearRect(0, 0, job.width, job.height);
-    ctx.drawImage(imgEl, 0, 0, job.width, job.height);
-
-    urlToUse = canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
-    title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${originalNameByFile.get(file) || "image"}`;
-  } else {
-    canvas.width = job.sw;
-    canvas.height = job.sh;
-    ctx.clearRect(0, 0, job.sw, job.sh);
-    ctx.drawImage(imgEl, job.sx, job.sy, job.sw, job.sh, 0, 0, job.sw, job.sh);
-
-    urlToUse = canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
-    title = job.title;
-  }
-
-  const imgWidget = await createImageWithRetry({
-    url: urlToUse,
-    x: job.x,
-    y: job.y,
-    title,
-  });
-
-  try {
-    if (job.kind === "full") {
-      await imgWidget.setMetadata(META_APP_ID, {
-        fileName: originalNameByFile.get(file) || "image",
-        satCode: info.satCode,
-        briCode: info.briCode,
-      });
-    } else {
-      await imgWidget.setMetadata(META_APP_ID, {
-        fileName: originalNameByFile.get(file) || "image",
-        satCode: info.satCode,
-        briCode: info.briCode,
-        tileIndex: job.tileIndex,
-        tilesX: job.tilesX,
-        tilesY: job.tilesY,
-      });
-    }
-  } catch (e) {
-    console.warn("setMetadata failed:", e);
-  }
-
-  allCreatedTiles.push(imgWidget);
-  uploadedBytesDone += urlToUse ? urlToUse.length : 0;
-  createdTiles += 1;
-  updateCreationProgress();
-
-  releaseDecodedImageIfDone(file);
-};
-
-// ---- Upload stage concurrency (tile-based) ----
-// Starts at 4 for large imports, then adapts down/up between 2..5 based on retries/latency.
-// For very large imports we also do a single forced probe at 5 to answer "can 5 help here?".
+    // Upload stage concurrency:
+// - starts at 4 for large imports, then adapts down/up between 2..4 based on retries/latency
 const initialConcurrency = UPLOAD_CONCURRENCY_INITIAL_LARGE; // always start at 4
 const minConcurrency = UPLOAD_CONCURRENCY_MIN;
 const maxConcurrency = UPLOAD_CONCURRENCY_MAX;
 
-await runWithAdaptiveConcurrency(tileJobs, async (job) => processOneJob(job), initialConcurrency, minConcurrency, maxConcurrency);
+await runWithAdaptiveConcurrency(orderedInfos, processOneInfo, initialConcurrency, minConcurrency, maxConcurrency);
 setProgress(totalTiles, totalTiles);
     if (setProgress.flush) setProgress.flush();
     setEtaText(null);
@@ -1986,8 +1717,7 @@ setProgress(totalTiles, totalTiles);
       console.log("createImage wall-time:", wallHuman);
       console.log("createImage wall-time (ms):", { avg: avgCreateMs, p50: p50Ms, p95: p95Ms });
       console.log("Concurrency:", {
-        maxSeen: maxInFlightCreateImage,
-        maxAllowedSeen: maxConcurrencySeen,
+        maxSeen: maxConcurrencySeen,
         configuredMax: UPLOAD_CONCURRENCY_MAX,
       });
       if (concurrencyDecisions.length) {
