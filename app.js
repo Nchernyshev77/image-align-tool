@@ -1,5 +1,6 @@
 // app.js
-// Image Align Tool: Sorting + Stitch/Slice
+// Image Align Tool_16: Sorting + Stitch/Slice
+// Based on Image Align Tool_14: start concurrency always 4 (removed 128-tile threshold).
 
 const { board } = window.miro;
 
@@ -395,30 +396,6 @@ async function sortImagesByColor(images) {
   return meta.map((m) => m.img);
 }
 
-
-
-// ---------- SORTING: by size (area) ----------
-
-async function sortImagesBySize(images, order = "desc") {
-  const meta = images.map((img, index) => {
-    const w = Number(img.width) || 0;
-    const h = Number(img.height) || 0;
-    const area = w * h;
-    return { img, index, w, h, area };
-  });
-
-  meta.sort((a, b) => {
-    if (a.area === b.area) return a.index - b.index;
-    return order === "asc" ? a.area - b.area : b.area - a.area;
-  });
-
-  console.groupCollapsed(`Sorting (size) – area (${order})`);
-  meta.forEach((m) => console.log(`${m.w}×${m.h} = ${m.area}`, getTitle(m.img) || m.img.id));
-  console.groupEnd();
-
-  return meta.map((m) => m.img);
-}
-
 // ---------- SORTING handler ----------
 
 async function handleSortingSubmit(event) {
@@ -435,8 +412,6 @@ async function handleSortingSubmit(event) {
     const startCorner = form.sortingStartCorner.value;
     const sortModeEl = document.getElementById("sortingSortMode");
     const sortMode = sortModeEl ? sortModeEl.value : "number";
-    const sizeOrderEl = document.getElementById("sortingSizeOrder");
-    const sizeOrder = sizeOrderEl ? sizeOrderEl.value : "desc";
 
     const selection = await board.getSelection();
     let images = selection.filter((i) => i.type === "image");
@@ -449,7 +424,7 @@ async function handleSortingSubmit(event) {
     }
 
     if (imagesPerRow < 1) {
-      await board.notifications.showError("“Tile in a row” must be greater than 0.");
+      await board.notifications.showError("“Rows” must be greater than 0.");
       return;
     }
 
@@ -458,9 +433,6 @@ async function handleSortingSubmit(event) {
     if (sortMode === "color") {
       await board.notifications.showInfo("Sorting by color…");
       orderedImages = await sortImagesByColor(images);
-    } else if (sortMode === "size") {
-      await board.notifications.showInfo("Sorting by size…");
-      orderedImages = await sortImagesBySize(images, sizeOrder);
     } else {
       orderedImages = await sortImagesByNumber(images);
     }
@@ -905,7 +877,7 @@ if (!setProgress._throttleWrapped) {
     }
 
     if (imagesPerRow < 1) {
-      await board.notifications.showError("“Tile in a row” must be greater than 0.");
+      await board.notifications.showError("“Rows” must be greater than 0.");
       return;
     }
 
@@ -1935,8 +1907,7 @@ const processOneJob = async (job) => {
 // ---- Upload stage concurrency (tile-based) ----
 // Starts at 4 for large imports, then adapts down/up between 2..5 based on retries/latency.
 // For very large imports we also do a single forced probe at 5 to answer "can 5 help here?".
-const initialConcurrency =
-  totalTiles >= 128 ? UPLOAD_CONCURRENCY_INITIAL_LARGE : UPLOAD_CONCURRENCY_SMALL;
+const initialConcurrency = UPLOAD_CONCURRENCY_INITIAL_LARGE; // always start at 4
 const minConcurrency = UPLOAD_CONCURRENCY_MIN;
 const maxConcurrency = UPLOAD_CONCURRENCY_MAX;
 
@@ -2052,19 +2023,6 @@ window.addEventListener("DOMContentLoaded", () => {
 
   const sortingForm = document.getElementById("sorting-form");
   if (sortingForm) sortingForm.addEventListener("submit", handleSortingSubmit);
-
-  function toggleSizeOrder() {
-    const sortModeEl = document.getElementById("sortingSortMode");
-    const field = document.getElementById("sortingSizeOrderField");
-    if (!sortModeEl || !field) return;
-    field.style.display = sortModeEl.value === "size" ? "" : "none";
-  }
-
-  const sortModeElInit = document.getElementById("sortingSortMode");
-  if (sortModeElInit) {
-    sortModeElInit.addEventListener("change", toggleSizeOrder);
-    toggleSizeOrder();
-  }
 
   const stitchForm = document.getElementById("stitch-form");
   if (stitchForm) stitchForm.addEventListener("submit", handleStitchSubmit);
