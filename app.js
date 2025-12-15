@@ -1,5 +1,5 @@
 // app.js
-// Image Align Tool_17: Sorting + Stitch/Slice
+// Image Align Tool_16: Sorting + Stitch/Slice
 // Based on Image Align Tool_14: start concurrency always 4 (removed 128-tile threshold).
 
 const { board } = window.miro;
@@ -412,6 +412,7 @@ async function handleSortingSubmit(event) {
     const startCorner = form.sortingStartCorner.value;
     const sortModeEl = document.getElementById("sortingSortMode");
     const sortMode = sortModeEl ? sortModeEl.value : "number";
+    const sizeOrder = form.sortingSizeOrder ? form.sortingSizeOrder.value : "desc";
 
     const selection = await board.getSelection();
     let images = selection.filter((i) => i.type === "image");
@@ -433,6 +434,9 @@ async function handleSortingSubmit(event) {
     if (sortMode === "color") {
       await board.notifications.showInfo("Sorting by color…");
       orderedImages = await sortImagesByColor(images);
+    } else if (sortMode === "size") {
+      await board.notifications.showInfo("Sorting by size…");
+      orderedImages = sortImagesBySize(images, { sizeMode, sizeOrder });
     } else {
       orderedImages = await sortImagesByNumber(images);
     }
@@ -456,6 +460,56 @@ async function handleSortingSubmit(event) {
       "Something went wrong while aligning images. Please check the console."
     );
   }
+}
+
+
+// ---------- SORTING: by size (area) ----------
+
+function sortImagesBySize(images, { sizeMode, sizeOrder }) {
+  const order = sizeOrder === "asc" ? 1 : -1;
+
+  // Sort by *effective* area after applying the selected resize mode.
+  // If resize is "Match width/height", the key reflects the size you will see after resizing.
+  let targetWidth = null;
+  let targetHeight = null;
+
+  if (sizeMode === "width") {
+    targetWidth = Math.min(...images.map((img) => img.width));
+  } else if (sizeMode === "height") {
+    targetHeight = Math.min(...images.map((img) => img.height));
+  }
+
+  const withKeys = images.map((img, index) => {
+    const w0 = img.width || 0;
+    const h0 = img.height || 0;
+
+    let w = w0;
+    let h = h0;
+
+    // Miro keeps aspect ratio when setting width/height, so we simulate that here.
+    if (targetWidth && w0 > 0) {
+      const scale = targetWidth / w0;
+      w = targetWidth;
+      h = h0 * scale;
+    } else if (targetHeight && h0 > 0) {
+      const scale = targetHeight / h0;
+      h = targetHeight;
+      w = w0 * scale;
+    }
+
+    const area = w * h;
+
+    return { img, index, area, w0, h0 };
+  });
+
+  withKeys.sort((a, b) => {
+    if (a.area !== b.area) return (a.area - b.area) * order;
+    if (a.w0 !== b.w0) return (a.w0 - b.w0) * order;
+    if (a.h0 !== b.h0) return (a.h0 - b.h0) * order;
+    return a.index - b.index; // stable fallback
+  });
+
+  return withKeys.map((x) => x.img);
 }
 
 // ---------- STITCH/S SLICE helpers ----------
@@ -2023,6 +2077,16 @@ window.addEventListener("DOMContentLoaded", () => {
 
   const sortingForm = document.getElementById("sorting-form");
   if (sortingForm) sortingForm.addEventListener("submit", handleSortingSubmit);
+
+  // Show "Size order" only when Sort by = Size
+  const sortModeSelect = document.getElementById("sortingSortMode");
+  const sizeOrderField = document.getElementById("sortingSizeOrderField");
+  const updateSizeOrderVisibility = () => {
+    if (!sortModeSelect || !sizeOrderField) return;
+    sizeOrderField.style.display = sortModeSelect.value === "size" ? "" : "none";
+  };
+  if (sortModeSelect) sortModeSelect.addEventListener("change", updateSizeOrderVisibility);
+  updateSizeOrderVisibility();
 
   const stitchForm = document.getElementById("stitch-form");
   if (stitchForm) stitchForm.addEventListener("submit", handleStitchSubmit);
