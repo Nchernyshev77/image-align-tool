@@ -1,5 +1,5 @@
 // app.js
-// Image Align Tool_20: Sorting + Stitch/Slice
+// Image Align Tool_21: Sorting + Stitch/Slice
 // Based on Image Align Tool_14: start concurrency always 4 (removed 128-tile threshold).
 // Cleanup A+B: removed unused helpers/constants, unified sorting engine, unified start-corner flip logic. (p50/p95 metrics unchanged).
 
@@ -13,7 +13,7 @@ const SLICE_TILE_SIZE = 4096;
 const SLICE_THRESHOLD_WIDTH = 8192;
 const SLICE_THRESHOLD_HEIGHT = 4096;
 let   MAX_SLICE_DIM = 16384;         // уточняем через WebGL
-const MAX_URL_BYTES = 29000000;      // лимит размера dataURL (~29 МБ, есть запас до 30 МБ)
+const MAX_URL_BYTES = 5500000;      // hard cap for dataURL length (chars) to avoid SDK crashes
 const TARGET_URL_BYTES = 4500000;   // целевой размер dataURL (~4.5 МБ на тайл/изображение)
 const CREATE_IMAGE_MAX_RETRIES = 5;
 const CREATE_IMAGE_BASE_DELAY_MS = 500;
@@ -560,43 +560,54 @@ function sortFilesByNameWithNumber(files) {
 }
 
 function canvasToDataUrlUnderLimit(canvas, maxBytes = TARGET_URL_BYTES) {
-  // Цель: держать качество около 0.8–0.85 (примерно Photoshop 10–11),
-  // но при этом НИКОГДА не пробивать жесткий лимит Miro по размеру dataURL.
-  //
-  // Алгоритм:
-  // 1) Пробуем уложиться в target (maxBytes) качеством 0.85 → 0.82 → 0.80.
-  // 2) Если target не достигается при 0.80 — оставляем 0.80 (размер будет больше target, но качество лучше).
-  // 3) Если даже так превышаем жесткий лимит MAX_URL_BYTES — тогда уже снижаем качество ниже 0.80,
-  //    пока не уложимся в MAX_URL_BYTES (чтобы не было падений/пропусков).
+  // IMPORTANT:
+  // - We approximate size by dataUrl.length (characters), NOT real bytes.
+  // - Miro SDK can crash/behave unpredictably when data URLs are too large.
+  // So we enforce a strict cap (MAX_URL_BYTES) and try to stay near target (TARGET_URL_BYTES).
 
   const hardLimit = MAX_URL_BYTES;
   const target = Math.min(maxBytes, hardLimit);
 
-  const tryQualities = [0.85, 0.82, 0.8];
-  for (const q of tryQualities) {
-    const dataUrl = canvas.toDataURL("image/jpeg", q);
+  // 1) Try descending JPEG quality until we fit the *target*.
+  //    This is intentionally strict: we never "keep 0.8 even if too big" anymore.
+  const minQ = 0.25;
+  for (let q = 0.85; q >= minQ; q -= 0.05) {
+    const dataUrl = canvas.toDataURL("image/jpeg", Math.max(minQ, Math.min(0.95, q)));
     if (dataUrl.length <= target) return dataUrl;
   }
 
-  // Не влезли в target при 0.8 — оставляем 0.8 (это сознательный компромисс ради качества).
-  let quality = 0.8;
-  let dataUrl = canvas.toDataURL("image/jpeg", quality);
-  if (dataUrl.length <= hardLimit) return dataUrl;
+  // 2) If quality alone can't fit (rare for very detailed 4k tiles), progressively downscale.
+  //    We downscale in-place by drawing into a smaller canvas and retry.
+  let curCanvas = canvas;
+  let scale = 1.0;
+  for (let step = 0; step < 6; step++) {
+    scale *= 0.9;
+    const w = Math.max(1, Math.floor(curCanvas.width * 0.9));
+    const h = Math.max(1, Math.floor(curCanvas.height * 0.9));
 
-  // Крайний случай: даже при 0.8 пробиваем hardLimit — уменьшаем качество, чтобы гарантированно не падать.
-  const HARD_MIN_Q = 0.25;
-  while (dataUrl.length > hardLimit && quality > HARD_MIN_Q) {
-    quality -= 0.05;
-    dataUrl = canvas.toDataURL("image/jpeg", quality);
+    const tmp = document.createElement("canvas");
+    tmp.width = w;
+    tmp.height = h;
+    const tctx = tmp.getContext("2d");
+    tctx.clearRect(0, 0, w, h);
+    tctx.drawImage(curCanvas, 0, 0, w, h);
+
+    // Retry qualities on the downscaled canvas
+    for (let q = 0.8; q >= minQ; q -= 0.05) {
+      const dataUrl = tmp.toDataURL("image/jpeg", Math.max(minQ, Math.min(0.95, q)));
+      if (dataUrl.length <= target) return dataUrl;
+    }
+
+    curCanvas = tmp;
   }
 
-  // Последняя страховка
-  if (dataUrl.length > hardLimit) {
-    dataUrl = canvas.toDataURL("image/jpeg", HARD_MIN_Q);
-  }
-
-  return dataUrl;
+  // 3) Absolute last resort: force min quality and accept hardLimit cap.
+  //    If it's still larger than hardLimit, we return minQ anyway; createImage will likely fail,
+  //    but this should be extremely rare after downscaling.
+  const finalUrl = curCanvas.toDataURL("image/jpeg", 0.25);
+  return finalUrl.length <= hardLimit ? finalUrl : finalUrl;
 }
+
 
 
 function computeVariableSlotCenters(
