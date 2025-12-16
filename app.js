@@ -1,7 +1,6 @@
 // app.js
-// Image Align Tool_21: Sorting + Stitch/Slice
-// Based on Image Align Tool_14: start concurrency always 4 (removed 128-tile threshold).
-// Cleanup A+B: removed unused helpers/constants, unified sorting engine, unified start-corner flip logic. (p50/p95 metrics unchanged).
+// Image Align Tool_23: Sorting + Stitch/Slice
+// Changes: start concurrency always 4; step-down on createImage errors (4→3→2→1) with requeue; console stats include batch errors + skipped summary.
 
 const { board } = window.miro;
 
@@ -18,7 +17,7 @@ const TARGET_URL_BYTES = 4500000;   // целевой размер dataURL (~4.5
 const CREATE_IMAGE_MAX_RETRIES = 5;
 const CREATE_IMAGE_BASE_DELAY_MS = 500;
 
-const UPLOAD_CONCURRENCY_MIN = 2;
+const UPLOAD_CONCURRENCY_MIN = 1;
 const UPLOAD_CONCURRENCY_MAX = 5;
 const UPLOAD_CONCURRENCY_INITIAL_LARGE = 4;
 const META_APP_ID = "image-align-tool";
@@ -1430,6 +1429,11 @@ const runWithAdaptiveConcurrency = async (
   let concurrency = Math.max(minConcurrency, Math.min(maxConcurrency, initialConcurrency));
   let lockedMax = maxConcurrency;
 
+  const MAX_JOB_ATTEMPTS = 3; // hard retry per tile-job (separate from createImage internal retries)
+  const skippedJobs = []; // { item, error }
+  let totalBatchErrors = 0;
+  let totalJobFailures = 0;
+
   const EWMA_ALPHA = 0.25;
   const GAIN_THRESHOLD = 1.10; // need ~10% throughput gain to justify higher concurrency
   const PROBE_ONLY_IF_TILES_AT_LEAST = 200;
@@ -1499,10 +1503,32 @@ let idx = 0;
     const wallBefore = createImageWallTimesMs.length;
     const t0 = performance.now();
 
+    const failures = []; // items to retry later (after lowering concurrency)
+    let skippedInBatch = 0;
     await runWithConcurrency(
       batch,
       async (item) => {
-        await worker(item);
+        item.__jobAttempts = (item.__jobAttempts || 0) + 1;
+
+        try {
+          await worker(item);
+        } catch (e) {
+          const attempts = item.__jobAttempts || 1;
+
+          // If a tile-job keeps failing, don't loop forever.
+          if (attempts >= MAX_JOB_ATTEMPTS) {
+            skippedJobs.push({ item, error: e });
+            skippedInBatch += 1;
+            try { releaseDecodedImageIfDone(item.file); } catch (_) {}
+            console.warn(
+              "Stitch/Slice: skipping a tile after repeated failures",
+              { attempts, title: item.title || null, kind: item.kind || null, error: e }
+            );
+            return;
+          }
+
+          failures.push({ item, error: e });
+        }
       },
       concUsed
     );
@@ -1511,6 +1537,15 @@ let idx = 0;
     const wallSlice = createImageWallTimesMs.slice(wallBefore, wallAfter);
     const p50WallMs = quantileMs(wallSlice, 0.5);
     const p95WallMs = quantileMs(wallSlice, 0.95);
+
+    const batchErrors = failures.length + skippedInBatch;
+    totalBatchErrors += batchErrors;
+    totalJobFailures += batchErrors;
+    if (batchErrors > 0) {
+      // Requeue failed jobs to be retried later (after we lower concurrency).
+      // Placement is deterministic anyway (x/y are fixed), so retry order doesn't matter.
+      for (const f of failures) items.push(f.item);
+    }
 
     const dtMs = performance.now() - t0;
     const retries = uploadRetryEvents - retryBefore;
@@ -1536,6 +1571,26 @@ let idx = 0;
     let concNext = concurrency;
 
     if (cooldownBatches > 0) cooldownBatches -= 1;
+
+    // Hard downshift on any createImage failures in this batch.
+    // We reduce stepwise: 4 -> 3 -> 2 -> 1 (minConcurrency is 1 in this build).
+    if (batchErrors > 0) {
+      if (probeCfg && !probeCfg.done) {
+        // Abort probe if the environment is unstable (errors during upload).
+        probeCfg.done = true;
+        probeCfg.phase = "done";
+      }
+
+      if (concurrency > minConcurrency) {
+        concNext = Math.max(minConcurrency, concurrency - 1);
+        lockedMax = Math.min(lockedMax, concNext);
+        action = "err-down";
+        cooldownBatches = Math.max(cooldownBatches, 2);
+      } else {
+        action = "err-hold";
+        cooldownBatches = Math.max(cooldownBatches, 2);
+      }
+    }
 
     // ---- Forced probe (once) ----
     const probePhase = probeCfg ? probeCfg.phase : null;
@@ -1711,6 +1766,7 @@ let idx = 0;
       ips: Number.isFinite(ips) ? Number(ips.toFixed(2)) : null,
       retriesPerTile: Number.isFinite(retriesPerTile) ? Number(retriesPerTile.toFixed(3)) : null,
       msPerTile: Number.isFinite(msPerTile) ? Math.round(msPerTile) : null,
+      errors: batchErrors,
       p50WallMs,
       p95WallMs,
       probePhase,
@@ -1722,6 +1778,16 @@ let idx = 0;
     concurrency = Math.max(minConcurrency, Math.min(lockedMax, concNext));
     idx += batch.length;
   }
+
+  if (skippedJobs.length) {
+    console.warn(`Stitch/Slice: ${skippedJobs.length} tile(s) were skipped after repeated failures.`);
+  }
+
+  return {
+    skippedJobs,
+    skippedCount: skippedJobs.length,
+    totalBatchErrors,
+  };
 };
 ;
 
@@ -1949,7 +2015,7 @@ const initialConcurrency = UPLOAD_CONCURRENCY_INITIAL_LARGE; // always start at 
 const minConcurrency = UPLOAD_CONCURRENCY_MIN;
 const maxConcurrency = UPLOAD_CONCURRENCY_MAX;
 
-await runWithAdaptiveConcurrency(tileJobs, async (job) => processOneJob(job), initialConcurrency, minConcurrency, maxConcurrency);
+const adaptiveResult = await runWithAdaptiveConcurrency(tileJobs, async (job) => processOneJob(job), initialConcurrency, minConcurrency, maxConcurrency);
 setProgress(totalTiles, totalTiles);
     if (setProgress.flush) setProgress.flush();
     setEtaText(null);
@@ -2028,7 +2094,12 @@ setProgress(totalTiles, totalTiles);
         maxAllowedSeen: maxConcurrencySeen,
         configuredMax: UPLOAD_CONCURRENCY_MAX,
       });
-      if (concurrencyDecisions.length) {
+      console.log("Stitch/Slice reliability:", {
+        skippedTiles: (adaptiveResult && adaptiveResult.skippedCount) || 0,
+        batchErrors: (adaptiveResult && adaptiveResult.totalBatchErrors) || 0,
+      });
+
+            if (concurrencyDecisions.length) {
         console.table(concurrencyDecisions.slice(-12));
       }
       console.groupEnd();
@@ -2036,11 +2107,17 @@ setProgress(totalTiles, totalTiles);
       console.warn("[Image Align Tool] stats failed:", e);
     }
 
-    await board.notifications.showInfo(
-      `Imported ${fileInfos.length} source image${
-        fileInfos.length === 1 ? "" : "s"
-      } into ${totalTiles} tile${totalTiles === 1 ? "" : "s"}.`
-    );
+    const skippedCount = (adaptiveResult && adaptiveResult.skippedCount) || 0;
+    const importedMsg = `Imported ${fileInfos.length} source image${
+      fileInfos.length === 1 ? "" : "s"
+    } into ${totalTiles} tile${totalTiles === 1 ? "" : "s"}.`;
+    if (skippedCount > 0) {
+      await board.notifications.showWarning(
+        `${importedMsg} Skipped ${skippedCount} tile${skippedCount === 1 ? "" : "s"} due to repeated errors (see console).`
+      );
+    } else {
+      await board.notifications.showInfo(importedMsg);
+    }
   } catch (err) {
     console.error(err);
     setProgress(0, 0, "Error");
