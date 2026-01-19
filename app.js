@@ -1,6 +1,6 @@
 // app.js
-// Image Align Tool_23: Sorting + Stitch/Slice
-// Changes: start concurrency always 4; step-down on createImage errors (4→3→2→1) with requeue; console stats include batch errors + skipped summary.
+// Image Align Tool_24: Sorting + Stitch/Slice
+// Changes: preserve original file dataURLs when possible (no canvas re-encode); safer JPEG sizing without downscale; enforce image width on createImage; fix skip-missing grid cell size.
 
 const { board } = window.miro;
 
@@ -13,7 +13,7 @@ const SLICE_THRESHOLD_WIDTH = 8192;
 const SLICE_THRESHOLD_HEIGHT = 4096;
 let   MAX_SLICE_DIM = 16384;         // уточняем через WebGL
 const MAX_URL_BYTES = 5500000;      // hard cap for dataURL length (chars) to avoid SDK crashes
-const TARGET_URL_BYTES = 4500000;   // целевой размер dataURL (~4.5 МБ на тайл/изображение)
+const TARGET_URL_BYTES = 5200000;   // target dataURL length (~5.2M chars) to reduce over-compression while staying under MAX_URL_BYTES
 const CREATE_IMAGE_MAX_RETRIES = 5;
 const CREATE_IMAGE_BASE_DELAY_MS = 500;
 
@@ -102,6 +102,16 @@ function loadImage(url) {
     img.onload = () => resolve(img);
     img.onerror = reject;
     img.src = url;
+  });
+}
+
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("Failed to read file"));
+    reader.readAsDataURL(file);
   });
 }
 
@@ -562,49 +572,31 @@ function canvasToDataUrlUnderLimit(canvas, maxBytes = TARGET_URL_BYTES) {
   // IMPORTANT:
   // - We approximate size by dataUrl.length (characters), NOT real bytes.
   // - Miro SDK can crash/behave unpredictably when data URLs are too large.
-  // So we enforce a strict cap (MAX_URL_BYTES) and try to stay near target (TARGET_URL_BYTES).
+  // We enforce a strict cap (MAX_URL_BYTES) and try to stay near target (maxBytes).
+  //
+  // NOTE:
+  // - We do NOT downscale canvases here anymore. Downscaling can cause some tiles to appear smaller.
+  // - If we can't fit by adjusting JPEG quality alone, we fall back to very low quality as a last resort.
 
   const hardLimit = MAX_URL_BYTES;
-  const target = Math.min(maxBytes, hardLimit);
+  const target = Math.min(Math.max(1, maxBytes), hardLimit);
 
-  // 1) Try descending JPEG quality until we fit the *target*.
-  //    This is intentionally strict: we never "keep 0.8 even if too big" anymore.
-  const minQ = 0.25;
-  for (let q = 0.85; q >= minQ; q -= 0.05) {
-    const dataUrl = canvas.toDataURL("image/jpeg", Math.max(minQ, Math.min(0.95, q)));
+  // Try higher qualities first to avoid over-compression.
+  // Step 1: preferred range (0.92 -> 0.55)
+  for (let q = 0.92; q >= 0.55; q -= 0.03) {
+    const dataUrl = canvas.toDataURL("image/jpeg", Math.max(0.25, Math.min(0.95, q)));
     if (dataUrl.length <= target) return dataUrl;
   }
 
-  // 2) If quality alone can't fit (rare for very detailed 4k tiles), progressively downscale.
-  //    We downscale in-place by drawing into a smaller canvas and retry.
-  let curCanvas = canvas;
-  let scale = 1.0;
-  for (let step = 0; step < 6; step++) {
-    scale *= 0.9;
-    const w = Math.max(1, Math.floor(curCanvas.width * 0.9));
-    const h = Math.max(1, Math.floor(curCanvas.height * 0.9));
-
-    const tmp = document.createElement("canvas");
-    tmp.width = w;
-    tmp.height = h;
-    const tctx = tmp.getContext("2d");
-    tctx.clearRect(0, 0, w, h);
-    tctx.drawImage(curCanvas, 0, 0, w, h);
-
-    // Retry qualities on the downscaled canvas
-    for (let q = 0.8; q >= minQ; q -= 0.05) {
-      const dataUrl = tmp.toDataURL("image/jpeg", Math.max(minQ, Math.min(0.95, q)));
-      if (dataUrl.length <= target) return dataUrl;
-    }
-
-    curCanvas = tmp;
+  // Step 2: emergency range (0.55 -> 0.25)
+  for (let q = 0.55; q >= 0.25; q -= 0.05) {
+    const dataUrl = canvas.toDataURL("image/jpeg", Math.max(0.25, Math.min(0.95, q)));
+    if (dataUrl.length <= target) return dataUrl;
   }
 
-  // 3) Absolute last resort: force min quality and accept hardLimit cap.
-  //    If it's still larger than hardLimit, we return minQ anyway; createImage will likely fail,
-  //    but this should be extremely rare after downscaling.
-  const finalUrl = curCanvas.toDataURL("image/jpeg", 0.25);
-  return finalUrl.length <= hardLimit ? finalUrl : finalUrl;
+  // Last resort
+  const finalUrl = canvas.toDataURL("image/jpeg", 0.25);
+  return finalUrl;
 }
 
 
@@ -698,8 +690,8 @@ function computeSkipMissingSlotCenters(
   const maxNum = Math.max(...nums);
 
   const cols = Math.max(1, imagesPerRow);
-  const cellWidth = tileInfos[0].info.width;
-  const cellHeight = tileInfos[0].info.height;
+  const cellWidth = Math.max(...tileInfos.map((t) => t.info.width));
+  const cellHeight = Math.max(...tileInfos.map((t) => t.info.height));
 
   const totalSlots = maxNum - minNum + 1;
   const rows = Math.ceil(totalSlots / cols);
@@ -1955,13 +1947,26 @@ const processOneJob = async (job) => {
   let title;
 
   if (job.kind === "full") {
-    canvas.width = job.width;
-    canvas.height = job.height;
-    ctx.clearRect(0, 0, job.width, job.height);
-    ctx.drawImage(imgEl, 0, 0, job.width, job.height);
-
-    urlToUse = canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
     title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${originalNameByFile.get(file) || "image"}`;
+
+    // Prefer uploading the original file bytes as a data URL when possible.
+    // This avoids an extra canvas JPEG re-encode (less quality loss + fewer color shifts).
+    try {
+      const directUrl = await fileToDataUrl(file);
+      if (directUrl && directUrl.length <= MAX_URL_BYTES) {
+        urlToUse = directUrl;
+      }
+    } catch (e) {
+      // ignore, fall back to canvas re-encode
+    }
+
+    if (!urlToUse) {
+      canvas.width = job.width;
+      canvas.height = job.height;
+      ctx.clearRect(0, 0, job.width, job.height);
+      ctx.drawImage(imgEl, 0, 0, job.width, job.height);
+      urlToUse = canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
+    }
   } else {
     canvas.width = job.sw;
     canvas.height = job.sh;
@@ -1977,6 +1982,9 @@ const processOneJob = async (job) => {
     x: job.x,
     y: job.y,
     title,
+    // Enforce on-board width to the intended job width.
+    // Miro keeps aspect ratio when setting width, so this stabilizes tile sizes.
+    width: job.kind === "tile" ? job.sw : job.width,
   });
 
   try {
