@@ -1,6 +1,6 @@
 // app.js
-// Image Align Tool_24: Sorting + Stitch/Slice
-// Changes: preserve original file dataURLs when possible (no canvas re-encode); safer JPEG sizing without downscale; enforce image width on createImage; fix skip-missing grid cell size.
+// Image Align Tool_25: Sorting + Stitch/Slice
+// Changes: start concurrency always 4; step-down on createImage errors (4→3→2→1) with requeue; console stats include batch errors + skipped summary.
 
 const { board } = window.miro;
 
@@ -12,8 +12,10 @@ const SLICE_TILE_SIZE = 4096;
 const SLICE_THRESHOLD_WIDTH = 8192;
 const SLICE_THRESHOLD_HEIGHT = 4096;
 let   MAX_SLICE_DIM = 16384;         // уточняем через WebGL
-const MAX_URL_BYTES = 5500000;      // hard cap for dataURL length (chars) to avoid SDK crashes
-const TARGET_URL_BYTES = 5200000;   // target dataURL length (~5.2M chars) to reduce over-compression while staying under MAX_URL_BYTES
+const MAX_URL_BYTES = 11000000;    // hard cap for dataURL length (chars) to avoid SDK crashes
+const TARGET_URL_BYTES = 9000000;  // target size for dataURL (chars) – less aggressive compression
+const MIN_JPEG_QUALITY = 0.65;     // don't go below this unless we must
+const CREATE_IMAGE_TIMEOUT_MS = 30000; // per createImage timeout to avoid 'hung' tiles
 const CREATE_IMAGE_MAX_RETRIES = 5;
 const CREATE_IMAGE_BASE_DELAY_MS = 500;
 
@@ -102,16 +104,6 @@ function loadImage(url) {
     img.onload = () => resolve(img);
     img.onerror = reject;
     img.src = url;
-  });
-}
-
-
-function fileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ""));
-    reader.onerror = () => reject(reader.error || new Error("Failed to read file"));
-    reader.readAsDataURL(file);
   });
 }
 
@@ -568,37 +560,51 @@ function sortFilesByNameWithNumber(files) {
   return arr.map((m) => m.file);
 }
 
-function canvasToDataUrlUnderLimit(canvas, maxBytes = TARGET_URL_BYTES) {
-  // IMPORTANT:
-  // - We approximate size by dataUrl.length (characters), NOT real bytes.
-  // - Miro SDK can crash/behave unpredictably when data URLs are too large.
-  // We enforce a strict cap (MAX_URL_BYTES) and try to stay near target (maxBytes).
-  //
-  // NOTE:
-  // - We do NOT downscale canvases here anymore. Downscaling can cause some tiles to appear smaller.
-  // - If we can't fit by adjusting JPEG quality alone, we fall back to very low quality as a last resort.
 
-  const hardLimit = MAX_URL_BYTES;
-  const target = Math.min(Math.max(1, maxBytes), hardLimit);
-
-  // Try higher qualities first to avoid over-compression.
-  // Step 1: preferred range (0.92 -> 0.55)
-  for (let q = 0.92; q >= 0.55; q -= 0.03) {
-    const dataUrl = canvas.toDataURL("image/jpeg", Math.max(0.25, Math.min(0.95, q)));
-    if (dataUrl.length <= target) return dataUrl;
-  }
-
-  // Step 2: emergency range (0.55 -> 0.25)
-  for (let q = 0.55; q >= 0.25; q -= 0.05) {
-    const dataUrl = canvas.toDataURL("image/jpeg", Math.max(0.25, Math.min(0.95, q)));
-    if (dataUrl.length <= target) return dataUrl;
-  }
-
-  // Last resort
-  const finalUrl = canvas.toDataURL("image/jpeg", 0.25);
-  return finalUrl;
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error('FileReader error'));
+    reader.readAsDataURL(file);
+  });
 }
 
+
+
+
+
+function canvasToDataUrlUnderLimit(canvas, maxBytes = TARGET_URL_BYTES) {
+  // We approximate size by dataUrl.length (characters), NOT real bytes.
+  // Goal in this build:
+  // - NEVER change pixel dimensions (no downscale).
+  // - Keep quality reasonably high and stable.
+  // - Use only a few encoding attempts (performance).
+  // - If we still exceed hard cap, fail the tile (so we don't crash the SDK).
+
+  const hardLimit = MAX_URL_BYTES;
+  const target = Math.min(maxBytes, hardLimit);
+
+  const qualities = [0.90, 0.85, 0.80, 0.75, 0.70, MIN_JPEG_QUALITY];
+  let lastUrl = null;
+
+  for (const q of qualities) {
+    const qq = Math.max(MIN_JPEG_QUALITY, Math.min(0.95, q));
+    const dataUrl = canvas.toDataURL("image/jpeg", qq);
+    lastUrl = dataUrl;
+    if (dataUrl.length <= target) return dataUrl;
+  }
+
+  if (lastUrl && lastUrl.length <= hardLimit) return lastUrl;
+
+  const size = lastUrl ? lastUrl.length : 0;
+  const err = new Error(
+    `Tile dataURL too large (${size} chars) exceeds MAX_URL_BYTES=${hardLimit}. ` +
+      `Try smaller tile size, or pre-slice tiles externally.`
+  );
+  err.name = "DataUrlTooLargeError";
+  throw err;
+}
 
 
 function computeVariableSlotCenters(
@@ -690,8 +696,8 @@ function computeSkipMissingSlotCenters(
   const maxNum = Math.max(...nums);
 
   const cols = Math.max(1, imagesPerRow);
-  const cellWidth = Math.max(...tileInfos.map((t) => t.info.width));
-  const cellHeight = Math.max(...tileInfos.map((t) => t.info.height));
+  const cellWidth = tileInfos[0].info.width;
+  const cellHeight = tileInfos[0].info.height;
 
   const totalSlots = maxNum - minNum + 1;
   const rows = Math.ceil(totalSlots / cols);
@@ -1350,7 +1356,10 @@ let slotCentersByFile = null;
 
       let res;
       try {
-        res = await board.createImage(params);
+        res = await Promise.race([
+          board.createImage(params),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('createImage timeout')), CREATE_IMAGE_TIMEOUT_MS)),
+        ]);
       } finally {
         inFlightCreateImage -= 1;
       }
@@ -1937,37 +1946,32 @@ const releaseDecodedImageIfDone = (file) => {
 
 const processOneJob = async (job) => {
   const { file, info } = job;
-  const imgEl = await getDecodedImage(file);
 
   // Per-job canvas (safe for concurrency)
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
 
   let urlToUse;
   let title;
+  let expectedWidth = null;
 
-  if (job.kind === "full") {
-    title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${originalNameByFile.get(file) || "image"}`;
-
-    // Prefer uploading the original file bytes as a data URL when possible.
-    // This avoids an extra canvas JPEG re-encode (less quality loss + fewer color shifts).
-    try {
-      const directUrl = await fileToDataUrl(file);
-      if (directUrl && directUrl.length <= MAX_URL_BYTES) {
-        urlToUse = directUrl;
-      }
-    } catch (e) {
-      // ignore, fall back to canvas re-encode
+  if (job.kind === 'full') {
+    // IMPORTANT: in Stitch mode (pre-sliced tiles), avoid canvas re-encoding to preserve colors/quality.
+    // We upload the file bytes as a dataURL directly.
+    urlToUse = await fileToDataUrl(file);
+    if (typeof urlToUse === 'string' && urlToUse.length > MAX_URL_BYTES) {
+      // Avoid SDK crashes on extremely large data URLs.
+      const err = new Error(`dataURL too large for Miro SDK (len=${urlToUse.length})`);
+      err.name = 'DataUrlTooLargeError';
+      throw err;
     }
 
-    if (!urlToUse) {
-      canvas.width = job.width;
-      canvas.height = job.height;
-      ctx.clearRect(0, 0, job.width, job.height);
-      ctx.drawImage(imgEl, 0, 0, job.width, job.height);
-      urlToUse = canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
-    }
+    title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${originalNameByFile.get(file) || 'image'}`;
+    expectedWidth = job.width;
   } else {
+    // Slice mode (we must draw/crop via canvas)
+    const imgEl = await getDecodedImage(file);
+
     canvas.width = job.sw;
     canvas.height = job.sh;
     ctx.clearRect(0, 0, job.sw, job.sh);
@@ -1975,28 +1979,33 @@ const processOneJob = async (job) => {
 
     urlToUse = canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
     title = job.title;
+
+    // Force consistent on-board width so tiles never appear smaller due to SDK-side scaling.
+    expectedWidth = job.sw;
   }
 
-  const imgWidget = await createImageWithRetry({
+  const params = {
     url: urlToUse,
     x: job.x,
     y: job.y,
     title,
-    // Enforce on-board width to the intended job width.
-    // Miro keeps aspect ratio when setting width, so this stabilizes tile sizes.
-    width: job.kind === "tile" ? job.sw : job.width,
-  });
+  };
+  if (Number.isFinite(expectedWidth) && expectedWidth > 0) {
+    params.width = expectedWidth;
+  }
+
+  const imgWidget = await createImageWithRetry(params);
 
   try {
-    if (job.kind === "full") {
+    if (job.kind === 'full') {
       await imgWidget.setMetadata(META_APP_ID, {
-        fileName: originalNameByFile.get(file) || "image",
+        fileName: originalNameByFile.get(file) || 'image',
         satCode: info.satCode,
         briCode: info.briCode,
       });
     } else {
       await imgWidget.setMetadata(META_APP_ID, {
-        fileName: originalNameByFile.get(file) || "image",
+        fileName: originalNameByFile.get(file) || 'image',
         satCode: info.satCode,
         briCode: info.briCode,
         tileIndex: job.tileIndex,
@@ -2005,7 +2014,7 @@ const processOneJob = async (job) => {
       });
     }
   } catch (e) {
-    console.warn("setMetadata failed:", e);
+    console.warn('setMetadata failed:', e);
   }
 
   allCreatedTiles.push(imgWidget);
@@ -2013,7 +2022,10 @@ const processOneJob = async (job) => {
   createdTiles += 1;
   updateCreationProgress();
 
-  releaseDecodedImageIfDone(file);
+  // IMPORTANT: release only on success (on failures we retry/requeue and keep decode cached)
+  try {
+    releaseDecodedImageIfDone(file);
+  } catch (_) {}
 };
 
 // ---- Upload stage concurrency (tile-based) ----
