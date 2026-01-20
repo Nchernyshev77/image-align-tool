@@ -1,6 +1,11 @@
 // app.js
-// Image Align Tool_23: Sorting + Stitch/Slice
-// Changes: start concurrency always 4; step-down on createImage errors (4→3→2→1) with requeue; console stats include batch errors + skipped summary.
+// Image Align Tool_26: Sorting + Stitch/Slice
+// Base: Image Align Tool_23
+// Changes in _26:
+// - Remove ANY downscales.
+// - Encode JPEG exactly once at quality=0.8.
+// - If an encoded tile exceeds MAX_URL_BYTES, recursively sub-slice that tile (2x2) until it fits.
+// - Prefer sRGB canvas colorSpace where supported.
 
 const { board } = window.miro;
 
@@ -103,6 +108,26 @@ function loadImage(url) {
     img.onerror = reject;
     img.src = url;
   });
+}
+
+// --- Canvas helpers (prefer sRGB) ---
+function get2dContextSrgb(canvas) {
+  // Some browsers support Canvas 2D colorSpace.
+  // We prefer sRGB to reduce unexpected conversions.
+  try {
+    const ctx = canvas.getContext("2d", { colorSpace: "srgb", alpha: false });
+    if (ctx) return ctx;
+  } catch (_) {}
+  return canvas.getContext("2d");
+}
+
+class DataUrlTooLargeError extends Error {
+  constructor(message, length, limit) {
+    super(message);
+    this.name = "DataUrlTooLargeError";
+    this.length = length;
+    this.limit = limit;
+  }
 }
 
 /**
@@ -558,53 +583,21 @@ function sortFilesByNameWithNumber(files) {
   return arr.map((m) => m.file);
 }
 
-function canvasToDataUrlUnderLimit(canvas, maxBytes = TARGET_URL_BYTES) {
-  // IMPORTANT:
-  // - We approximate size by dataUrl.length (characters), NOT real bytes.
-  // - Miro SDK can crash/behave unpredictably when data URLs are too large.
-  // So we enforce a strict cap (MAX_URL_BYTES) and try to stay near target (TARGET_URL_BYTES).
-
-  const hardLimit = MAX_URL_BYTES;
-  const target = Math.min(maxBytes, hardLimit);
-
-  // 1) Try descending JPEG quality until we fit the *target*.
-  //    This is intentionally strict: we never "keep 0.8 even if too big" anymore.
-  const minQ = 0.25;
-  for (let q = 0.85; q >= minQ; q -= 0.05) {
-    const dataUrl = canvas.toDataURL("image/jpeg", Math.max(minQ, Math.min(0.95, q)));
-    if (dataUrl.length <= target) return dataUrl;
+function canvasToDataUrlUnderLimit(canvas) {
+  // Tool_26 policy:
+  // - EXACTLY one JPEG encoding pass at fixed quality.
+  // - If it doesn't fit, we do NOT downscale and we do NOT reduce quality further.
+  //   The caller must sub-slice the region into smaller tiles.
+  const q = 0.8;
+  const dataUrl = canvas.toDataURL("image/jpeg", q);
+  if (dataUrl.length > MAX_URL_BYTES) {
+    throw new DataUrlTooLargeError(
+      `dataURL too large at q=${q} (len=${dataUrl.length}, cap=${MAX_URL_BYTES})`,
+      dataUrl.length,
+      MAX_URL_BYTES
+    );
   }
-
-  // 2) If quality alone can't fit (rare for very detailed 4k tiles), progressively downscale.
-  //    We downscale in-place by drawing into a smaller canvas and retry.
-  let curCanvas = canvas;
-  let scale = 1.0;
-  for (let step = 0; step < 6; step++) {
-    scale *= 0.9;
-    const w = Math.max(1, Math.floor(curCanvas.width * 0.9));
-    const h = Math.max(1, Math.floor(curCanvas.height * 0.9));
-
-    const tmp = document.createElement("canvas");
-    tmp.width = w;
-    tmp.height = h;
-    const tctx = tmp.getContext("2d");
-    tctx.clearRect(0, 0, w, h);
-    tctx.drawImage(curCanvas, 0, 0, w, h);
-
-    // Retry qualities on the downscaled canvas
-    for (let q = 0.8; q >= minQ; q -= 0.05) {
-      const dataUrl = tmp.toDataURL("image/jpeg", Math.max(minQ, Math.min(0.95, q)));
-      if (dataUrl.length <= target) return dataUrl;
-    }
-
-    curCanvas = tmp;
-  }
-
-  // 3) Absolute last resort: force min quality and accept hardLimit cap.
-  //    If it's still larger than hardLimit, we return minQ anyway; createImage will likely fail,
-  //    but this should be extremely rare after downscaling.
-  const finalUrl = curCanvas.toDataURL("image/jpeg", 0.25);
-  return finalUrl.length <= hardLimit ? finalUrl : finalUrl;
+  return dataUrl;
 }
 
 
@@ -1130,7 +1123,7 @@ try {
     updatePrepEta(prepDone, prepTotalSteps);
     await new Promise((r) => setTimeout(r, 0));
 
-    const totalTiles = orderedInfos.reduce(
+    let totalTiles = orderedInfos.reduce(
       (sum, info) => sum + (info.needsSlice ? info.numTiles : 1),
       0
     );
@@ -1947,63 +1940,209 @@ const processOneJob = async (job) => {
   const { file, info } = job;
   const imgEl = await getDecodedImage(file);
 
-  // Per-job canvas (safe for concurrency)
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
+  const fileName = originalNameByFile.get(file) || "image";
 
-  let urlToUse;
-  let title;
+  const uploadOne = async ({ url, x, y, title, meta }) => {
+    const imgWidget = await createImageWithRetry({ url, x, y, title });
+    try {
+      await imgWidget.setMetadata(META_APP_ID, meta);
+    } catch (e) {
+      console.warn("setMetadata failed:", e);
+    }
+    allCreatedTiles.push(imgWidget);
+    uploadedBytesDone += url ? url.length : 0;
+    createdTiles += 1;
+    updateCreationProgress();
+    return imgWidget;
+  };
 
+  const renderRegionToCanvas = ({ sx, sy, sw, sh, outW, outH }) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = outW;
+    canvas.height = outH;
+    const ctx = get2dContextSrgb(canvas);
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, outW, outH);
+    ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, outW, outH);
+    return canvas;
+  };
+
+  const uploadRegionWithSubslice = async (region) => {
+    // region: {sx,sy,sw,sh, left, top, w, h, titleBase, metaBase, depth}
+    const depth = region.depth || 0;
+    const canvas = renderRegionToCanvas({
+      sx: region.sx,
+      sy: region.sy,
+      sw: region.sw,
+      sh: region.sh,
+      outW: region.w,
+      outH: region.h,
+    });
+
+    try {
+      const url = canvasToDataUrlUnderLimit(canvas);
+      const title = region.titleBase;
+      const centerX = region.left + region.w / 2;
+      const centerY = region.top + region.h / 2;
+      await uploadOne({
+        url,
+        x: centerX,
+        y: centerY,
+        title,
+        meta: region.metaBase,
+      });
+      return;
+    } catch (e) {
+      const isTooLarge = e && e.name === "DataUrlTooLargeError";
+      if (!isTooLarge) throw e;
+
+      // Sub-slice this region (2x2) until each part fits.
+      // NOTE: This increases the number of images on the board but keeps quality=0.8.
+      const minSub = 512;
+      if (region.w <= minSub || region.h <= minSub) {
+        // Can't reasonably sub-slice further.
+        throw e;
+      }
+
+      const w2 = Math.ceil(region.w / 2);
+      const h2 = Math.ceil(region.h / 2);
+      const wR = region.w - w2;
+      const hB = region.h - h2;
+
+      const sw2 = Math.ceil(region.sw / 2);
+      const sh2 = Math.ceil(region.sh / 2);
+      const swR = region.sw - sw2;
+      const shB = region.sh - sh2;
+
+      // One region becomes 4 → add +3 to totalTiles so progress stays sane.
+      totalTiles += 3;
+      updateCreationProgress();
+
+      const nextDepth = depth + 1;
+      const base = region.titleBase;
+
+      const mkMeta = (subRow, subCol) => ({
+        ...region.metaBase,
+        subSlice: true,
+        subDepth: nextDepth,
+        subRow,
+        subCol,
+        subW: region.w,
+        subH: region.h,
+      });
+
+      const parts = [
+        // top-left
+        {
+          sx: region.sx,
+          sy: region.sy,
+          sw: sw2,
+          sh: sh2,
+          left: region.left,
+          top: region.top,
+          w: w2,
+          h: h2,
+          titleBase: `${base} s${nextDepth}a`,
+          metaBase: mkMeta(0, 0),
+          depth: nextDepth,
+        },
+        // top-right
+        {
+          sx: region.sx + sw2,
+          sy: region.sy,
+          sw: swR,
+          sh: sh2,
+          left: region.left + w2,
+          top: region.top,
+          w: wR,
+          h: h2,
+          titleBase: `${base} s${nextDepth}b`,
+          metaBase: mkMeta(0, 1),
+          depth: nextDepth,
+        },
+        // bottom-left
+        {
+          sx: region.sx,
+          sy: region.sy + sh2,
+          sw: sw2,
+          sh: shB,
+          left: region.left,
+          top: region.top + h2,
+          w: w2,
+          h: hB,
+          titleBase: `${base} s${nextDepth}c`,
+          metaBase: mkMeta(1, 0),
+          depth: nextDepth,
+        },
+        // bottom-right
+        {
+          sx: region.sx + sw2,
+          sy: region.sy + sh2,
+          sw: swR,
+          sh: shB,
+          left: region.left + w2,
+          top: region.top + h2,
+          w: wR,
+          h: hB,
+          titleBase: `${base} s${nextDepth}d`,
+          metaBase: mkMeta(1, 1),
+          depth: nextDepth,
+        },
+      ];
+
+      // Upload parts sequentially to avoid multiplying peak memory for very detailed tiles.
+      for (const p of parts) {
+        await uploadRegionWithSubslice(p);
+      }
+    }
+  };
+
+  // Build initial region for this job.
   if (job.kind === "full") {
-    canvas.width = job.width;
-    canvas.height = job.height;
-    ctx.clearRect(0, 0, job.width, job.height);
-    ctx.drawImage(imgEl, 0, 0, job.width, job.height);
-
-    urlToUse = canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
-    title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${originalNameByFile.get(file) || "image"}`;
-  } else {
-    canvas.width = job.sw;
-    canvas.height = job.sh;
-    ctx.clearRect(0, 0, job.sw, job.sh);
-    ctx.drawImage(imgEl, job.sx, job.sy, job.sw, job.sh, 0, 0, job.sw, job.sh);
-
-    urlToUse = canvasToDataUrlUnderLimit(canvas, TARGET_URL_BYTES);
-    title = job.title;
-  }
-
-  const imgWidget = await createImageWithRetry({
-    url: urlToUse,
-    x: job.x,
-    y: job.y,
-    title,
-  });
-
-  try {
-    if (job.kind === "full") {
-      await imgWidget.setMetadata(META_APP_ID, {
-        fileName: originalNameByFile.get(file) || "image",
+    const titleBase = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${fileName}`;
+    const left = job.x - job.width / 2;
+    const top = job.y - job.height / 2;
+    await uploadRegionWithSubslice({
+      sx: 0,
+      sy: 0,
+      sw: job.width,
+      sh: job.height,
+      left,
+      top,
+      w: job.width,
+      h: job.height,
+      titleBase,
+      metaBase: {
+        fileName,
         satCode: info.satCode,
         briCode: info.briCode,
-      });
-    } else {
-      await imgWidget.setMetadata(META_APP_ID, {
-        fileName: originalNameByFile.get(file) || "image",
+      },
+      depth: 0,
+    });
+  } else {
+    const left = job.x - job.sw / 2;
+    const top = job.y - job.sh / 2;
+    await uploadRegionWithSubslice({
+      sx: job.sx,
+      sy: job.sy,
+      sw: job.sw,
+      sh: job.sh,
+      left,
+      top,
+      w: job.sw,
+      h: job.sh,
+      titleBase: job.title,
+      metaBase: {
+        fileName,
         satCode: info.satCode,
         briCode: info.briCode,
         tileIndex: job.tileIndex,
         tilesX: job.tilesX,
         tilesY: job.tilesY,
-      });
-    }
-  } catch (e) {
-    console.warn("setMetadata failed:", e);
+      },
+      depth: 0,
+    });
   }
-
-  allCreatedTiles.push(imgWidget);
-  uploadedBytesDone += urlToUse ? urlToUse.length : 0;
-  createdTiles += 1;
-  updateCreationProgress();
 
   releaseDecodedImageIfDone(file);
 };
