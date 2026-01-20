@@ -2,10 +2,12 @@
 // Image Align Tool_28: Sorting + Stitch/Slice
 // Base: Image Align Tool_23
 // Changes in _28:
-// - Remove ANY downscales.
-// - Encode JPEG at q=0.8; if it exceeds MAX_URL_BYTES, re-encode from original canvas pixels with lower quality (0.75/0.70/0.65).
-// - Only if it still exceeds MAX_URL_BYTES at min quality, recursively sub-slice that region (2x2) until it fits.
-// - Prefer sRGB canvas colorSpace where supported (canvas context colorSpace="srgb").
+// - Start from Tool_27.
+// - Remove ANY downscales (still).
+// - Compress-first: try JPEG quality ladder (0.8 -> 0.75 -> 0.70 -> 0.65) on the SAME canvas pixels.
+// - Only if still above MAX_URL_BYTES at q=0.65 do we sub-slice that region (2x2) and repeat.
+// - Log Canvas2D colorSpace/profile support (srgb request + actual ctx.colorSpace).
+// - Prefer sRGB canvas colorSpace where supported.
 
 const { board } = window.miro;
 
@@ -111,14 +113,62 @@ function loadImage(url) {
 }
 
 // --- Canvas helpers (prefer sRGB) ---
+// Note: In browsers we cannot embed ICC profiles into JPEG produced by canvas.
+// What we *can* do is request an sRGB canvas colorSpace (where supported) and log support.
+let CANVAS_COLORSPACE_INFO = { requested: 'srgb', supported: null, actual: null };
+
+function detectCanvasColorSpaceInfo() {
+  if (CANVAS_COLORSPACE_INFO.supported !== null) return CANVAS_COLORSPACE_INFO;
+  try {
+    const c = document.createElement('canvas');
+    // Request sRGB explicitly
+    const ctx = c.getContext('2d', { colorSpace: 'srgb', alpha: false });
+    if (ctx) {
+      CANVAS_COLORSPACE_INFO.supported = true;
+      CANVAS_COLORSPACE_INFO.actual = ctx.colorSpace || 'unknown';
+      return CANVAS_COLORSPACE_INFO;
+    }
+  } catch (_) {}
+
+  try {
+    const c = document.createElement('canvas');
+    const ctx2 = c.getContext('2d');
+    CANVAS_COLORSPACE_INFO.supported = false;
+    CANVAS_COLORSPACE_INFO.actual = (ctx2 && ctx2.colorSpace) ? ctx2.colorSpace : 'unknown';
+    return CANVAS_COLORSPACE_INFO;
+  } catch (_) {
+    CANVAS_COLORSPACE_INFO.supported = false;
+    CANVAS_COLORSPACE_INFO.actual = 'unknown';
+    return CANVAS_COLORSPACE_INFO;
+  }
+}
+
+function logCanvasColorSpaceInfoOnce(prefix = 'Canvas') {
+  const info = detectCanvasColorSpaceInfo();
+  // Keep log short but explicit
+  console.log(`${prefix}: 2D colorSpace request=srgb supported=${info.supported} actual=${info.actual}`);
+}
+
 function get2dContextSrgb(canvas) {
   // Some browsers support Canvas 2D colorSpace.
   // We prefer sRGB to reduce unexpected conversions.
   try {
-    const ctx = canvas.getContext("2d", { colorSpace: "srgb", alpha: false });
-    if (ctx) return ctx;
+    const ctx = canvas.getContext('2d', { colorSpace: 'srgb', alpha: false });
+    if (ctx) {
+      // cache support info lazily
+      if (CANVAS_COLORSPACE_INFO.supported === null) {
+        CANVAS_COLORSPACE_INFO.supported = true;
+        CANVAS_COLORSPACE_INFO.actual = ctx.colorSpace || 'unknown';
+      }
+      return ctx;
+    }
   } catch (_) {}
-  return canvas.getContext("2d");
+  const fallback = canvas.getContext('2d');
+  if (CANVAS_COLORSPACE_INFO.supported === null) {
+    CANVAS_COLORSPACE_INFO.supported = false;
+    CANVAS_COLORSPACE_INFO.actual = (fallback && fallback.colorSpace) ? fallback.colorSpace : 'unknown';
+  }
+  return fallback;
 }
 
 class DataUrlTooLargeError extends Error {
@@ -584,33 +634,22 @@ function sortFilesByNameWithNumber(files) {
 }
 
 function canvasToDataUrlUnderLimit(canvas) {
-  // Tool_28 policy (based on Tool_23):
-  // - NO downscales (never change pixel dimensions).
-  // - Prefer a single JPEG encode at q=0.8.
-  // - If the result exceeds MAX_URL_BYTES, re-encode FROM THE SAME CANVAS pixels
-  //   with lower quality (still NOT "JPEG over JPEG").
-  // - Only if even MIN_JPEG_QUALITY cannot fit, throw DataUrlTooLargeError so the
-  //   caller can sub-slice the region.
-
-  const qualities = [0.8, 0.75, 0.7, 0.65];
-
-  let lastUrl = null;
+  // Tool_28 policy (compress-first, no downscale):
+  // - Always start with a single JPEG encode at q=0.8.
+  // - If it exceeds MAX_URL_BYTES, re-encode the SAME canvas pixels at lower quality.
+  //   (This is NOT JPEG-on-JPEG; the source pixels are the same.)
+  // - Only if it still exceeds MAX_URL_BYTES at q=0.65 do we throw, and the caller may sub-slice.
+  const qualities = [0.8, 0.75, 0.70, 0.65];
   let lastLen = 0;
+  let lastQ = qualities[0];
   for (const q of qualities) {
-    const url = canvas.toDataURL('image/jpeg', q);
-    const len = url.length;
-    lastUrl = url;
-    lastLen = len;
-
-    // If it fits the hard cap, we accept it immediately.
-    // (We don't chase TARGET_URL_BYTES with extra passes to avoid unnecessary re-encodes.)
-    if (len <= MAX_URL_BYTES) {
-      return url;
-    }
+    lastQ = q;
+    const dataUrl = canvas.toDataURL('image/jpeg', q);
+    lastLen = dataUrl.length;
+    if (lastLen <= MAX_URL_BYTES) return dataUrl;
   }
-
   throw new DataUrlTooLargeError(
-    `dataURL too large even at min q=${qualities[qualities.length-1]} (len=${lastLen}, cap=${MAX_URL_BYTES})`,
+    `dataURL too large even at q=${lastQ} (len=${lastLen}, cap=${MAX_URL_BYTES})`,
     lastLen,
     MAX_URL_BYTES
   );
@@ -762,6 +801,8 @@ async function handleStitchSubmit(event) {
 
   // ---- run-level timers & stats (declared early to avoid TDZ across reruns) ----
   var prepStartTs = performance.now();
+  // Log canvas colorSpace/profile support once per run
+  logCanvasColorSpaceInfoOnce('Stitch/Slice');
   var prepEndTs = null;
   var uploadStartTs = null;
   var uploadEndTs = null;
@@ -2289,6 +2330,7 @@ setProgress(totalTiles, totalTiles);
 
 window.addEventListener("DOMContentLoaded", () => {
   detectMaxSliceDim();
+  logCanvasColorSpaceInfoOnce('Canvas');
 
   const sortingForm = document.getElementById("sorting-form");
   if (sortingForm) sortingForm.addEventListener("submit", handleSortingSubmit);
