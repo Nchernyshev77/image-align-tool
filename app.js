@@ -1,11 +1,11 @@
 // app.js
-// Image Align Tool_29: Sorting + Stitch/Slice
+// Image Align Tool_26: Sorting + Stitch/Slice
 // Base: Image Align Tool_23
-// Changes in _28:
+// Changes in _26:
 // - Remove ANY downscales.
-// - Encode JPEG at q=0.8; if it exceeds MAX_URL_BYTES, re-encode from original canvas pixels with lower quality (0.75/0.70/0.65).
-// - Only if it still exceeds MAX_URL_BYTES at min quality, recursively sub-slice that region (2x2) until it fits.
-// - Prefer sRGB canvas colorSpace where supported (canvas context colorSpace="srgb").
+// - Encode JPEG exactly once at quality=0.8.
+// - If an encoded tile exceeds MAX_URL_BYTES, recursively sub-slice that tile (2x2) until it fits.
+// - Prefer sRGB canvas colorSpace where supported.
 
 const { board } = window.miro;
 
@@ -17,8 +17,11 @@ const SLICE_TILE_SIZE = 4096;
 const SLICE_THRESHOLD_WIDTH = 8192;
 const SLICE_THRESHOLD_HEIGHT = 4096;
 let   MAX_SLICE_DIM = 16384;         // уточняем через WebGL
-const MAX_URL_BYTES = 11000000;     // hard cap for dataURL length (chars) to avoid SDK/transport issues
-const TARGET_URL_BYTES = 9000000;   // soft target for dataURL length (chars) to reduce board lag
+// dataURL length (chars) hard cap to avoid SDK crashes.
+// Note: data URLs are base64, so the string is ~33% larger than the underlying bytes.
+// A higher cap reduces unnecessary sub-slicing for detailed 4K tiles.
+const MAX_URL_BYTES = 11000000;
+const TARGET_URL_BYTES = 4500000;   // целевой размер dataURL (~4.5 МБ на тайл/изображение)
 const CREATE_IMAGE_MAX_RETRIES = 5;
 const CREATE_IMAGE_BASE_DELAY_MS = 500;
 
@@ -121,41 +124,24 @@ function get2dContextSrgb(canvas) {
   return canvas.getContext("2d");
 }
 
-
-function logCanvasColorSpace(tag) {
+function logCanvasColorSpace(prefix) {
   try {
-    const c = document.createElement('canvas');
+    const c = document.createElement("canvas");
     let supported = false;
-    let actual = 'unknown';
-
-    let ctx = null;
+    let actual = "unknown";
     try {
-      ctx = c.getContext('2d', { colorSpace: 'srgb', alpha: false });
+      const ctx = c.getContext("2d", { colorSpace: "srgb", alpha: false });
       supported = !!ctx;
+      if (ctx && typeof ctx.getContextAttributes === "function") {
+        const attrs = ctx.getContextAttributes();
+        if (attrs && typeof attrs.colorSpace === "string") actual = attrs.colorSpace;
+      }
     } catch (_) {
       supported = false;
-      ctx = null;
     }
-
-    if (!ctx) {
-      try { ctx = c.getContext('2d'); } catch (_) { ctx = null; }
-    }
-
-    if (ctx) {
-      // Some browsers expose context attributes; others don't.
-      try {
-        const attrs = typeof ctx.getContextAttributes === 'function' ? ctx.getContextAttributes() : null;
-        if (attrs && typeof attrs.colorSpace === 'string') actual = attrs.colorSpace;
-      } catch (_) {}
-      // Non-standard hints
-      try {
-        if (actual === 'unknown' && typeof ctx.colorSpace === 'string') actual = ctx.colorSpace;
-      } catch (_) {}
-    }
-
-    console.log(`${tag}: 2D colorSpace request=srgb supported=${supported} actual=${actual}`);
-  } catch (e) {
-    console.log(`${tag}: 2D colorSpace request=srgb supported=false actual=error`);
+    console.log(`${prefix}: 2D colorSpace request=srgb supported=${supported} actual=${actual}`);
+  } catch (_) {
+    // ignore
   }
 }
 
@@ -512,7 +498,6 @@ async function orderImagesForSorting(images, { sortMode, sizeMode, sizeOrder }) 
 
 async function handleSortingSubmit(event) {
   event.preventDefault();
-  logCanvasColorSpace("Stitch/Slice");
 
   try {
     const form = document.getElementById("sorting-form");
@@ -623,48 +608,22 @@ function sortFilesByNameWithNumber(files) {
 }
 
 function canvasToDataUrlUnderLimit(canvas) {
-  // Tool_29 policy (based on Tool_27 + fixes):
-  // - NO downscales (never change pixel dimensions).
-  // - Prefer ONE encode at q=0.8.
-  // - If above TARGET_URL_BYTES (soft target), try lower qualities from the SAME canvas pixels.
-  // - If still above TARGET but <= MAX, accept the smallest we produced.
-  // - Only if above MAX_URL_BYTES even at MIN quality do we throw (caller may sub-slice).
-
-  const qualities = [0.8, 0.75, 0.7, 0.65];
-
-  let bestUrl = null;
-  let bestLen = Infinity;
-
-  for (const q of qualities) {
-    const url = canvas.toDataURL('image/jpeg', q);
-    const len = url.length;
-
-    if (len <= MAX_URL_BYTES && len < bestLen) {
-      bestUrl = url;
-      bestLen = len;
-    }
-
-    // Fits hard cap and meets soft target — accept immediately.
-    if (len <= TARGET_URL_BYTES) {
-      return url;
-    }
-
-    // If above hard cap, we MUST try lower quality.
-    // If between TARGET and MAX, we prefer trying a lower quality (if available) to reduce board lag.
+  // Tool_26 policy:
+  // - EXACTLY one JPEG encoding pass at fixed quality.
+  // - If it doesn't fit, we do NOT downscale and we do NOT reduce quality further.
+  //   The caller must sub-slice the region into smaller tiles.
+  const q = 0.8;
+  const dataUrl = canvas.toDataURL("image/jpeg", q);
+  if (dataUrl.length > MAX_URL_BYTES) {
+    throw new DataUrlTooLargeError(
+      `dataURL too large at q=${q} (len=${dataUrl.length}, cap=${MAX_URL_BYTES})`,
+      dataUrl.length,
+      MAX_URL_BYTES
+    );
   }
-
-  if (bestUrl) {
-    return bestUrl;
-  }
-
-  // None of the qualities fit the hard cap.
-  // This will be handled by region sub-slicing.
-  throw new DataUrlTooLargeError(
-    `dataURL too large even at min q=${qualities[qualities.length - 1]} (cap=${MAX_URL_BYTES})`,
-    -1,
-    MAX_URL_BYTES
-  );
+  return dataUrl;
 }
+
 
 
 function computeVariableSlotCenters(
@@ -751,19 +710,34 @@ function computeSkipMissingSlotCenters(
 ) {
   if (!tileInfos.length) return [];
 
-  const nums = tileInfos.map((n) => n.num);
-  const minNum = Math.min(...nums);
-  const maxNum = Math.max(...nums);
-
+  // IMPORTANT:
+  // When the smallest tile number is not aligned to the start of a row (num % cols !== 0),
+  // a naive normalization by minNum causes "wrap" across rows:
+  // tiles that should be on the left of later rows can end up on the far right.
+  // Fix: anchor by (minRow, minCol) in the source grid and normalize by row/col.
   const cols = Math.max(1, imagesPerRow);
   const cellWidth = tileInfos[0].info.width;
   const cellHeight = tileInfos[0].info.height;
 
-  const totalSlots = maxNum - minNum + 1;
-  const rows = Math.ceil(totalSlots / cols);
+  let minRow = Infinity;
+  let maxRow = -Infinity;
+  let minCol = Infinity;
+  let maxCol = -Infinity;
 
-  const gridWidth = cols * cellWidth;
-  const gridHeight = rows * cellHeight;
+  for (const { num } of tileInfos) {
+    const row = Math.floor(num / cols);
+    const col = num % cols;
+    if (row < minRow) minRow = row;
+    if (row > maxRow) maxRow = row;
+    if (col < minCol) minCol = col;
+    if (col > maxCol) maxCol = col;
+  }
+
+  const normCols = Math.max(1, maxCol - minCol + 1);
+  const normRows = Math.max(1, maxRow - minRow + 1);
+
+  const gridWidth = normCols * cellWidth;
+  const gridHeight = normRows * cellHeight;
 
   let flipX = false;
   let flipY = false;
@@ -785,12 +759,13 @@ function computeSkipMissingSlotCenters(
   const centersByFileId = new Map();
 
   for (const { info, num } of tileInfos) {
-    const pos = num - minNum;
-    let row = Math.floor(pos / cols);
-    let col = pos % cols;
+    // Normalize to the bounding rectangle of provided tiles.
+    // This preserves correct adjacency even when the batch starts mid-row.
+    let row = Math.floor(num / cols) - minRow;
+    let col = (num % cols) - minCol;
 
-    if (flipX) col = cols - 1 - col;
-    if (flipY) row = rows - 1 - row;
+    if (flipX) col = normCols - 1 - col;
+    if (flipY) row = normRows - 1 - row;
 
     const left = viewCenterX - gridWidth / 2 + col * cellWidth;
     const top = viewCenterY - gridHeight / 2 + row * cellHeight;
@@ -808,6 +783,7 @@ function computeSkipMissingSlotCenters(
 
 async function handleStitchSubmit(event) {
   event.preventDefault();
+
   logCanvasColorSpace("Stitch/Slice");
 
 
@@ -2405,23 +2381,4 @@ window.addEventListener("DOMContentLoaded", () => {
     fileInput.addEventListener("change", updateLabel);
     updateLabel();
   }
-});function getCanvasColorSpaceInfo() {
-  try {
-    const c = document.createElement('canvas');
-    // Try request srgb
-    const ctx = c.getContext && c.getContext('2d', { colorSpace: 'srgb', alpha: false });
-    const supported = !!ctx;
-    let actual = 'unknown';
-    try {
-      if (ctx && typeof ctx.getContextAttributes === 'function') {
-        const attrs = ctx.getContextAttributes();
-        if (attrs && attrs.colorSpace) actual = String(attrs.colorSpace);
-      }
-    } catch (_) {}
-    return { supported, actual };
-  } catch (_) {
-    return { supported: false, actual: 'unknown' };
-  }
-}
-
-
+});
