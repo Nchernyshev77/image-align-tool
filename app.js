@@ -1,11 +1,11 @@
 // app.js
-// Image Align Tool_26: Sorting + Stitch/Slice
+// Image Align Tool_28: Sorting + Stitch/Slice
 // Base: Image Align Tool_23
-// Changes in _26:
+// Changes in _28:
 // - Remove ANY downscales.
-// - Encode JPEG exactly once at quality=0.8.
-// - If an encoded tile exceeds MAX_URL_BYTES, recursively sub-slice that tile (2x2) until it fits.
-// - Prefer sRGB canvas colorSpace where supported.
+// - Encode JPEG at q=0.8; if it exceeds MAX_URL_BYTES, re-encode from original canvas pixels with lower quality (0.75/0.70/0.65).
+// - Only if it still exceeds MAX_URL_BYTES at min quality, recursively sub-slice that region (2x2) until it fits.
+// - Prefer sRGB canvas colorSpace where supported (canvas context colorSpace="srgb").
 
 const { board } = window.miro;
 
@@ -584,22 +584,37 @@ function sortFilesByNameWithNumber(files) {
 }
 
 function canvasToDataUrlUnderLimit(canvas) {
-  // Tool_26 policy:
-  // - EXACTLY one JPEG encoding pass at fixed quality.
-  // - If it doesn't fit, we do NOT downscale and we do NOT reduce quality further.
-  //   The caller must sub-slice the region into smaller tiles.
-  const q = 0.8;
-  const dataUrl = canvas.toDataURL("image/jpeg", q);
-  if (dataUrl.length > MAX_URL_BYTES) {
-    throw new DataUrlTooLargeError(
-      `dataURL too large at q=${q} (len=${dataUrl.length}, cap=${MAX_URL_BYTES})`,
-      dataUrl.length,
-      MAX_URL_BYTES
-    );
-  }
-  return dataUrl;
-}
+  // Tool_28 policy (based on Tool_23):
+  // - NO downscales (never change pixel dimensions).
+  // - Prefer a single JPEG encode at q=0.8.
+  // - If the result exceeds MAX_URL_BYTES, re-encode FROM THE SAME CANVAS pixels
+  //   with lower quality (still NOT "JPEG over JPEG").
+  // - Only if even MIN_JPEG_QUALITY cannot fit, throw DataUrlTooLargeError so the
+  //   caller can sub-slice the region.
 
+  const qualities = [0.8, 0.75, 0.7, 0.65];
+
+  let lastUrl = null;
+  let lastLen = 0;
+  for (const q of qualities) {
+    const url = canvas.toDataURL('image/jpeg', q);
+    const len = url.length;
+    lastUrl = url;
+    lastLen = len;
+
+    // If it fits the hard cap, we accept it immediately.
+    // (We don't chase TARGET_URL_BYTES with extra passes to avoid unnecessary re-encodes.)
+    if (len <= MAX_URL_BYTES) {
+      return url;
+    }
+  }
+
+  throw new DataUrlTooLargeError(
+    `dataURL too large even at min q=${qualities[qualities.length-1]} (len=${lastLen}, cap=${MAX_URL_BYTES})`,
+    lastLen,
+    MAX_URL_BYTES
+  );
+}
 
 
 function computeVariableSlotCenters(
