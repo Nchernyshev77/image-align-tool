@@ -1,7 +1,7 @@
 // app.js
-// Image Align Tool_31: Sorting + Stitch/Slice
-// Base: current main app.js from GitHub
-// Changes in _31:
+// Image Align Tool_32: Sorting + Stitch/Slice
+// Base: user-provided original app.js
+// Changes in _32:
 // - Keep Miro notification messages at 80 chars max.
 // - Remove the hard stop by image side length.
 // - Probe large images at runtime before allowing Stitch/Slice.
