@@ -1,11 +1,12 @@
+Image Align Tool_31 — full app.js
 // app.js
-// Image Align Tool_26: Sorting + Stitch/Slice
-// Base: Image Align Tool_23
-// Changes in _26:
-// - Remove ANY downscales.
-// - Encode JPEG exactly once at quality=0.8.
-// - If an encoded tile exceeds MAX_URL_BYTES, recursively sub-slice that tile (2x2) until it fits.
-// - Prefer sRGB canvas colorSpace where supported.
+// Image Align Tool_31: Sorting + Stitch/Slice
+// Base: current main app.js from GitHub
+// Changes in _31:
+// - Keep Miro notification messages at 80 chars max.
+// - Remove the hard stop by image side length.
+// - Probe large images at runtime before allowing Stitch/Slice.
+// - Log detailed large-image diagnostics to the console.
 
 const { board } = window.miro;
 
@@ -29,6 +30,9 @@ const UPLOAD_CONCURRENCY_MIN = 1;
 const UPLOAD_CONCURRENCY_MAX = 5;
 const UPLOAD_CONCURRENCY_INITIAL_LARGE = 4;
 const META_APP_ID = "image-align-tool";
+const MAX_NOTIFICATION_MESSAGE_LEN = 80;
+const LARGE_IMAGE_PROBE_SOURCE_SIZE = 1024;
+const LARGE_IMAGE_PROBE_OUTPUT_SIZE = 256;
 
 // ---------- авто-детект лимита по стороне через WebGL ----------
 
@@ -52,6 +56,40 @@ function detectMaxSliceDim() {
     console.warn("Slice: failed to detect MAX_TEXTURE_SIZE, using fallback.", e);
   }
 }
+
+function normalizeNotificationMessage(message) {
+  const raw = String(message ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return "Done";
+  if (raw.length <= MAX_NOTIFICATION_MESSAGE_LEN) return raw;
+  return `${raw.slice(0, MAX_NOTIFICATION_MESSAGE_LEN - 1).trimEnd()}…`;
+}
+
+async function showSafeNotification(methodName, message, details) {
+  const safeMessage = normalizeNotificationMessage(message);
+  if (details !== undefined) {
+    console.log(`[Image Align Tool] ${methodName}:`, details);
+    if (safeMessage !== String(message ?? "").replace(/\s+/g, " ").trim()) {
+      console.log(`[Image Align Tool] ${methodName} original message:`, message);
+    }
+  }
+
+  const fn = board && board.notifications && board.notifications[methodName];
+  if (typeof fn !== "function") return;
+  await fn.call(board.notifications, safeMessage);
+}
+
+function notifyInfo(message, details) {
+  return showSafeNotification("showInfo", message, details);
+}
+
+function notifyWarning(message, details) {
+  return showSafeNotification("showWarning", message, details);
+}
+
+function notifyError(message, details) {
+  return showSafeNotification("showError", message, details);
+}
+
 
 // ---------- helpers: titles & numbers ----------
 
@@ -516,19 +554,19 @@ async function handleSortingSubmit(event) {
     const images = selection.filter((i) => i.type === "image");
 
     if (!images.length) {
-      await board.notifications.showInfo("Select at least one image on the board.");
+      await notifyInfo("Select at least one image");
       return;
     }
 
     if (imagesPerRow < 1) {
-      await board.notifications.showError("“Rows” must be greater than 0.");
+      await notifyError("Rows must be greater than 0");
       return;
     }
 
     if (sortMode === "color") {
-      await board.notifications.showInfo("Sorting by color…");
+      await notifyInfo("Sorting by color…");
     } else if (sortMode === "size") {
-      await board.notifications.showInfo("Sorting by size…");
+      await notifyInfo("Sorting by size…");
     }
 
     const orderedImages = await orderImagesForSorting(images, {
@@ -545,14 +583,10 @@ async function handleSortingSubmit(event) {
       startCorner,
     });
 
-    await board.notifications.showInfo(
-      `Done: aligned ${orderedImages.length} image${orderedImages.length === 1 ? "" : "s"}.`
-    );
+    await notifyInfo(`Aligned ${orderedImages.length} image${orderedImages.length === 1 ? "" : "s"}`);
   } catch (err) {
     console.error(err);
-    await board.notifications.showError(
-      "Something went wrong while aligning images. Please check the console."
-    );
+    await notifyError("Sorting failed", err);
   }
 }
 
@@ -624,6 +658,125 @@ function canvasToDataUrlUnderLimit(canvas) {
   return dataUrl;
 }
 
+function buildLargeImageProbeSamples(width, height) {
+  const span = Math.max(1, Math.min(LARGE_IMAGE_PROBE_SOURCE_SIZE, width, height));
+  const positions = [
+    { label: "top-left", x: 0, y: 0 },
+    {
+      label: "center",
+      x: Math.max(0, Math.floor((width - span) / 2)),
+      y: Math.max(0, Math.floor((height - span) / 2)),
+    },
+    {
+      label: "bottom-right",
+      x: Math.max(0, width - span),
+      y: Math.max(0, height - span),
+    },
+  ];
+
+  const unique = [];
+  const seen = new Set();
+  for (const pos of positions) {
+    const key = `${pos.x}:${pos.y}:${span}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push({
+      label: pos.label,
+      sx: pos.x,
+      sy: pos.y,
+      sw: span,
+      sh: span,
+    });
+  }
+  return unique;
+}
+
+function probeLargeImageRuntime(imgEl, { fileName, width, height, maxTextureSize }) {
+  const diag = {
+    fileName,
+    width,
+    height,
+    maxTextureSize,
+    decodeOk: true,
+    probeRenderOk: false,
+    probeEncodeOk: false,
+    stopReason: null,
+    samples: [],
+  };
+
+  console.groupCollapsed(`[Image Align Tool] Large image probe: ${fileName}`);
+  console.log("Image:", { width, height, maxTextureSize });
+
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = LARGE_IMAGE_PROBE_OUTPUT_SIZE;
+    canvas.height = LARGE_IMAGE_PROBE_OUTPUT_SIZE;
+
+    const ctx = get2dContextSrgb(canvas);
+    if (!ctx) {
+      diag.stopReason = "2d-context-unavailable";
+      return { ok: false, diag };
+    }
+
+    ctx.imageSmoothingEnabled = false;
+    const samples = buildLargeImageProbeSamples(width, height);
+
+    for (const sample of samples) {
+      try {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(
+          imgEl,
+          sample.sx,
+          sample.sy,
+          sample.sw,
+          sample.sh,
+          0,
+          0,
+          canvas.width,
+          canvas.height
+        );
+        ctx.getImageData(0, 0, 1, 1);
+        diag.samples.push({ ...sample, ok: true });
+      } catch (e) {
+        diag.samples.push({ ...sample, ok: false, error: e && e.message ? e.message : String(e) });
+        diag.stopReason = "probe-render-failed";
+        console.warn("Large image probe render failed:", { sample, error: e });
+        return { ok: false, diag };
+      }
+    }
+
+    diag.probeRenderOk = true;
+
+    try {
+      const encoded = canvas.toDataURL("image/jpeg", 0.7);
+      diag.probeEncodeOk = typeof encoded === "string" && encoded.startsWith("data:image/jpeg");
+      if (!diag.probeEncodeOk) {
+        diag.stopReason = "probe-encode-empty";
+        return { ok: false, diag };
+      }
+    } catch (e) {
+      diag.stopReason = "probe-encode-failed";
+      console.warn("Large image probe encode failed:", e);
+      return { ok: false, diag };
+    }
+
+    diag.stopReason = null;
+    return { ok: true, diag };
+  } catch (e) {
+    diag.stopReason = "probe-exception";
+    console.warn("Large image probe crashed:", e);
+    return { ok: false, diag, error: e };
+  } finally {
+    console.log("Probe result:", {
+      decodeOk: diag.decodeOk,
+      probeRenderOk: diag.probeRenderOk,
+      probeEncodeOk: diag.probeEncodeOk,
+      stopReason: diag.stopReason,
+    });
+    if (diag.samples.length) console.table(diag.samples);
+    console.groupEnd();
+  }
+}
 
 
 function computeVariableSlotCenters(
@@ -942,14 +1095,12 @@ if (!setProgress._throttleWrapped) {
     const files = input ? input.files : null;
 
     if (!files || !files.length) {
-      await board.notifications.showError(
-        "Please select one or more image files."
-      );
+      await notifyError("Select image files");
       return;
     }
 
     if (imagesPerRow < 1) {
-      await board.notifications.showError("“Rows” must be greater than 0.");
+      await notifyError("Rows must be greater than 0");
       return;
     }
 
@@ -1030,21 +1181,24 @@ setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
       updatePrepEta(i + 1, prepTotalSteps);
       // Даем браузеру шанс отрисовать прогресс на больших партиях
       await new Promise((r) => setTimeout(r, 0));
-// Используем object URL вместо dataURL, чтобы не держать гигантские base64-строки в памяти.
-const objectUrl = URL.createObjectURL(file);
 
-let imgEl;
-try {
-  // Для objectUrl crossOrigin не нужен, но в loadImage он выставлен — это ок.
-  imgEl = await loadImage(objectUrl);
+      // Используем object URL вместо dataURL, чтобы не держать гигантские base64-строки в памяти.
+      const objectUrl = URL.createObjectURL(file);
+
+      let imgEl;
+      try {
+        // Для objectUrl crossOrigin не нужен, но в loadImage он выставлен — это ок.
+        imgEl = await loadImage(objectUrl);
         URL.revokeObjectURL(objectUrl);
-} catch (e) {
+      } catch (e) {
         URL.revokeObjectURL(objectUrl);
 
         console.error("Stitch/Slice: browser failed to decode image", file.name, e);
-        await board.notifications.showError(
-          `Cannot import "${file.name}": browser failed to decode the image.`
-        );
+        await notifyError("Cannot decode image", {
+          fileName: file.name,
+          decodeOk: false,
+          error: e && e.message ? e.message : String(e),
+        });
         continue;
       }
 
@@ -1053,22 +1207,40 @@ try {
 
       if (!width || !height) {
         console.error("Stitch/Slice: invalid dimensions", width, height, file.name);
-        await board.notifications.showError(
-          `Cannot import "${file.name}": image has invalid dimensions.`
-        );
+        await notifyError("Invalid image dimensions", {
+          fileName: file.name,
+          width,
+          height,
+        });
+        try { imgEl.src = ""; } catch (_) {}
         continue;
       }
 
-      if (width > MAX_SLICE_DIM || height > MAX_SLICE_DIM) {
-        console.warn(
-          `Stitch/Slice: image too large (${width}x${height}), limit is ${MAX_SLICE_DIM}px per side.`
-        );
-        await board.notifications.showError(
-          `Image "${file.name}" is too large (${width}×${height}). ` +
-            `Stitch/Slice supports up to ${MAX_SLICE_DIM}px per side on this device. ` +
-            `Please downscale or pre-slice it externally.`
-        );
-        continue;
+      const exceedsTextureHint = width > MAX_SLICE_DIM || height > MAX_SLICE_DIM;
+      if (exceedsTextureHint) {
+        console.warn("Stitch/Slice: image exceeds MAX_TEXTURE_SIZE hint, running probe.", {
+          fileName: file.name,
+          width,
+          height,
+          maxTextureSize: MAX_SLICE_DIM,
+          decodeOk: true,
+        });
+
+        const probe = probeLargeImageRuntime(imgEl, {
+          fileName: file.name,
+          width,
+          height,
+          maxTextureSize: MAX_SLICE_DIM,
+        });
+
+        if (!probe.ok) {
+          console.warn("Stitch/Slice: large image probe failed; import stopped.", probe.diag);
+          await notifyWarning("Image is too large for this browser", probe.diag);
+          try { imgEl.src = ""; } catch (_) {}
+          continue;
+        }
+
+        console.log("Stitch/Slice: large image probe passed; continuing with slicing.", probe.diag);
       }
 
       let brightness = 0.5;
@@ -1171,9 +1343,7 @@ try {
     );
 
     if (anySliced && skipMissingTiles) {
-      await board.notifications.showInfo(
-        '“Skip missing tiles” is ignored for large images (Stitch/Slice).'
-      );
+      await notifyInfo("Skip missing tiles is ignored");
     }
 
     // 4) layout planning (не доводим прогресс до 100% ДО завершения расчётов)
@@ -2289,23 +2459,25 @@ setProgress(totalTiles, totalTiles);
     }
 
     const skippedCount = (adaptiveResult && adaptiveResult.skippedCount) || 0;
-    const importedMsg = `Imported ${fileInfos.length} source image${
-      fileInfos.length === 1 ? "" : "s"
-    } into ${totalTiles} tile${totalTiles === 1 ? "" : "s"}.`;
+    const importSummary = {
+      sourceImages: fileInfos.length,
+      totalTiles,
+      createdTiles,
+      skippedCount,
+    };
     if (skippedCount > 0) {
-      await board.notifications.showWarning(
-        `${importedMsg} Skipped ${skippedCount} tile${skippedCount === 1 ? "" : "s"} due to repeated errors (see console).`
-      );
+      await notifyWarning("Import completed with skipped tiles", importSummary);
     } else {
-      await board.notifications.showInfo(importedMsg);
+      await notifyInfo(
+        `Imported ${fileInfos.length} image${fileInfos.length === 1 ? "" : "s"}`,
+        importSummary
+      );
     }
   } catch (err) {
     console.error(err);
     setProgress(0, 0, "Error");
     setEtaText(null);
-    await board.notifications.showError(
-      "Something went wrong while importing images. Please check the console."
-    );
+    await notifyError("Image import failed", err);
   } finally {
     const stitchButton = document.getElementById("stitchButton");
     if (stitchButton) stitchButton.disabled = false;
