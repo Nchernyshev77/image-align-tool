@@ -1,4 +1,3 @@
-Image Align Tool_31 — full app.js
 // app.js
 // Image Align Tool_31: Sorting + Stitch/Slice
 // Base: current main app.js from GitHub
