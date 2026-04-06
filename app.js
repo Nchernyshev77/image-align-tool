@@ -1,10 +1,10 @@
 // app.js
-// Image Align Tool_33: Sorting + Stitch/Slice
-// Base: Image Align Tool_32
-// Changes in _33:
-// - Make the large-image probe render real tile-sized regions.
-// - Compare a real tile render against a direct preview render.
-// - Stop import when a large tile render becomes empty/black.
+// Image Align Tool_34: Sorting + Stitch/Slice
+// Base: Image Align Tool_33
+// Changes in _34:
+// - Make the large-image probe validate the real full-tile JPEG path.
+// - Re-decode the encoded probe tile and compare it with the source preview.
+// - Stop import when encode/decode of a real tile becomes black/empty/corrupted.
 
 const { board } = window.miro;
 
@@ -785,7 +785,7 @@ function makeProbePreviewFromCanvas(sourceCanvas) {
   return canvas;
 }
 
-function probeLargeImageRuntime(imgEl, { fileName, width, height, maxTextureSize }) {
+async function probeLargeImageRuntime(imgEl, { fileName, width, height, maxTextureSize }) {
   const diag = {
     fileName,
     width,
@@ -796,6 +796,38 @@ function probeLargeImageRuntime(imgEl, { fileName, width, height, maxTextureSize
     probeEncodeOk: false,
     stopReason: null,
     samples: [],
+  };
+
+  const summarizeForDiag = (summary) => ({
+    avgLuma: Number(summary.avgLuma.toFixed(2)),
+    avgRgb: Number(summary.avgRgb.toFixed(2)),
+    nonZeroPixels: summary.nonZeroPixels,
+    alphaSum: summary.alphaSum,
+  });
+
+  const isBlackOrEmptyMismatch = (referenceSummary, candidateSummary, diff) => {
+    const referenceHasVisibleSignal =
+      referenceSummary.alphaSum > 0 && referenceSummary.avgLuma >= LARGE_IMAGE_PROBE_SIGNAL_LUMA_MIN;
+    const candidateLooksBlack =
+      candidateSummary.alphaSum > 0 &&
+      candidateSummary.avgLuma <= LARGE_IMAGE_PROBE_BLACK_LUMA_MAX &&
+      candidateSummary.nonZeroPixels > 0;
+    const candidateLooksEmpty =
+      candidateSummary.alphaSum === 0 || candidateSummary.nonZeroPixels === 0;
+    const mismatch = diff >= LARGE_IMAGE_PROBE_DIFF_MIN;
+
+    if ((referenceHasVisibleSignal && candidateLooksBlack && mismatch) ||
+        (referenceSummary.alphaSum > 0 && candidateLooksEmpty)) {
+      return {
+        failed: true,
+        kind: candidateLooksEmpty ? "empty" : "black",
+      };
+    }
+
+    return {
+      failed: false,
+      kind: null,
+    };
   };
 
   console.groupCollapsed(`[Image Align Tool] Large image probe: ${fileName}`);
@@ -818,6 +850,7 @@ function probeLargeImageRuntime(imgEl, { fileName, width, height, maxTextureSize
       try {
         const referencePreview = makeProbePreviewFromSource(imgEl, sample);
         const referenceSummary = summarizeProbePreviewCanvas(referencePreview);
+        sampleDiag.reference = summarizeForDiag(referenceSummary);
 
         const tileCanvas = document.createElement("canvas");
         tileCanvas.width = sample.outW;
@@ -847,44 +880,28 @@ function probeLargeImageRuntime(imgEl, { fileName, width, height, maxTextureSize
 
         const tilePreview = makeProbePreviewFromCanvas(tileCanvas);
         const tileSummary = summarizeProbePreviewCanvas(tilePreview);
-        const comparison = compareProbePreviewCanvases(referencePreview, tilePreview);
+        const renderComparison = compareProbePreviewCanvases(referencePreview, tilePreview);
+        sampleDiag.tile = summarizeForDiag(tileSummary);
+        sampleDiag.renderMeanAbsDiff = Number(renderComparison.meanAbsDiff.toFixed(2));
 
-        sampleDiag.reference = {
-          avgLuma: Number(referenceSummary.avgLuma.toFixed(2)),
-          avgRgb: Number(referenceSummary.avgRgb.toFixed(2)),
-          nonZeroPixels: referenceSummary.nonZeroPixels,
-          alphaSum: referenceSummary.alphaSum,
-        };
-        sampleDiag.tile = {
-          avgLuma: Number(tileSummary.avgLuma.toFixed(2)),
-          avgRgb: Number(tileSummary.avgRgb.toFixed(2)),
-          nonZeroPixels: tileSummary.nonZeroPixels,
-          alphaSum: tileSummary.alphaSum,
-        };
-        sampleDiag.meanAbsDiff = Number(comparison.meanAbsDiff.toFixed(2));
-
-        const referenceHasVisibleSignal =
-          referenceSummary.alphaSum > 0 && referenceSummary.avgLuma >= LARGE_IMAGE_PROBE_SIGNAL_LUMA_MIN;
-        const tileLooksBlack =
-          tileSummary.alphaSum > 0 &&
-          tileSummary.avgLuma <= LARGE_IMAGE_PROBE_BLACK_LUMA_MAX &&
-          tileSummary.nonZeroPixels > 0;
-        const tileLooksEmpty = tileSummary.alphaSum === 0 || tileSummary.nonZeroPixels === 0;
-        const renderMismatch = comparison.meanAbsDiff >= LARGE_IMAGE_PROBE_DIFF_MIN;
-
-        if ((referenceHasVisibleSignal && tileLooksBlack && renderMismatch) ||
-            (referenceSummary.alphaSum > 0 && tileLooksEmpty)) {
+        const renderCheck = isBlackOrEmptyMismatch(
+          referenceSummary,
+          tileSummary,
+          renderComparison.meanAbsDiff
+        );
+        if (renderCheck.failed) {
           sampleDiag.ok = false;
-          sampleDiag.error = tileLooksEmpty ? "tile-render-empty" : "tile-render-black";
+          sampleDiag.error = renderCheck.kind === "empty" ? "tile-render-empty" : "tile-render-black";
           diag.samples.push(sampleDiag);
-          diag.stopReason = tileLooksEmpty ? "probe-empty-tile" : "probe-black-tile";
-          console.warn("Large image probe tile mismatch:", sampleDiag);
+          diag.stopReason = renderCheck.kind === "empty" ? "probe-empty-tile" : "probe-black-tile";
+          console.warn("Large image probe tile render mismatch:", sampleDiag);
           return { ok: false, diag };
         }
 
+        let encodedUrl;
         try {
-          const encoded = tilePreview.toDataURL("image/jpeg", 0.7);
-          diag.probeEncodeOk = typeof encoded === "string" && encoded.startsWith("data:image/jpeg");
+          encodedUrl = canvasToDataUrlUnderLimit(tileCanvas);
+          diag.probeEncodeOk = typeof encodedUrl === "string" && encodedUrl.startsWith("data:image/jpeg");
           if (!diag.probeEncodeOk) {
             sampleDiag.ok = false;
             sampleDiag.error = "probe-encode-empty";
@@ -892,12 +909,50 @@ function probeLargeImageRuntime(imgEl, { fileName, width, height, maxTextureSize
             diag.stopReason = "probe-encode-empty";
             return { ok: false, diag };
           }
+          sampleDiag.encodedLength = encodedUrl.length;
         } catch (e) {
           sampleDiag.ok = false;
           sampleDiag.error = e && e.message ? e.message : String(e);
           diag.samples.push(sampleDiag);
           diag.stopReason = "probe-encode-failed";
-          console.warn("Large image probe encode failed:", e);
+          console.warn("Large image probe full-tile encode failed:", e);
+          return { ok: false, diag };
+        }
+
+        try {
+          const encodedImgEl = await loadImage(encodedUrl);
+          const encodedPreview = makeProbePreviewFromSource(encodedImgEl, {
+            sx: 0,
+            sy: 0,
+            sw: encodedImgEl.naturalWidth || encodedImgEl.width,
+            sh: encodedImgEl.naturalHeight || encodedImgEl.height,
+          });
+          const encodedSummary = summarizeProbePreviewCanvas(encodedPreview);
+          const encodedComparison = compareProbePreviewCanvases(referencePreview, encodedPreview);
+          sampleDiag.encoded = summarizeForDiag(encodedSummary);
+          sampleDiag.encodedMeanAbsDiff = Number(encodedComparison.meanAbsDiff.toFixed(2));
+
+          const encodedCheck = isBlackOrEmptyMismatch(
+            referenceSummary,
+            encodedSummary,
+            encodedComparison.meanAbsDiff
+          );
+          if (encodedCheck.failed) {
+            sampleDiag.ok = false;
+            sampleDiag.error = encodedCheck.kind === "empty" ? "tile-encode-empty" : "tile-encode-black";
+            diag.samples.push(sampleDiag);
+            diag.stopReason = encodedCheck.kind === "empty" ? "probe-encoded-empty" : "probe-encoded-black";
+            console.warn("Large image probe encoded tile mismatch:", sampleDiag);
+            return { ok: false, diag };
+          }
+
+          try { encodedImgEl.src = ""; } catch (_) {}
+        } catch (e) {
+          sampleDiag.ok = false;
+          sampleDiag.error = e && e.message ? e.message : String(e);
+          diag.samples.push(sampleDiag);
+          diag.stopReason = "probe-encoded-decode-failed";
+          console.warn("Large image probe encoded tile decode failed:", e);
           return { ok: false, diag };
         }
 
@@ -1381,7 +1436,7 @@ setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
           decodeOk: true,
         });
 
-        const probe = probeLargeImageRuntime(imgEl, {
+        const probe = await probeLargeImageRuntime(imgEl, {
           fileName: file.name,
           width,
           height,
