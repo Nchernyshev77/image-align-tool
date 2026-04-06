@@ -1,12 +1,11 @@
 // app.js
-// Image Align Tool_41: Sorting + Stitch/Slice
+// Image Align Tool_42: Sorting + Stitch/Slice
 // Base: Image Align Tool_26
 // Base: Image Align Tool_40
-// Changes in _41:
-// - Show large-image failure directly in the panel UI.
-// - Make the failure text red.
-// - Hide the progress bar on fatal prepare/upload failures.
-// - Replace the stage label with "Fail" on fatal UI errors.
+// Changes in _42:
+// - Reduce tile size only for truly huge images to improve 32k import chances.
+// - Run huge bitmap-region imports in a safer single-file path with lower concurrency.
+// - Keep the normal 4096 tile path for regular images so smaller imports stay fast.
 
 const { board } = window.miro;
 
@@ -39,7 +38,8 @@ const LARGE_IMAGE_BITMAP_MIN_DIM = 24000;
 const LARGE_IMAGE_BITMAP_MIN_TILES = 36;
 const LARGE_IMAGE_PROBE_MIN_DIM = 24000;
 const LARGE_IMAGE_PROBE_MIN_TILES = 36;
-const BITMAP_JOB_CONCURRENCY = 2;
+const BITMAP_JOB_CONCURRENCY = 1;
+const LARGE_IMAGE_BITMAP_TILE_SIZE = 2048;
 const BITMAP_FILE_CREATE_IMAGE_MAX_RETRIES = 1;
 const BITMAP_FILE_MAX_JOB_ATTEMPTS = 1;
 const TOO_LARGE_IMPORT_MESSAGE = "Image is too large for this browser";
@@ -1365,17 +1365,31 @@ try {
       let tilesX = 1;
       let tilesY = 1;
       let numTiles = 1;
+      let sliceTileSize = SLICE_TILE_SIZE;
+      let previewTilesX = 1;
+      let previewTilesY = 1;
+      let previewNumTiles = 1;
       if (needsSlice) {
-        tilesX = Math.ceil(width / SLICE_TILE_SIZE);
-        tilesY = Math.ceil(height / SLICE_TILE_SIZE);
-        numTiles = tilesX * tilesY;
+        previewTilesX = Math.ceil(width / SLICE_TILE_SIZE);
+        previewTilesY = Math.ceil(height / SLICE_TILE_SIZE);
+        previewNumTiles = previewTilesX * previewTilesY;
       }
 
       const useBitmapRegion = needsSlice && (
         width > LARGE_IMAGE_BITMAP_MIN_DIM ||
         height > LARGE_IMAGE_BITMAP_MIN_DIM ||
-        numTiles >= LARGE_IMAGE_BITMAP_MIN_TILES
+        previewNumTiles >= LARGE_IMAGE_BITMAP_MIN_TILES
       );
+
+      if (useBitmapRegion) {
+        sliceTileSize = LARGE_IMAGE_BITMAP_TILE_SIZE;
+      }
+
+      if (needsSlice) {
+        tilesX = Math.ceil(width / sliceTileSize);
+        tilesY = Math.ceil(height / sliceTileSize);
+        numTiles = tilesX * tilesY;
+      }
 
       const shouldRunLargeProbe = useBitmapRegion && (
         width >= LARGE_IMAGE_PROBE_MIN_DIM ||
@@ -1424,6 +1438,7 @@ try {
         tilesX,
         tilesY,
         numTiles,
+        sliceTileSize,
       });
     }
 
@@ -2230,6 +2245,7 @@ const getFileCenter = (info, fileIndex) => {
 for (let i = 0; i < orderedInfos.length; i++) {
   const info = orderedInfos[i];
   const { file, needsSlice, width, height, tilesX, tilesY } = info;
+  const sliceTileSize = info.sliceTileSize || SLICE_TILE_SIZE;
 
   const center = getFileCenter(info, i);
   const originalName = file.name || "image";
@@ -2257,10 +2273,10 @@ for (let i = 0; i < orderedInfos.length; i++) {
   const rowHeights = [];
 
   for (let tx = 0; tx < tilesX; tx++) {
-    colWidths.push(Math.min(SLICE_TILE_SIZE, width - tx * SLICE_TILE_SIZE));
+    colWidths.push(Math.min(sliceTileSize, width - tx * sliceTileSize));
   }
   for (let ty = 0; ty < tilesY; ty++) {
-    rowHeights.push(Math.min(SLICE_TILE_SIZE, height - ty * SLICE_TILE_SIZE));
+    rowHeights.push(Math.min(sliceTileSize, height - ty * sliceTileSize));
   }
 
   const mosaicW = colWidths.reduce((sum, w) => sum + w, 0);
@@ -2284,8 +2300,8 @@ for (let i = 0; i < orderedInfos.length; i++) {
       const sw = colWidths[tx];
       const sh = rowHeights[ty];
 
-      const sx = tx * SLICE_TILE_SIZE;
-      const sy = ty * SLICE_TILE_SIZE;
+      const sx = tx * sliceTileSize;
+      const sy = ty * sliceTileSize;
 
       const tileLeft = mosaicLeft + colPrefix[tx];
       const tileTop = mosaicTop + rowPrefix[ty];
