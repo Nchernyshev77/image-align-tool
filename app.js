@@ -1,10 +1,11 @@
 // app.js
-// Image Align Tool_35: Sorting + Stitch/Slice
+// Image Align Tool_36: Sorting + Stitch/Slice
 // Base: Image Align Tool_26
-// Changes in _35:
+// Changes in _36:
 // - Keep Miro notifications short and log details only to the console.
 // - Remove the hard per-side reject and use runtime bitmap-region probe instead.
 // - Slice large images via createImageBitmap(file, sx, sy, sw, sh) to avoid black tiles.
+// - Make Stage 1 large-image probe lightweight and bounded by timeout.
 // - Keep panel.html unchanged and preserve the rest of the current flow.
 
 const { board } = window.miro;
@@ -30,7 +31,9 @@ const UPLOAD_CONCURRENCY_MAX = 5;
 const UPLOAD_CONCURRENCY_INITIAL_LARGE = 4;
 const META_APP_ID = "image-align-tool";
 const MAX_NOTIFICATION_MESSAGE_LENGTH = 80;
-const BITMAP_SLICE_PROBE_TILE = 2048;
+const BITMAP_SLICE_PROBE_TILE = 1024;
+const BITMAP_SLICE_PROBE_OUTPUT = 512;
+const BITMAP_SLICE_PROBE_TIMEOUT_MS = 8000;
 const LARGE_IMAGE_DIMENSION_WARNING = 16384;
 
 // ---------- авто-детект лимита по стороне через WebGL ----------
@@ -258,6 +261,19 @@ async function decodeImageFromFile(file) {
   }
 }
 
+function withTimeout(promise, ms, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label || "operation"} timed out after ${ms}ms`));
+    }, ms);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 async function renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH) {
   if (typeof createImageBitmap !== "function") {
     throw new Error("createImageBitmap is not available");
@@ -286,68 +302,57 @@ async function probeBitmapSlicePath(file, width, height) {
     width,
     height,
     maxTextureSize: MAX_SLICE_DIM,
-    decodeOk: false,
+    decodeOk: true,
     bitmapRegionOk: false,
     drawOk: false,
     encodeOk: false,
     stats: [],
     stopReason: null,
+    timeoutMs: BITMAP_SLICE_PROBE_TIMEOUT_MS,
+    probeTile: Math.min(BITMAP_SLICE_PROBE_TILE, width, height),
+    outputTile: Math.min(BITMAP_SLICE_PROBE_OUTPUT, width, height),
+  };
+
+  const probeSize = Math.min(BITMAP_SLICE_PROBE_TILE, width, height);
+  const outputSize = Math.min(BITMAP_SLICE_PROBE_OUTPUT, width, height);
+  const centerRegion = {
+    sx: Math.max(0, Math.floor((width - probeSize) / 2)),
+    sy: Math.max(0, Math.floor((height - probeSize) / 2)),
+    sw: probeSize,
+    sh: probeSize,
   };
 
   try {
-    const imgEl = await decodeImageFromFile(file);
-    diag.decodeOk = true;
-    try {
-      imgEl.src = "";
-    } catch (_) {}
-  } catch (e) {
-    diag.stopReason = "decode_failed";
-    diag.error = String(e && e.message ? e.message : e);
-    return { ok: false, diag, message: "Cannot decode image" };
-  }
-
-  const probeSize = Math.min(BITMAP_SLICE_PROBE_TILE, width, height);
-  const points = createProbePoints(width - probeSize + 1, height - probeSize + 1)
-    .slice(0, 3)
-    .map((p) => ({
-      sx: Math.min(Math.max(0, p.x), Math.max(0, width - probeSize)),
-      sy: Math.min(Math.max(0, p.y), Math.max(0, height - probeSize)),
-      sw: probeSize,
-      sh: probeSize,
-    }));
-
-  try {
-    for (const region of points) {
-      const canvas = await renderBitmapRegionToCanvas(
+    const canvas = await withTimeout(
+      renderBitmapRegionToCanvas(
         file,
-        region.sx,
-        region.sy,
-        region.sw,
-        region.sh,
-        region.sw,
-        region.sh
-      );
+        centerRegion.sx,
+        centerRegion.sy,
+        centerRegion.sw,
+        centerRegion.sh,
+        outputSize,
+        outputSize
+      ),
+      BITMAP_SLICE_PROBE_TIMEOUT_MS,
+      "bitmap probe"
+    );
 
-      diag.bitmapRegionOk = true;
-      diag.drawOk = true;
+    diag.bitmapRegionOk = true;
+    diag.drawOk = true;
 
-      const stats = getCanvasStats(canvas);
-      diag.stats.push({ ...region, ...stats });
+    const stats = getCanvasStats(canvas);
+    diag.stats.push({ ...centerRegion, outW: outputSize, outH: outputSize, ...stats });
 
-      const preview = document.createElement("canvas");
-      preview.width = 64;
-      preview.height = 64;
-      const previewCtx = get2dContextSrgb(preview);
-      previewCtx.imageSmoothingEnabled = false;
-      previewCtx.clearRect(0, 0, 64, 64);
-      previewCtx.drawImage(canvas, 0, 0, 64, 64);
-
-      const dataUrl = preview.toDataURL("image/jpeg", 0.8);
-      if (!dataUrl || !dataUrl.startsWith("data:image/jpeg")) {
-        throw new Error("preview_encode_failed");
-      }
-      diag.encodeOk = true;
+    const dataUrl = withTimeout(
+      Promise.resolve(canvas.toDataURL("image/jpeg", 0.8)),
+      BITMAP_SLICE_PROBE_TIMEOUT_MS,
+      "bitmap probe encode"
+    );
+    const encoded = await dataUrl;
+    if (!encoded || !encoded.startsWith("data:image/jpeg")) {
+      throw new Error("probe_encode_failed");
     }
+    diag.encodeOk = true;
   } catch (e) {
     diag.stopReason = "bitmap_slice_failed";
     diag.error = String(e && e.message ? e.message : e);
@@ -356,6 +361,7 @@ async function probeBitmapSlicePath(file, width, height) {
 
   return { ok: true, diag };
 }
+
 
 /**
  * Возвращает яркость и "сырую" сатурацию по ROI:
@@ -1297,6 +1303,7 @@ try {
       }
 
       if (needsSlice) {
+        setProgress(i + 1, prepTotalSteps, "Preparing files… (large image probe)", i + 1, filesArray.length);
         const probe = await probeBitmapSlicePath(file, width, height);
         console.log("[Image Align Tool] large image probe", probe.diag);
         if (!probe.ok) {
@@ -1304,6 +1311,7 @@ try {
           try { imgEl.src = ""; } catch (e) {}
           continue;
         }
+        setProgress(i + 1, prepTotalSteps, "Preparing files…", i + 1, filesArray.length);
       }
 
       // Release the decoded preview image after analysis.
