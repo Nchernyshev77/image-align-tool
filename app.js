@@ -1,11 +1,10 @@
 // app.js
-// Image Align Tool_32: Sorting + Stitch/Slice
-// Base: user-provided original app.js
-// Changes in _32:
-// - Keep Miro notification messages at 80 chars max.
-// - Remove the hard stop by image side length.
-// - Probe large images at runtime before allowing Stitch/Slice.
-// - Log detailed large-image diagnostics to the console.
+// Image Align Tool_33: Sorting + Stitch/Slice
+// Base: Image Align Tool_32
+// Changes in _33:
+// - Make the large-image probe render real tile-sized regions.
+// - Compare a real tile render against a direct preview render.
+// - Stop import when a large tile render becomes empty/black.
 
 const { board } = window.miro;
 
@@ -30,8 +29,10 @@ const UPLOAD_CONCURRENCY_MAX = 5;
 const UPLOAD_CONCURRENCY_INITIAL_LARGE = 4;
 const META_APP_ID = "image-align-tool";
 const MAX_NOTIFICATION_MESSAGE_LEN = 80;
-const LARGE_IMAGE_PROBE_SOURCE_SIZE = 1024;
-const LARGE_IMAGE_PROBE_OUTPUT_SIZE = 256;
+const LARGE_IMAGE_PROBE_REF_SIZE = 128;
+const LARGE_IMAGE_PROBE_BLACK_LUMA_MAX = 1.5;
+const LARGE_IMAGE_PROBE_SIGNAL_LUMA_MIN = 6;
+const LARGE_IMAGE_PROBE_DIFF_MIN = 8;
 
 // ---------- авто-детект лимита по стороне через WebGL ----------
 
@@ -658,36 +659,130 @@ function canvasToDataUrlUnderLimit(canvas) {
 }
 
 function buildLargeImageProbeSamples(width, height) {
-  const span = Math.max(1, Math.min(LARGE_IMAGE_PROBE_SOURCE_SIZE, width, height));
+  const tileW = Math.max(1, Math.min(SLICE_TILE_SIZE, width));
+  const tileH = Math.max(1, Math.min(SLICE_TILE_SIZE, height));
   const positions = [
     { label: "top-left", x: 0, y: 0 },
     {
       label: "center",
-      x: Math.max(0, Math.floor((width - span) / 2)),
-      y: Math.max(0, Math.floor((height - span) / 2)),
+      x: Math.max(0, Math.floor((width - tileW) / 2)),
+      y: Math.max(0, Math.floor((height - tileH) / 2)),
     },
     {
       label: "bottom-right",
-      x: Math.max(0, width - span),
-      y: Math.max(0, height - span),
+      x: Math.max(0, width - tileW),
+      y: Math.max(0, height - tileH),
     },
   ];
 
   const unique = [];
   const seen = new Set();
   for (const pos of positions) {
-    const key = `${pos.x}:${pos.y}:${span}`;
+    const key = `${pos.x}:${pos.y}:${tileW}:${tileH}`;
     if (seen.has(key)) continue;
     seen.add(key);
     unique.push({
       label: pos.label,
       sx: pos.x,
       sy: pos.y,
-      sw: span,
-      sh: span,
+      sw: tileW,
+      sh: tileH,
+      outW: tileW,
+      outH: tileH,
     });
   }
   return unique;
+}
+
+function summarizeProbePreviewCanvas(canvas) {
+  const ctx = canvas.getContext("2d");
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+  const pixels = data.length / 4;
+
+  let alphaSum = 0;
+  let rgbSum = 0;
+  let lumaSum = 0;
+  let nonZeroPixels = 0;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const a = data[i + 3];
+
+    alphaSum += a;
+    rgbSum += r + g + b;
+
+    const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    lumaSum += luma;
+
+    if (r > 0 || g > 0 || b > 0 || a > 0) {
+      nonZeroPixels += 1;
+    }
+  }
+
+  return {
+    pixels,
+    alphaSum,
+    rgbSum,
+    nonZeroPixels,
+    avgLuma: pixels ? lumaSum / pixels : 0,
+    avgRgb: pixels ? rgbSum / (pixels * 3) : 0,
+  };
+}
+
+function compareProbePreviewCanvases(aCanvas, bCanvas) {
+  const aCtx = aCanvas.getContext("2d");
+  const bCtx = bCanvas.getContext("2d");
+  const aData = aCtx.getImageData(0, 0, aCanvas.width, aCanvas.height).data;
+  const bData = bCtx.getImageData(0, 0, bCanvas.width, bCanvas.height).data;
+
+  let totalDiff = 0;
+  let compared = 0;
+
+  for (let i = 0; i < aData.length; i += 4) {
+    totalDiff += Math.abs(aData[i] - bData[i]);
+    totalDiff += Math.abs(aData[i + 1] - bData[i + 1]);
+    totalDiff += Math.abs(aData[i + 2] - bData[i + 2]);
+    compared += 3;
+  }
+
+  return {
+    meanAbsDiff: compared ? totalDiff / compared : 0,
+  };
+}
+
+function makeProbePreviewFromSource(imgEl, sample) {
+  const canvas = document.createElement("canvas");
+  canvas.width = LARGE_IMAGE_PROBE_REF_SIZE;
+  canvas.height = LARGE_IMAGE_PROBE_REF_SIZE;
+  const ctx = get2dContextSrgb(canvas);
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(
+    imgEl,
+    sample.sx,
+    sample.sy,
+    sample.sw,
+    sample.sh,
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+  return canvas;
+}
+
+function makeProbePreviewFromCanvas(sourceCanvas) {
+  const canvas = document.createElement("canvas");
+  canvas.width = LARGE_IMAGE_PROBE_REF_SIZE;
+  canvas.height = LARGE_IMAGE_PROBE_REF_SIZE;
+  const ctx = get2dContextSrgb(canvas);
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(sourceCanvas, 0, 0, sourceCanvas.width, sourceCanvas.height, 0, 0, canvas.width, canvas.height);
+  return canvas;
 }
 
 function probeLargeImageRuntime(imgEl, { fileName, width, height, maxTextureSize }) {
@@ -704,26 +799,41 @@ function probeLargeImageRuntime(imgEl, { fileName, width, height, maxTextureSize
   };
 
   console.groupCollapsed(`[Image Align Tool] Large image probe: ${fileName}`);
-  console.log("Image:", { width, height, maxTextureSize });
+  console.log("Image:", { width, height, maxTextureSize, tileSize: SLICE_TILE_SIZE });
 
   try {
-    const canvas = document.createElement("canvas");
-    canvas.width = LARGE_IMAGE_PROBE_OUTPUT_SIZE;
-    canvas.height = LARGE_IMAGE_PROBE_OUTPUT_SIZE;
-
-    const ctx = get2dContextSrgb(canvas);
-    if (!ctx) {
-      diag.stopReason = "2d-context-unavailable";
-      return { ok: false, diag };
-    }
-
-    ctx.imageSmoothingEnabled = false;
     const samples = buildLargeImageProbeSamples(width, height);
 
     for (const sample of samples) {
+      const sampleDiag = {
+        label: sample.label,
+        sx: sample.sx,
+        sy: sample.sy,
+        sw: sample.sw,
+        sh: sample.sh,
+        outW: sample.outW,
+        outH: sample.outH,
+      };
+
       try {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(
+        const referencePreview = makeProbePreviewFromSource(imgEl, sample);
+        const referenceSummary = summarizeProbePreviewCanvas(referencePreview);
+
+        const tileCanvas = document.createElement("canvas");
+        tileCanvas.width = sample.outW;
+        tileCanvas.height = sample.outH;
+        const tileCtx = get2dContextSrgb(tileCanvas);
+        if (!tileCtx) {
+          sampleDiag.ok = false;
+          sampleDiag.error = "2d-context-unavailable";
+          diag.samples.push(sampleDiag);
+          diag.stopReason = "2d-context-unavailable";
+          return { ok: false, diag };
+        }
+
+        tileCtx.imageSmoothingEnabled = false;
+        tileCtx.clearRect(0, 0, tileCanvas.width, tileCanvas.height);
+        tileCtx.drawImage(
           imgEl,
           sample.sx,
           sample.sy,
@@ -731,13 +841,72 @@ function probeLargeImageRuntime(imgEl, { fileName, width, height, maxTextureSize
           sample.sh,
           0,
           0,
-          canvas.width,
-          canvas.height
+          tileCanvas.width,
+          tileCanvas.height
         );
-        ctx.getImageData(0, 0, 1, 1);
-        diag.samples.push({ ...sample, ok: true });
+
+        const tilePreview = makeProbePreviewFromCanvas(tileCanvas);
+        const tileSummary = summarizeProbePreviewCanvas(tilePreview);
+        const comparison = compareProbePreviewCanvases(referencePreview, tilePreview);
+
+        sampleDiag.reference = {
+          avgLuma: Number(referenceSummary.avgLuma.toFixed(2)),
+          avgRgb: Number(referenceSummary.avgRgb.toFixed(2)),
+          nonZeroPixels: referenceSummary.nonZeroPixels,
+          alphaSum: referenceSummary.alphaSum,
+        };
+        sampleDiag.tile = {
+          avgLuma: Number(tileSummary.avgLuma.toFixed(2)),
+          avgRgb: Number(tileSummary.avgRgb.toFixed(2)),
+          nonZeroPixels: tileSummary.nonZeroPixels,
+          alphaSum: tileSummary.alphaSum,
+        };
+        sampleDiag.meanAbsDiff = Number(comparison.meanAbsDiff.toFixed(2));
+
+        const referenceHasVisibleSignal =
+          referenceSummary.alphaSum > 0 && referenceSummary.avgLuma >= LARGE_IMAGE_PROBE_SIGNAL_LUMA_MIN;
+        const tileLooksBlack =
+          tileSummary.alphaSum > 0 &&
+          tileSummary.avgLuma <= LARGE_IMAGE_PROBE_BLACK_LUMA_MAX &&
+          tileSummary.nonZeroPixels > 0;
+        const tileLooksEmpty = tileSummary.alphaSum === 0 || tileSummary.nonZeroPixels === 0;
+        const renderMismatch = comparison.meanAbsDiff >= LARGE_IMAGE_PROBE_DIFF_MIN;
+
+        if ((referenceHasVisibleSignal && tileLooksBlack && renderMismatch) ||
+            (referenceSummary.alphaSum > 0 && tileLooksEmpty)) {
+          sampleDiag.ok = false;
+          sampleDiag.error = tileLooksEmpty ? "tile-render-empty" : "tile-render-black";
+          diag.samples.push(sampleDiag);
+          diag.stopReason = tileLooksEmpty ? "probe-empty-tile" : "probe-black-tile";
+          console.warn("Large image probe tile mismatch:", sampleDiag);
+          return { ok: false, diag };
+        }
+
+        try {
+          const encoded = tilePreview.toDataURL("image/jpeg", 0.7);
+          diag.probeEncodeOk = typeof encoded === "string" && encoded.startsWith("data:image/jpeg");
+          if (!diag.probeEncodeOk) {
+            sampleDiag.ok = false;
+            sampleDiag.error = "probe-encode-empty";
+            diag.samples.push(sampleDiag);
+            diag.stopReason = "probe-encode-empty";
+            return { ok: false, diag };
+          }
+        } catch (e) {
+          sampleDiag.ok = false;
+          sampleDiag.error = e && e.message ? e.message : String(e);
+          diag.samples.push(sampleDiag);
+          diag.stopReason = "probe-encode-failed";
+          console.warn("Large image probe encode failed:", e);
+          return { ok: false, diag };
+        }
+
+        sampleDiag.ok = true;
+        diag.samples.push(sampleDiag);
       } catch (e) {
-        diag.samples.push({ ...sample, ok: false, error: e && e.message ? e.message : String(e) });
+        sampleDiag.ok = false;
+        sampleDiag.error = e && e.message ? e.message : String(e);
+        diag.samples.push(sampleDiag);
         diag.stopReason = "probe-render-failed";
         console.warn("Large image probe render failed:", { sample, error: e });
         return { ok: false, diag };
@@ -745,20 +914,7 @@ function probeLargeImageRuntime(imgEl, { fileName, width, height, maxTextureSize
     }
 
     diag.probeRenderOk = true;
-
-    try {
-      const encoded = canvas.toDataURL("image/jpeg", 0.7);
-      diag.probeEncodeOk = typeof encoded === "string" && encoded.startsWith("data:image/jpeg");
-      if (!diag.probeEncodeOk) {
-        diag.stopReason = "probe-encode-empty";
-        return { ok: false, diag };
-      }
-    } catch (e) {
-      diag.stopReason = "probe-encode-failed";
-      console.warn("Large image probe encode failed:", e);
-      return { ok: false, diag };
-    }
-
+    diag.probeEncodeOk = true;
     diag.stopReason = null;
     return { ok: true, diag };
   } catch (e) {
