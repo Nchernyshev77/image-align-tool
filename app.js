@@ -1,10 +1,10 @@
 // app.js
-// Image Align Tool_43: Sorting + Stitch/Slice
-// Base: Image Align Tool_42
-// Changes in _43:
-// - Stop rejecting huge images because a probe exceeded a fixed timeout.
-// - Accept huge images after successful decode and let the real bitmap path decide.
-// - Keep early failure only when the browser lacks createImageBitmap for the huge path.
+// Image Align Tool_44: Sorting + Stitch/Slice
+// Base: Image Align Tool_43
+// Changes in _44:
+// - Restore renderBitmapRegionToCanvas for the huge-image bitmap path.
+// - Keep huge-image mode at 2048 tile size and concurrency 1.
+// - Fix Firefox 32k import path so it reaches real bitmap slicing instead of failing early.
 
 const { board } = window.miro;
 
@@ -276,6 +276,28 @@ async function decodeImageFromFile(file) {
     return await loadImage(objectUrl);
   } finally {
     URL.revokeObjectURL(objectUrl);
+  }
+}
+
+async function renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH) {
+  if (typeof createImageBitmap !== "function") {
+    throw new Error("createImageBitmap is not available");
+  }
+
+  const bitmap = await createImageBitmap(file, sx, sy, sw, sh);
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = outW;
+    canvas.height = outH;
+    const ctx = get2dContextSrgb(canvas);
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, outW, outH);
+    ctx.drawImage(bitmap, 0, 0, outW, outH);
+    return canvas;
+  } finally {
+    if (bitmap && typeof bitmap.close === "function") {
+      bitmap.close();
+    }
   }
 }
 
