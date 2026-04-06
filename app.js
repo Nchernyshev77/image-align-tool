@@ -1,10 +1,10 @@
 // app.js
-// Image Align Tool_45: Sorting + Stitch/Slice
-// Base: Image Align Tool_44
-// Changes in _45:
-// - Route Firefox huge-image imports through decoded imgEl slicing instead of createImageBitmap regions.
-// - Keep huge-image mode at 2048 tile size and concurrency 1.
-// - Avoid Firefox region-bitmap failures like "object is not, or is no longer, usable".
+// Image Align Tool_46: Sorting + Stitch/Slice
+// Base: Image Align Tool_45
+// Changes in _46:
+// - For Firefox huge-image imports, slice via createImageBitmap(imgEl, region).
+// - Keep 2048 tiles and concurrency 1 for huge-image mode.
+// - Avoid the black-tile path from direct drawImage(imgEl, region) on 32k images.
 
 const { board } = window.miro;
 
@@ -42,7 +42,6 @@ const BITMAP_FILE_CREATE_IMAGE_MAX_RETRIES = 1;
 const BITMAP_FILE_MAX_JOB_ATTEMPTS = 1;
 const TOO_LARGE_IMPORT_MESSAGE = "Image is too large for this browser";
 const FAILURE_UI_COLOR = "#c62828";
-const IS_FIREFOX = /firefox/i.test((navigator && navigator.userAgent) || "");
 
 // ---------- авто-детект лимита по стороне через WebGL ----------
 
@@ -156,6 +155,15 @@ function logCanvasColorSpace(prefix) {
     console.log(`${prefix}: 2D colorSpace request=srgb supported=${supported} actual=${actual}`);
   } catch (_) {
     // ignore
+  }
+}
+
+function isFirefoxBrowser() {
+  try {
+    const ua = (typeof navigator !== "undefined" && navigator.userAgent) ? navigator.userAgent : "";
+    return /firefox/i.test(ua) && !/seamonkey/i.test(ua);
+  } catch (_) {
+    return false;
   }
 }
 
@@ -280,12 +288,12 @@ async function decodeImageFromFile(file) {
   }
 }
 
-async function renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH) {
+async function renderBitmapRegionToCanvas(source, sx, sy, sw, sh, outW, outH) {
   if (typeof createImageBitmap !== "function") {
     throw new Error("createImageBitmap is not available");
   }
 
-  const bitmap = await createImageBitmap(file, sx, sy, sw, sh);
+  const bitmap = await createImageBitmap(source, sx, sy, sw, sh);
   try {
     const canvas = document.createElement("canvas");
     canvas.width = outW;
@@ -1298,7 +1306,6 @@ try {
         height > LARGE_IMAGE_BITMAP_MIN_DIM ||
         previewNumTiles >= LARGE_IMAGE_BITMAP_MIN_TILES
       );
-      const useHugeDecodedPath = useBitmapRegion && IS_FIREFOX;
 
       if (useBitmapRegion) {
         sliceTileSize = LARGE_IMAGE_BITMAP_TILE_SIZE;
@@ -1310,7 +1317,7 @@ try {
         numTiles = tilesX * tilesY;
       }
 
-      if (useBitmapRegion && !useHugeDecodedPath && typeof createImageBitmap !== "function") {
+      if (useBitmapRegion && typeof createImageBitmap !== "function") {
         hugePathUnsupportedFailures.push({
           fileName: file.name,
           width,
@@ -1342,7 +1349,7 @@ try {
           tilesY,
           numTiles,
           sliceTileSize,
-          renderPath: useHugeDecodedPath ? "firefox-decoded-image" : "bitmap-region",
+          bitmapSource: isFirefoxBrowser() ? "imgEl-region" : "file-region",
         });
       }
 
@@ -1357,7 +1364,6 @@ try {
         satCode,
         needsSlice,
         useBitmapRegion,
-        useHugeDecodedPath,
         probeFailedSoft: false,
         tilesX,
         tilesY,
@@ -2294,7 +2300,7 @@ const processOneJob = async (job) => {
   const { file, info } = job;
   const fileName = originalNameByFile.get(file) || "image";
   const usesBitmapRegion = !!(info && info.useBitmapRegion);
-  const usesHugeDecodedPath = !!(info && info.useHugeDecodedPath);
+  const useFirefoxImageBitmapFromImage = usesBitmapRegion && isFirefoxBrowser();
 
   if (usesBitmapRegion && failedBitmapFiles.has(file)) {
     markJobSettled(job, "skipped", { reason: "file-already-failed" });
@@ -2303,7 +2309,7 @@ const processOneJob = async (job) => {
   }
 
   let imgEl = null;
-  if (!usesBitmapRegion || usesHugeDecodedPath) {
+  if (!usesBitmapRegion || useFirefoxImageBitmapFromImage) {
     imgEl = await getDecodedImage(file);
   }
 
@@ -2326,8 +2332,9 @@ const processOneJob = async (job) => {
     };
 
     const renderRegionToCanvas = async ({ sx, sy, sw, sh, outW, outH }) => {
-      if (usesBitmapRegion && !usesHugeDecodedPath) {
-        return await renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH);
+      if (usesBitmapRegion) {
+        const bitmapSource = useFirefoxImageBitmapFromImage && imgEl ? imgEl : file;
+        return await renderBitmapRegionToCanvas(bitmapSource, sx, sy, sw, sh, outW, outH);
       }
 
       const canvas = document.createElement("canvas");
