@@ -1,11 +1,12 @@
 // app.js
-// Image Align Tool_40: Sorting + Stitch/Slice
+// Image Align Tool_41: Sorting + Stitch/Slice
 // Base: Image Align Tool_26
-// Changes in _39:
-// - Restore the fast legacy slicing path for normal images (including typical <=16k imports).
-// - Use bitmap-region slicing only for truly huge files.
-// - Track per-file failures and show a short final UI message when some files were not imported.
-// - Keep detailed failure diagnostics in the console.
+// Base: Image Align Tool_40
+// Changes in _41:
+// - Show large-image failure directly in the panel UI.
+// - Make the failure text red.
+// - Hide the progress bar on fatal prepare/upload failures.
+// - Replace the stage label with "Fail" on fatal UI errors.
 
 const { board } = window.miro;
 
@@ -42,6 +43,7 @@ const BITMAP_JOB_CONCURRENCY = 2;
 const BITMAP_FILE_CREATE_IMAGE_MAX_RETRIES = 1;
 const BITMAP_FILE_MAX_JOB_ATTEMPTS = 1;
 const TOO_LARGE_IMPORT_MESSAGE = "Image is too large for this browser";
+const FAILURE_UI_COLOR = "#c62828";
 
 // ---------- авто-детект лимита по стороне через WebGL ----------
 
@@ -1048,6 +1050,52 @@ async function handleStitchSubmit(event) {
   const STAGES_TOTAL = 2;
   let stageIndex = 1; // 1/2 = Preparing, 2/2 = Uploading
 
+  const resetProgressUiState = () => {
+    if (progressBarEl) {
+      progressBarEl.style.width = "0%";
+      progressBarEl.style.display = "";
+      if (progressBarEl.parentElement) progressBarEl.parentElement.style.display = "";
+    }
+    if (progressStageEl) {
+      progressStageEl.style.display = "";
+      progressStageEl.style.color = "";
+      progressStageEl.style.fontWeight = "600";
+      progressStageEl.textContent = "";
+    }
+    if (progressMainEl) {
+      progressMainEl.style.color = "";
+      progressMainEl.style.fontWeight = "";
+      progressMainEl.textContent = "";
+    }
+    if (progressEtaEl) {
+      progressEtaEl.style.color = "";
+      progressEtaEl.textContent = "";
+    }
+  };
+
+  const showFailedProgressState = (message) => {
+    if (progressBarEl) {
+      progressBarEl.style.width = "0%";
+      progressBarEl.style.display = "none";
+      if (progressBarEl.parentElement) progressBarEl.parentElement.style.display = "none";
+    }
+    if (progressStageEl) {
+      progressStageEl.style.display = "";
+      progressStageEl.style.color = FAILURE_UI_COLOR;
+      progressStageEl.style.fontWeight = "700";
+      progressStageEl.textContent = "Fail";
+    }
+    if (progressMainEl) {
+      progressMainEl.style.color = FAILURE_UI_COLOR;
+      progressMainEl.style.fontWeight = "700";
+      progressMainEl.textContent = message || "Fail";
+    }
+    if (progressEtaEl) {
+      progressEtaEl.style.color = FAILURE_UI_COLOR;
+      progressEtaEl.textContent = "";
+    }
+  };
+
   const setStage = (idx) => {
     stageIndex = Math.max(1, Math.min(STAGES_TOTAL, idx));
     if (progressStageEl) {
@@ -1178,6 +1226,7 @@ if (!setProgress._throttleWrapped) {
     }
 
     if (stitchButton) stitchButton.disabled = true;
+    resetProgressUiState();
     setProgress(0, 0, "");
     setEtaText(null);
     if (setEtaText.flush) setEtaText.flush();
@@ -1383,8 +1432,10 @@ try {
 
     if (!fileInfos.length) {
       if (tooLargeProbeFailures.length > 0) {
-        setProgress(0, 0, "Image is too large");
+        if (setProgress.flush) setProgress.flush();
+        if (setEtaText.flush) setEtaText.flush();
         setEtaText(null);
+        showFailedProgressState("Image is too large");
         await notifyWarning(TOO_LARGE_IMPORT_MESSAGE, { failedFiles: tooLargeProbeFailures });
         return;
       }
@@ -2724,8 +2775,10 @@ setProgress(totalTiles, totalTiles);
     }
   } catch (err) {
     console.error(err);
-    setProgress(0, 0, "Error");
+    if (setProgress.flush) setProgress.flush();
+    if (setEtaText.flush) setEtaText.flush();
     setEtaText(null);
+    showFailedProgressState("Import failed");
     await notifyError("Image import failed", err);
   } finally {
     const stitchButton = document.getElementById("stitchButton");
