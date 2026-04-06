@@ -1,11 +1,10 @@
 // app.js
-// Image Align Tool_42: Sorting + Stitch/Slice
-// Base: Image Align Tool_26
-// Base: Image Align Tool_40
-// Changes in _42:
-// - Reduce tile size only for truly huge images to improve 32k import chances.
-// - Run huge bitmap-region imports in a safer single-file path with lower concurrency.
-// - Keep the normal 4096 tile path for regular images so smaller imports stay fast.
+// Image Align Tool_43: Sorting + Stitch/Slice
+// Base: Image Align Tool_42
+// Changes in _43:
+// - Stop rejecting huge images because a probe exceeded a fixed timeout.
+// - Accept huge images after successful decode and let the real bitmap path decide.
+// - Keep early failure only when the browser lacks createImageBitmap for the huge path.
 
 const { board } = window.miro;
 
@@ -32,7 +31,6 @@ const META_APP_ID = "image-align-tool";
 const MAX_NOTIFICATION_MESSAGE_LENGTH = 80;
 const BITMAP_SLICE_PROBE_TILE = 1024;
 const BITMAP_SLICE_PROBE_OUTPUT = 512;
-const BITMAP_SLICE_PROBE_TIMEOUT_MS = 8000;
 const LARGE_IMAGE_DIMENSION_WARNING = 16384;
 const LARGE_IMAGE_BITMAP_MIN_DIM = 24000;
 const LARGE_IMAGE_BITMAP_MIN_TILES = 36;
@@ -280,108 +278,6 @@ async function decodeImageFromFile(file) {
     URL.revokeObjectURL(objectUrl);
   }
 }
-
-function withTimeout(promise, ms, label) {
-  let timer = null;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      reject(new Error(`${label || "operation"} timed out after ${ms}ms`));
-    }, ms);
-  });
-
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timer) clearTimeout(timer);
-  });
-}
-
-async function renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH) {
-  if (typeof createImageBitmap !== "function") {
-    throw new Error("createImageBitmap is not available");
-  }
-
-  const bitmap = await createImageBitmap(file, sx, sy, sw, sh);
-  try {
-    const canvas = document.createElement("canvas");
-    canvas.width = outW;
-    canvas.height = outH;
-    const ctx = get2dContextSrgb(canvas);
-    ctx.imageSmoothingEnabled = false;
-    ctx.clearRect(0, 0, outW, outH);
-    ctx.drawImage(bitmap, 0, 0, outW, outH);
-    return canvas;
-  } finally {
-    if (bitmap && typeof bitmap.close === "function") {
-      bitmap.close();
-    }
-  }
-}
-
-async function probeBitmapSlicePath(file, width, height) {
-  const diag = {
-    fileName: file && file.name ? file.name : "image",
-    width,
-    height,
-    maxTextureSize: MAX_SLICE_DIM,
-    decodeOk: true,
-    bitmapRegionOk: false,
-    drawOk: false,
-    encodeOk: false,
-    stats: [],
-    stopReason: null,
-    timeoutMs: BITMAP_SLICE_PROBE_TIMEOUT_MS,
-    probeTile: Math.min(BITMAP_SLICE_PROBE_TILE, width, height),
-    outputTile: Math.min(BITMAP_SLICE_PROBE_OUTPUT, width, height),
-  };
-
-  const probeSize = Math.min(BITMAP_SLICE_PROBE_TILE, width, height);
-  const outputSize = Math.min(BITMAP_SLICE_PROBE_OUTPUT, width, height);
-  const centerRegion = {
-    sx: Math.max(0, Math.floor((width - probeSize) / 2)),
-    sy: Math.max(0, Math.floor((height - probeSize) / 2)),
-    sw: probeSize,
-    sh: probeSize,
-  };
-
-  try {
-    const canvas = await withTimeout(
-      renderBitmapRegionToCanvas(
-        file,
-        centerRegion.sx,
-        centerRegion.sy,
-        centerRegion.sw,
-        centerRegion.sh,
-        outputSize,
-        outputSize
-      ),
-      BITMAP_SLICE_PROBE_TIMEOUT_MS,
-      "bitmap probe"
-    );
-
-    diag.bitmapRegionOk = true;
-    diag.drawOk = true;
-
-    const stats = getCanvasStats(canvas);
-    diag.stats.push({ ...centerRegion, outW: outputSize, outH: outputSize, ...stats });
-
-    const dataUrl = withTimeout(
-      Promise.resolve(canvas.toDataURL("image/jpeg", 0.8)),
-      BITMAP_SLICE_PROBE_TIMEOUT_MS,
-      "bitmap probe encode"
-    );
-    const encoded = await dataUrl;
-    if (!encoded || !encoded.startsWith("data:image/jpeg")) {
-      throw new Error("probe_encode_failed");
-    }
-    diag.encodeOk = true;
-  } catch (e) {
-    diag.stopReason = "bitmap_slice_failed";
-    diag.error = String(e && e.message ? e.message : e);
-    return { ok: false, diag, message: "Large image probe failed" };
-  }
-
-  return { ok: true, diag };
-}
-
 
 /**
  * Возвращает яркость и "сырую" сатурацию по ROI:
@@ -1292,8 +1188,7 @@ if (!setProgress._throttleWrapped) {
 
     const fileInfos = [];
     let anySliced = false;
-    let softProbeFailures = 0;
-    const tooLargeProbeFailures = [];
+    const hugePathUnsupportedFailures = [];
 
         startPrepEta();
 setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
@@ -1391,36 +1286,39 @@ try {
         numTiles = tilesX * tilesY;
       }
 
-      const shouldRunLargeProbe = useBitmapRegion && (
-        width >= LARGE_IMAGE_PROBE_MIN_DIM ||
-        height >= LARGE_IMAGE_PROBE_MIN_DIM ||
-        numTiles >= LARGE_IMAGE_PROBE_MIN_TILES
-      );
+      if (useBitmapRegion && typeof createImageBitmap !== "function") {
+        hugePathUnsupportedFailures.push({
+          fileName: file.name,
+          width,
+          height,
+          tilesX,
+          tilesY,
+          numTiles,
+          stopReason: "bitmap-api-unavailable",
+          error: "createImageBitmap is not available",
+        });
+        console.warn("[Image Align Tool] huge image path unavailable; file skipped", {
+          fileName: file.name,
+          width,
+          height,
+          tilesX,
+          tilesY,
+          numTiles,
+        });
+        try { imgEl.src = ""; } catch (e) {}
+        continue;
+      }
 
-      let probeFailedSoft = false;
-      if (shouldRunLargeProbe) {
-        setProgress(i + 1, prepTotalSteps, "Preparing files… (large image probe)", i + 1, filesArray.length);
-        const probe = await probeBitmapSlicePath(file, width, height);
-        console.log("[Image Align Tool] large image probe", probe.diag);
-        if (!probe.ok) {
-          probeFailedSoft = true;
-          softProbeFailures += 1;
-          tooLargeProbeFailures.push({
-            fileName: file.name,
-            width,
-            height,
-            tilesX,
-            tilesY,
-            numTiles,
-            stopReason: probe && probe.diag ? probe.diag.stopReason : null,
-            error: probe && probe.diag ? probe.diag.error : null,
-          });
-          console.warn("[Image Align Tool] large image probe failed; file skipped", probe.diag);
-          try { imgEl.src = ""; } catch (e) {}
-          setProgress(i + 1, prepTotalSteps, "Preparing files…", i + 1, filesArray.length);
-          continue;
-        }
-        setProgress(i + 1, prepTotalSteps, "Preparing files…", i + 1, filesArray.length);
+      if (useBitmapRegion) {
+        console.log("[Image Align Tool] huge image accepted after decode; fixed-time probe skipped", {
+          fileName: file.name,
+          width,
+          height,
+          tilesX,
+          tilesY,
+          numTiles,
+          sliceTileSize,
+        });
       }
 
       // Release the decoded preview image after analysis.
@@ -1434,7 +1332,7 @@ try {
         satCode,
         needsSlice,
         useBitmapRegion,
-        probeFailedSoft,
+        probeFailedSoft: false,
         tilesX,
         tilesY,
         numTiles,
@@ -1446,12 +1344,12 @@ try {
     let prepDone = filesArray.length;
 
     if (!fileInfos.length) {
-      if (tooLargeProbeFailures.length > 0) {
+      if (hugePathUnsupportedFailures.length > 0) {
         if (setProgress.flush) setProgress.flush();
         if (setEtaText.flush) setEtaText.flush();
         setEtaText(null);
         showFailedProgressState("Image is too large");
-        await notifyWarning(TOO_LARGE_IMPORT_MESSAGE, { failedFiles: tooLargeProbeFailures });
+        await notifyWarning(TOO_LARGE_IMPORT_MESSAGE, { failedFiles: hugePathUnsupportedFailures });
         return;
       }
       setProgress(0, 0, "Nothing to import.");
@@ -1459,13 +1357,11 @@ try {
       return;
     }
 
-    if (tooLargeProbeFailures.length > 0) {
+    if (hugePathUnsupportedFailures.length > 0) {
       await notifyWarning(
-        tooLargeProbeFailures.length === 1 ? TOO_LARGE_IMPORT_MESSAGE : "Some images are too large",
-        { failedFiles: tooLargeProbeFailures }
+        hugePathUnsupportedFailures.length === 1 ? TOO_LARGE_IMPORT_MESSAGE : "Some images are too large",
+        { failedFiles: hugePathUnsupportedFailures }
       );
-    } else if (softProbeFailures > 0) {
-      await notifyWarning("Probe failed, trying upload", { softProbeFailures });
     }
 
     // 1) sorting
