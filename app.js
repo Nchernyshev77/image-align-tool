@@ -1,13 +1,12 @@
 // app.js
-// Image Align Tool_37: Sorting + Stitch/Slice
+// Image Align Tool_38: Sorting + Stitch/Slice
 // Base: Image Align Tool_26
-// Changes in _37:
-// - Keep Miro notifications short and log details only to the console.
-// - Remove the hard per-side reject and use runtime bitmap-region probe instead.
-// - Slice large images via createImageBitmap(file, sx, sy, sw, sh) to avoid black tiles.
-// - Make Stage 1 large-image probe lightweight and bounded by timeout.
-// - Downgrade large-image probe failures from hard-stop to advisory and continue upload.
-// - Keep panel.html unchanged and preserve the rest of the current flow.
+// Changes in _38:
+// - Use bitmap-region slicing only for truly huge images, keep smaller sliced files on the faster legacy path.
+// - Isolate huge-file upload failures so they do not slow down smaller images.
+// - Run regular jobs before bitmap-region jobs to keep normal imports fast.
+// - Fail huge files fast on the first real tile error instead of long retry chains.
+// - Keep Miro notifications short and log detailed diagnostics to the console.
 
 const { board } = window.miro;
 
@@ -36,6 +35,12 @@ const BITMAP_SLICE_PROBE_TILE = 1024;
 const BITMAP_SLICE_PROBE_OUTPUT = 512;
 const BITMAP_SLICE_PROBE_TIMEOUT_MS = 8000;
 const LARGE_IMAGE_DIMENSION_WARNING = 16384;
+const LARGE_IMAGE_BITMAP_MIN_DIM = 16384;
+const LARGE_IMAGE_PROBE_MIN_DIM = 20000;
+const LARGE_IMAGE_PROBE_MIN_TILES = 16;
+const BITMAP_JOB_CONCURRENCY = 2;
+const BITMAP_FILE_CREATE_IMAGE_MAX_RETRIES = 1;
+const BITMAP_FILE_MAX_JOB_ATTEMPTS = 1;
 
 // ---------- авто-детект лимита по стороне через WebGL ----------
 
@@ -158,6 +163,17 @@ class DataUrlTooLargeError extends Error {
     this.name = "DataUrlTooLargeError";
     this.length = length;
     this.limit = limit;
+  }
+}
+
+class FatalBitmapFileError extends Error {
+  constructor(file, fileName, cause) {
+    const message = cause && cause.message ? cause.message : String(cause || "Bitmap tile failed");
+    super(message);
+    this.name = "FatalBitmapFileError";
+    this.file = file;
+    this.fileName = fileName || (file && file.name) || "image";
+    this.cause = cause;
   }
 }
 
@@ -1304,8 +1320,21 @@ try {
         numTiles = tilesX * tilesY;
       }
 
+      const useBitmapRegion = needsSlice && (
+        width > MAX_SLICE_DIM ||
+        height > MAX_SLICE_DIM ||
+        width >= LARGE_IMAGE_BITMAP_MIN_DIM ||
+        height >= LARGE_IMAGE_BITMAP_MIN_DIM
+      );
+
+      const shouldRunLargeProbe = useBitmapRegion && (
+        width >= LARGE_IMAGE_PROBE_MIN_DIM ||
+        height >= LARGE_IMAGE_PROBE_MIN_DIM ||
+        numTiles >= LARGE_IMAGE_PROBE_MIN_TILES
+      );
+
       let probeFailedSoft = false;
-      if (needsSlice) {
+      if (shouldRunLargeProbe) {
         setProgress(i + 1, prepTotalSteps, "Preparing files… (large image probe)", i + 1, filesArray.length);
         const probe = await probeBitmapSlicePath(file, width, height);
         console.log("[Image Align Tool] large image probe", probe.diag);
@@ -1327,7 +1356,7 @@ try {
         briCode,
         satCode,
         needsSlice,
-        useBitmapRegion: needsSlice,
+        useBitmapRegion,
         probeFailedSoft,
         tilesX,
         tilesY,
@@ -1459,6 +1488,41 @@ let slotCentersByFile = null;
 
     const allCreatedTiles = [];
     let createdTiles = 0;
+    let settledTiles = 0;
+    let skippedTiles = 0;
+    const failedBitmapFiles = new Map();
+
+    const markJobSettled = (job, status, details) => {
+      if (job && job.__settled) return;
+      if (job) job.__settled = true;
+      settledTiles += 1;
+      if (status === "skipped") {
+        skippedTiles += 1;
+      }
+      if (details) {
+        console.log("[Image Align Tool] job settled", {
+          status,
+          title: job && job.title ? job.title : null,
+          fileName: job && job.file ? job.file.name : null,
+          details,
+        });
+      }
+      updateCreationProgress();
+    };
+
+    const markBitmapFileFailed = (file, error, job) => {
+      if (!file) return;
+      if (!failedBitmapFiles.has(file)) {
+        failedBitmapFiles.set(file, {
+          fileName: (job && job.file && job.file.name) || (file && file.name) || "image",
+          message: error && error.message ? error.message : String(error || "bitmap file failed"),
+        });
+        console.warn("[Image Align Tool] bitmap file failed; skipping remaining tiles", {
+          fileName: (job && job.file && job.file.name) || (file && file.name) || "image",
+          error,
+        });
+      }
+    };
 
     // ---- ETA: считаем по фактической пропускной способности (учитывает параллелизм) ----
     // adaptive concurrency diagnostics
@@ -1487,14 +1551,14 @@ let slotCentersByFile = null;
     const pad3 = (n) => String(n).padStart(3, "0");
 
     const updateCreationProgress = () => {
-      setProgress(createdTiles, totalTiles, "Uploading to board…");
+      setProgress(settledTiles, totalTiles, "Uploading to board…");
 
       if (!uploadStartTs) {
         setEtaText(null);
         return;
       }
 
-      const remainingTiles = totalTiles - createdTiles;
+      const remainingTiles = totalTiles - settledTiles;
       if (remainingTiles <= 0) {
         setEtaText(null);
         return;
@@ -1590,13 +1654,17 @@ let slotCentersByFile = null;
     let maxInFlightCreateImage = 0;
 
 
-    const createImageWithRetry = async (params) => {
+    const createImageWithRetry = async (params, options = {}) => {
+  const maxRetries = Number.isFinite(options.maxRetries)
+    ? Math.max(0, Math.floor(options.maxRetries))
+    : CREATE_IMAGE_MAX_RETRIES;
+
   let attempt = 0;
   let lastErr = null;
 
   const tStart = performance.now();
 
-  while (attempt <= CREATE_IMAGE_MAX_RETRIES) {
+  while (attempt <= maxRetries) {
     try {
       // Track real in-flight createImage requests (not just "allowed concurrency")
       inFlightCreateImage += 1;
@@ -1622,7 +1690,7 @@ let slotCentersByFile = null;
       attempt += 1;
       uploadRetryEvents += 1;
 
-      if (attempt > CREATE_IMAGE_MAX_RETRIES) break;
+      if (attempt > maxRetries) break;
 
       const msg = e && e.message ? e.message : String(e);
       const isStackOverflow = msg.includes("Maximum call stack size exceeded");
@@ -1677,7 +1745,7 @@ const runWithAdaptiveConcurrency = async (
   let concurrency = Math.max(minConcurrency, Math.min(maxConcurrency, initialConcurrency));
   let lockedMax = maxConcurrency;
 
-  const MAX_JOB_ATTEMPTS = 3; // hard retry per tile-job (separate from createImage internal retries)
+  const MAX_JOB_ATTEMPTS = 3; // hard retry per regular tile-job (bitmap-region jobs use a stricter path)
   const skippedJobs = []; // { item, error }
   let totalBatchErrors = 0;
   let totalJobFailures = 0;
@@ -1762,11 +1830,15 @@ let idx = 0;
           await worker(item);
         } catch (e) {
           const attempts = item.__jobAttempts || 1;
+          const maxAttemptsForItem = item.info && item.info.useBitmapRegion
+            ? BITMAP_FILE_MAX_JOB_ATTEMPTS
+            : MAX_JOB_ATTEMPTS;
 
           // If a tile-job keeps failing, don't loop forever.
-          if (attempts >= MAX_JOB_ATTEMPTS) {
+          if (attempts >= maxAttemptsForItem) {
             skippedJobs.push({ item, error: e });
             skippedInBatch += 1;
+            markJobSettled(item, "skipped", { reason: "repeated-failure" });
             try { releaseDecodedImageIfDone(item.file); } catch (_) {}
             console.warn(
               "Stitch/Slice: skipping a tile after repeated failures",
@@ -2183,212 +2255,260 @@ const releaseDecodedImageIfDone = (file) => {
 };
 
 const processOneJob = async (job) => {
+  if (job && job.__settled) return;
+
   const { file, info } = job;
   const fileName = originalNameByFile.get(file) || "image";
   const usesBitmapRegion = !!(info && info.useBitmapRegion);
+
+  if (usesBitmapRegion && failedBitmapFiles.has(file)) {
+    markJobSettled(job, "skipped", { reason: "file-already-failed" });
+    releaseDecodedImageIfDone(file);
+    return;
+  }
 
   let imgEl = null;
   if (!usesBitmapRegion) {
     imgEl = await getDecodedImage(file);
   }
 
-  const uploadOne = async ({ url, x, y, title, meta }) => {
-    const imgWidget = await createImageWithRetry({ url, x, y, title });
-    try {
-      await imgWidget.setMetadata(META_APP_ID, meta);
-    } catch (e) {
-      console.warn("setMetadata failed:", e);
-    }
-    allCreatedTiles.push(imgWidget);
-    uploadedBytesDone += url ? url.length : 0;
-    createdTiles += 1;
-    updateCreationProgress();
-    return imgWidget;
-  };
+  try {
+    const uploadOne = async ({ url, x, y, title, meta }) => {
+      const imgWidget = await createImageWithRetry(
+        { url, x, y, title },
+        { maxRetries: usesBitmapRegion ? BITMAP_FILE_CREATE_IMAGE_MAX_RETRIES : CREATE_IMAGE_MAX_RETRIES }
+      );
+      try {
+        await imgWidget.setMetadata(META_APP_ID, meta);
+      } catch (e) {
+        console.warn("setMetadata failed:", e);
+      }
+      allCreatedTiles.push(imgWidget);
+      uploadedBytesDone += url ? url.length : 0;
+      createdTiles += 1;
+      markJobSettled(job, "created");
+      return imgWidget;
+    };
 
-  const renderRegionToCanvas = async ({ sx, sy, sw, sh, outW, outH }) => {
+    const renderRegionToCanvas = async ({ sx, sy, sw, sh, outW, outH }) => {
+      if (usesBitmapRegion) {
+        return await renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH);
+      }
+
+      const canvas = document.createElement("canvas");
+      canvas.width = outW;
+      canvas.height = outH;
+      const ctx = get2dContextSrgb(canvas);
+      ctx.imageSmoothingEnabled = false;
+      ctx.clearRect(0, 0, outW, outH);
+      ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, outW, outH);
+      return canvas;
+    };
+
+    const uploadRegionWithSubslice = async (region) => {
+      const depth = region.depth || 0;
+      const canvas = await renderRegionToCanvas({
+        sx: region.sx,
+        sy: region.sy,
+        sw: region.sw,
+        sh: region.sh,
+        outW: region.w,
+        outH: region.h,
+      });
+
+      try {
+        const url = canvasToDataUrlUnderLimit(canvas);
+        const title = region.titleBase;
+        const centerX = region.left + region.w / 2;
+        const centerY = region.top + region.h / 2;
+        await uploadOne({
+          url,
+          x: centerX,
+          y: centerY,
+          title,
+          meta: region.metaBase,
+        });
+        return;
+      } catch (e) {
+        const isTooLarge = e && e.name === "DataUrlTooLargeError";
+        if (!isTooLarge) throw e;
+
+        const minSub = 512;
+        if (region.w <= minSub || region.h <= minSub) {
+          throw e;
+        }
+
+        const w2 = Math.ceil(region.w / 2);
+        const h2 = Math.ceil(region.h / 2);
+        const wR = region.w - w2;
+        const hB = region.h - h2;
+
+        const sw2 = Math.ceil(region.sw / 2);
+        const sh2 = Math.ceil(region.sh / 2);
+        const swR = region.sw - sw2;
+        const shB = region.sh - sh2;
+
+        totalTiles += 3;
+        updateCreationProgress();
+
+        const nextDepth = depth + 1;
+        const base = region.titleBase;
+
+        const mkMeta = (subRow, subCol) => ({
+          ...region.metaBase,
+          subSlice: true,
+          subDepth: nextDepth,
+          subRow,
+          subCol,
+          subW: region.w,
+          subH: region.h,
+        });
+
+        const parts = [
+          {
+            sx: region.sx,
+            sy: region.sy,
+            sw: sw2,
+            sh: sh2,
+            left: region.left,
+            top: region.top,
+            w: w2,
+            h: h2,
+            titleBase: `${base} s${nextDepth}a`,
+            metaBase: mkMeta(0, 0),
+            depth: nextDepth,
+          },
+          {
+            sx: region.sx + sw2,
+            sy: region.sy,
+            sw: swR,
+            sh: sh2,
+            left: region.left + w2,
+            top: region.top,
+            w: wR,
+            h: h2,
+            titleBase: `${base} s${nextDepth}b`,
+            metaBase: mkMeta(0, 1),
+            depth: nextDepth,
+          },
+          {
+            sx: region.sx,
+            sy: region.sy + sh2,
+            sw: sw2,
+            sh: shB,
+            left: region.left,
+            top: region.top + h2,
+            w: w2,
+            h: hB,
+            titleBase: `${base} s${nextDepth}c`,
+            metaBase: mkMeta(1, 0),
+            depth: nextDepth,
+          },
+          {
+            sx: region.sx + sw2,
+            sy: region.sy + sh2,
+            sw: swR,
+            sh: shB,
+            left: region.left + w2,
+            top: region.top + h2,
+            w: wR,
+            h: hB,
+            titleBase: `${base} s${nextDepth}d`,
+            metaBase: mkMeta(1, 1),
+            depth: nextDepth,
+          },
+        ];
+
+        for (const p of parts) {
+          await uploadRegionWithSubslice(p);
+        }
+      }
+    };
+
+    if (job.kind === "full") {
+      const titleBase = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${fileName}`;
+      const left = job.x - job.width / 2;
+      const top = job.y - job.height / 2;
+      await uploadRegionWithSubslice({
+        sx: 0,
+        sy: 0,
+        sw: job.width,
+        sh: job.height,
+        left,
+        top,
+        w: job.width,
+        h: job.height,
+        titleBase,
+        metaBase: {
+          fileName,
+          satCode: info.satCode,
+          briCode: info.briCode,
+        },
+        depth: 0,
+      });
+    } else {
+      const left = job.x - job.sw / 2;
+      const top = job.y - job.sh / 2;
+      await uploadRegionWithSubslice({
+        sx: job.sx,
+        sy: job.sy,
+        sw: job.sw,
+        sh: job.sh,
+        left,
+        top,
+        w: job.sw,
+        h: job.sh,
+        titleBase: job.title,
+        metaBase: {
+          fileName,
+          satCode: info.satCode,
+          briCode: info.briCode,
+          tileIndex: job.tileIndex,
+          tilesX: job.tilesX,
+          tilesY: job.tilesY,
+        },
+        depth: 0,
+      });
+    }
+  } catch (e) {
     if (usesBitmapRegion) {
-      return await renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH);
+      throw new FatalBitmapFileError(file, fileName, e);
     }
+    throw e;
+  } finally {
+    if (job.__settled || failedBitmapFiles.has(file)) {
+      releaseDecodedImageIfDone(file);
+    }
+  }
+};
 
-    const canvas = document.createElement("canvas");
-    canvas.width = outW;
-    canvas.height = outH;
-    const ctx = get2dContextSrgb(canvas);
-    ctx.imageSmoothingEnabled = false;
-    ctx.clearRect(0, 0, outW, outH);
-    ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, outW, outH);
-    return canvas;
-  };
+const runBitmapJobsWithIsolation = async (items, worker, concurrency) => {
+  const skippedJobsLocal = [];
 
-  const uploadRegionWithSubslice = async (region) => {
-    // region: {sx,sy,sw,sh, left, top, w, h, titleBase, metaBase, depth}
-    const depth = region.depth || 0;
-    const canvas = await renderRegionToCanvas({
-      sx: region.sx,
-      sy: region.sy,
-      sw: region.sw,
-      sh: region.sh,
-      outW: region.w,
-      outH: region.h,
-    });
+  await runWithConcurrency(items, async (item) => {
+    if (item.__settled) return;
+
+    if (failedBitmapFiles.has(item.file)) {
+      markJobSettled(item, "skipped", { reason: "file-failed-earlier" });
+      try { releaseDecodedImageIfDone(item.file); } catch (_) {}
+      return;
+    }
 
     try {
-      const url = canvasToDataUrlUnderLimit(canvas);
-      const title = region.titleBase;
-      const centerX = region.left + region.w / 2;
-      const centerY = region.top + region.h / 2;
-      await uploadOne({
-        url,
-        x: centerX,
-        y: centerY,
-        title,
-        meta: region.metaBase,
-      });
-      return;
+      await worker(item);
     } catch (e) {
-      const isTooLarge = e && e.name === "DataUrlTooLargeError";
-      if (!isTooLarge) throw e;
-
-      const minSub = 512;
-      if (region.w <= minSub || region.h <= minSub) {
-        throw e;
-      }
-
-      const w2 = Math.ceil(region.w / 2);
-      const h2 = Math.ceil(region.h / 2);
-      const wR = region.w - w2;
-      const hB = region.h - h2;
-
-      const sw2 = Math.ceil(region.sw / 2);
-      const sh2 = Math.ceil(region.sh / 2);
-      const swR = region.sw - sw2;
-      const shB = region.sh - sh2;
-
-      totalTiles += 3;
-      updateCreationProgress();
-
-      const nextDepth = depth + 1;
-      const base = region.titleBase;
-
-      const mkMeta = (subRow, subCol) => ({
-        ...region.metaBase,
-        subSlice: true,
-        subDepth: nextDepth,
-        subRow,
-        subCol,
-        subW: region.w,
-        subH: region.h,
-      });
-
-      const parts = [
-        {
-          sx: region.sx,
-          sy: region.sy,
-          sw: sw2,
-          sh: sh2,
-          left: region.left,
-          top: region.top,
-          w: w2,
-          h: h2,
-          titleBase: `${base} s${nextDepth}a`,
-          metaBase: mkMeta(0, 0),
-          depth: nextDepth,
-        },
-        {
-          sx: region.sx + sw2,
-          sy: region.sy,
-          sw: swR,
-          sh: sh2,
-          left: region.left + w2,
-          top: region.top,
-          w: wR,
-          h: h2,
-          titleBase: `${base} s${nextDepth}b`,
-          metaBase: mkMeta(0, 1),
-          depth: nextDepth,
-        },
-        {
-          sx: region.sx,
-          sy: region.sy + sh2,
-          sw: sw2,
-          sh: shB,
-          left: region.left,
-          top: region.top + h2,
-          w: w2,
-          h: hB,
-          titleBase: `${base} s${nextDepth}c`,
-          metaBase: mkMeta(1, 0),
-          depth: nextDepth,
-        },
-        {
-          sx: region.sx + sw2,
-          sy: region.sy + sh2,
-          sw: swR,
-          sh: shB,
-          left: region.left + w2,
-          top: region.top + h2,
-          w: wR,
-          h: hB,
-          titleBase: `${base} s${nextDepth}d`,
-          metaBase: mkMeta(1, 1),
-          depth: nextDepth,
-        },
-      ];
-
-      for (const p of parts) {
-        await uploadRegionWithSubslice(p);
-      }
+      markBitmapFileFailed(item.file, e, item);
+      skippedJobsLocal.push({ item, error: e });
+      markJobSettled(item, "skipped", { reason: "bitmap-file-failed" });
+      try { releaseDecodedImageIfDone(item.file); } catch (_) {}
     }
+  }, Math.max(1, concurrency));
+
+  return {
+    skippedJobs: skippedJobsLocal,
+    skippedCount: skippedJobsLocal.length,
+    failedFiles: Array.from(failedBitmapFiles.values()),
   };
-
-  if (job.kind === "full") {
-    const titleBase = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${fileName}`;
-    const left = job.x - job.width / 2;
-    const top = job.y - job.height / 2;
-    await uploadRegionWithSubslice({
-      sx: 0,
-      sy: 0,
-      sw: job.width,
-      sh: job.height,
-      left,
-      top,
-      w: job.width,
-      h: job.height,
-      titleBase,
-      metaBase: {
-        fileName,
-        satCode: info.satCode,
-        briCode: info.briCode,
-      },
-      depth: 0,
-    });
-  } else {
-    const left = job.x - job.sw / 2;
-    const top = job.y - job.sh / 2;
-    await uploadRegionWithSubslice({
-      sx: job.sx,
-      sy: job.sy,
-      sw: job.sw,
-      sh: job.sh,
-      left,
-      top,
-      w: job.sw,
-      h: job.sh,
-      titleBase: job.title,
-      metaBase: {
-        fileName,
-        satCode: info.satCode,
-        briCode: info.briCode,
-        tileIndex: job.tileIndex,
-        tilesX: job.tilesX,
-        tilesY: job.tilesY,
-      },
-      depth: 0,
-    });
-  }
-
-  releaseDecodedImageIfDone(file);
 };
 
 // ---- Upload stage concurrency (tile-based) ----
@@ -2398,7 +2518,29 @@ const initialConcurrency = UPLOAD_CONCURRENCY_INITIAL_LARGE; // always start at 
 const minConcurrency = UPLOAD_CONCURRENCY_MIN;
 const maxConcurrency = UPLOAD_CONCURRENCY_MAX;
 
-const adaptiveResult = await runWithAdaptiveConcurrency(tileJobs, async (job) => processOneJob(job), initialConcurrency, minConcurrency, maxConcurrency);
+const regularTileJobs = tileJobs.filter((job) => !(job.info && job.info.useBitmapRegion));
+const bitmapTileJobs = tileJobs.filter((job) => !!(job.info && job.info.useBitmapRegion));
+
+let adaptiveResult = { skippedJobs: [], skippedCount: 0, totalBatchErrors: 0 };
+if (regularTileJobs.length) {
+  adaptiveResult = await runWithAdaptiveConcurrency(
+    regularTileJobs,
+    async (job) => processOneJob(job),
+    initialConcurrency,
+    minConcurrency,
+    maxConcurrency
+  );
+}
+
+let bitmapResult = { skippedJobs: [], skippedCount: 0, failedFiles: [] };
+if (bitmapTileJobs.length) {
+  bitmapResult = await runBitmapJobsWithIsolation(
+    bitmapTileJobs,
+    async (job) => processOneJob(job),
+    BITMAP_JOB_CONCURRENCY
+  );
+}
+
 setProgress(totalTiles, totalTiles);
     if (setProgress.flush) setProgress.flush();
     setEtaText(null);
@@ -2456,7 +2598,7 @@ setProgress(totalTiles, totalTiles);
 
       console.groupCollapsed("[Image Align Tool] Import stats");
       console.log("Files (sources):", fileInfos.length);
-      console.log("Tiles:", { total: totalTiles, created: createdTiles });
+      console.log("Tiles:", { total: totalTiles, created: createdTiles, settled: settledTiles, skipped: skippedTiles });
       console.log("Time:", { preparing: fmtMs(prepMs), uploading: fmtMs(uploadMs), total: fmtMs(totalMs) });
       console.log("Upload:", {
         totalMB: Math.round(totalMB * 10) / 10,
@@ -2478,9 +2620,14 @@ setProgress(totalTiles, totalTiles);
         configuredMax: UPLOAD_CONCURRENCY_MAX,
       });
       console.log("Stitch/Slice reliability:", {
-        skippedTiles: (adaptiveResult && adaptiveResult.skippedCount) || 0,
+        skippedTiles: skippedTiles,
+        regularSkipped: (adaptiveResult && adaptiveResult.skippedCount) || 0,
+        bitmapFailedFiles: bitmapResult && bitmapResult.failedFiles ? bitmapResult.failedFiles.length : 0,
         batchErrors: (adaptiveResult && adaptiveResult.totalBatchErrors) || 0,
       });
+      if (bitmapResult && bitmapResult.failedFiles && bitmapResult.failedFiles.length) {
+        console.table(bitmapResult.failedFiles);
+      }
 
             if (concurrencyDecisions.length) {
         console.table(concurrencyDecisions.slice(-12));
