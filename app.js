@@ -1,11 +1,12 @@
 // app.js
-// Image Align Tool_36: Sorting + Stitch/Slice
+// Image Align Tool_37: Sorting + Stitch/Slice
 // Base: Image Align Tool_26
-// Changes in _36:
+// Changes in _37:
 // - Keep Miro notifications short and log details only to the console.
 // - Remove the hard per-side reject and use runtime bitmap-region probe instead.
 // - Slice large images via createImageBitmap(file, sx, sy, sw, sh) to avoid black tiles.
 // - Make Stage 1 large-image probe lightweight and bounded by timeout.
+// - Downgrade large-image probe failures from hard-stop to advisory and continue upload.
 // - Keep panel.html unchanged and preserve the rest of the current flow.
 
 const { board } = window.miro;
@@ -1225,6 +1226,7 @@ if (!setProgress._throttleWrapped) {
 
     const fileInfos = [];
     let anySliced = false;
+    let softProbeFailures = 0;
 
         startPrepEta();
 setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
@@ -1302,14 +1304,15 @@ try {
         numTiles = tilesX * tilesY;
       }
 
+      let probeFailedSoft = false;
       if (needsSlice) {
         setProgress(i + 1, prepTotalSteps, "Preparing files… (large image probe)", i + 1, filesArray.length);
         const probe = await probeBitmapSlicePath(file, width, height);
         console.log("[Image Align Tool] large image probe", probe.diag);
         if (!probe.ok) {
-          await notifyWarning(probe.message || "Large image probe failed", probe.diag);
-          try { imgEl.src = ""; } catch (e) {}
-          continue;
+          probeFailedSoft = true;
+          softProbeFailures += 1;
+          console.warn("[Image Align Tool] large image probe failed, continuing with bitmap slicing", probe.diag);
         }
         setProgress(i + 1, prepTotalSteps, "Preparing files…", i + 1, filesArray.length);
       }
@@ -1325,6 +1328,7 @@ try {
         satCode,
         needsSlice,
         useBitmapRegion: needsSlice,
+        probeFailedSoft,
         tilesX,
         tilesY,
         numTiles,
@@ -1338,6 +1342,10 @@ try {
       setProgress(0, 0, "Nothing to import.");
       setEtaText(null);
       return;
+    }
+
+    if (softProbeFailures > 0) {
+      await notifyWarning("Probe failed, trying upload", { softProbeFailures });
     }
 
     // 1) sorting
