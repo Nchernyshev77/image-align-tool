@@ -1,10 +1,10 @@
 // app.js
-// Image Align Tool_44: Sorting + Stitch/Slice
-// Base: Image Align Tool_43
-// Changes in _44:
-// - Restore renderBitmapRegionToCanvas for the huge-image bitmap path.
+// Image Align Tool_45: Sorting + Stitch/Slice
+// Base: Image Align Tool_44
+// Changes in _45:
+// - Route Firefox huge-image imports through decoded imgEl slicing instead of createImageBitmap regions.
 // - Keep huge-image mode at 2048 tile size and concurrency 1.
-// - Fix Firefox 32k import path so it reaches real bitmap slicing instead of failing early.
+// - Avoid Firefox region-bitmap failures like "object is not, or is no longer, usable".
 
 const { board } = window.miro;
 
@@ -42,6 +42,7 @@ const BITMAP_FILE_CREATE_IMAGE_MAX_RETRIES = 1;
 const BITMAP_FILE_MAX_JOB_ATTEMPTS = 1;
 const TOO_LARGE_IMPORT_MESSAGE = "Image is too large for this browser";
 const FAILURE_UI_COLOR = "#c62828";
+const IS_FIREFOX = /firefox/i.test((navigator && navigator.userAgent) || "");
 
 // ---------- авто-детект лимита по стороне через WebGL ----------
 
@@ -1297,6 +1298,7 @@ try {
         height > LARGE_IMAGE_BITMAP_MIN_DIM ||
         previewNumTiles >= LARGE_IMAGE_BITMAP_MIN_TILES
       );
+      const useHugeDecodedPath = useBitmapRegion && IS_FIREFOX;
 
       if (useBitmapRegion) {
         sliceTileSize = LARGE_IMAGE_BITMAP_TILE_SIZE;
@@ -1308,7 +1310,7 @@ try {
         numTiles = tilesX * tilesY;
       }
 
-      if (useBitmapRegion && typeof createImageBitmap !== "function") {
+      if (useBitmapRegion && !useHugeDecodedPath && typeof createImageBitmap !== "function") {
         hugePathUnsupportedFailures.push({
           fileName: file.name,
           width,
@@ -1340,6 +1342,7 @@ try {
           tilesY,
           numTiles,
           sliceTileSize,
+          renderPath: useHugeDecodedPath ? "firefox-decoded-image" : "bitmap-region",
         });
       }
 
@@ -1354,6 +1357,7 @@ try {
         satCode,
         needsSlice,
         useBitmapRegion,
+        useHugeDecodedPath,
         probeFailedSoft: false,
         tilesX,
         tilesY,
@@ -2290,6 +2294,7 @@ const processOneJob = async (job) => {
   const { file, info } = job;
   const fileName = originalNameByFile.get(file) || "image";
   const usesBitmapRegion = !!(info && info.useBitmapRegion);
+  const usesHugeDecodedPath = !!(info && info.useHugeDecodedPath);
 
   if (usesBitmapRegion && failedBitmapFiles.has(file)) {
     markJobSettled(job, "skipped", { reason: "file-already-failed" });
@@ -2298,7 +2303,7 @@ const processOneJob = async (job) => {
   }
 
   let imgEl = null;
-  if (!usesBitmapRegion) {
+  if (!usesBitmapRegion || usesHugeDecodedPath) {
     imgEl = await getDecodedImage(file);
   }
 
@@ -2321,7 +2326,7 @@ const processOneJob = async (job) => {
     };
 
     const renderRegionToCanvas = async ({ sx, sy, sw, sh, outW, outH }) => {
-      if (usesBitmapRegion) {
+      if (usesBitmapRegion && !usesHugeDecodedPath) {
         return await renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH);
       }
 
