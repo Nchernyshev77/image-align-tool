@@ -1,5 +1,5 @@
 // app.js
-// Image Align Tool_39: Sorting + Stitch/Slice
+// Image Align Tool_40: Sorting + Stitch/Slice
 // Base: Image Align Tool_26
 // Changes in _39:
 // - Restore the fast legacy slicing path for normal images (including typical <=16k imports).
@@ -41,6 +41,7 @@ const LARGE_IMAGE_PROBE_MIN_TILES = 36;
 const BITMAP_JOB_CONCURRENCY = 2;
 const BITMAP_FILE_CREATE_IMAGE_MAX_RETRIES = 1;
 const BITMAP_FILE_MAX_JOB_ATTEMPTS = 1;
+const TOO_LARGE_IMPORT_MESSAGE = "Image is too large for this browser";
 
 // ---------- авто-детект лимита по стороне через WebGL ----------
 
@@ -1243,6 +1244,7 @@ if (!setProgress._throttleWrapped) {
     const fileInfos = [];
     let anySliced = false;
     let softProbeFailures = 0;
+    const tooLargeProbeFailures = [];
 
         startPrepEta();
 setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
@@ -1340,7 +1342,20 @@ try {
         if (!probe.ok) {
           probeFailedSoft = true;
           softProbeFailures += 1;
-          console.warn("[Image Align Tool] large image probe failed, continuing with bitmap slicing", probe.diag);
+          tooLargeProbeFailures.push({
+            fileName: file.name,
+            width,
+            height,
+            tilesX,
+            tilesY,
+            numTiles,
+            stopReason: probe && probe.diag ? probe.diag.stopReason : null,
+            error: probe && probe.diag ? probe.diag.error : null,
+          });
+          console.warn("[Image Align Tool] large image probe failed; file skipped", probe.diag);
+          try { imgEl.src = ""; } catch (e) {}
+          setProgress(i + 1, prepTotalSteps, "Preparing files…", i + 1, filesArray.length);
+          continue;
         }
         setProgress(i + 1, prepTotalSteps, "Preparing files…", i + 1, filesArray.length);
       }
@@ -1367,12 +1382,23 @@ try {
     let prepDone = filesArray.length;
 
     if (!fileInfos.length) {
+      if (tooLargeProbeFailures.length > 0) {
+        setProgress(0, 0, "Image is too large");
+        setEtaText(null);
+        await notifyWarning(TOO_LARGE_IMPORT_MESSAGE, { failedFiles: tooLargeProbeFailures });
+        return;
+      }
       setProgress(0, 0, "Nothing to import.");
       setEtaText(null);
       return;
     }
 
-    if (softProbeFailures > 0) {
+    if (tooLargeProbeFailures.length > 0) {
+      await notifyWarning(
+        tooLargeProbeFailures.length === 1 ? TOO_LARGE_IMPORT_MESSAGE : "Some images are too large",
+        { failedFiles: tooLargeProbeFailures }
+      );
+    } else if (softProbeFailures > 0) {
       await notifyWarning("Probe failed, trying upload", { softProbeFailures });
     }
 
