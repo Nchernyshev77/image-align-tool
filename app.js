@@ -1,12 +1,11 @@
 // app.js
-// Image Align Tool_38: Sorting + Stitch/Slice
+// Image Align Tool_39: Sorting + Stitch/Slice
 // Base: Image Align Tool_26
-// Changes in _38:
-// - Use bitmap-region slicing only for truly huge images, keep smaller sliced files on the faster legacy path.
-// - Isolate huge-file upload failures so they do not slow down smaller images.
-// - Run regular jobs before bitmap-region jobs to keep normal imports fast.
-// - Fail huge files fast on the first real tile error instead of long retry chains.
-// - Keep Miro notifications short and log detailed diagnostics to the console.
+// Changes in _39:
+// - Restore the fast legacy slicing path for normal images (including typical <=16k imports).
+// - Use bitmap-region slicing only for truly huge files.
+// - Track per-file failures and show a short final UI message when some files were not imported.
+// - Keep detailed failure diagnostics in the console.
 
 const { board } = window.miro;
 
@@ -35,9 +34,10 @@ const BITMAP_SLICE_PROBE_TILE = 1024;
 const BITMAP_SLICE_PROBE_OUTPUT = 512;
 const BITMAP_SLICE_PROBE_TIMEOUT_MS = 8000;
 const LARGE_IMAGE_DIMENSION_WARNING = 16384;
-const LARGE_IMAGE_BITMAP_MIN_DIM = 16384;
-const LARGE_IMAGE_PROBE_MIN_DIM = 20000;
-const LARGE_IMAGE_PROBE_MIN_TILES = 16;
+const LARGE_IMAGE_BITMAP_MIN_DIM = 24000;
+const LARGE_IMAGE_BITMAP_MIN_TILES = 36;
+const LARGE_IMAGE_PROBE_MIN_DIM = 24000;
+const LARGE_IMAGE_PROBE_MIN_TILES = 36;
 const BITMAP_JOB_CONCURRENCY = 2;
 const BITMAP_FILE_CREATE_IMAGE_MAX_RETRIES = 1;
 const BITMAP_FILE_MAX_JOB_ATTEMPTS = 1;
@@ -1321,10 +1321,9 @@ try {
       }
 
       const useBitmapRegion = needsSlice && (
-        width > MAX_SLICE_DIM ||
-        height > MAX_SLICE_DIM ||
-        width >= LARGE_IMAGE_BITMAP_MIN_DIM ||
-        height >= LARGE_IMAGE_BITMAP_MIN_DIM
+        width > LARGE_IMAGE_BITMAP_MIN_DIM ||
+        height > LARGE_IMAGE_BITMAP_MIN_DIM ||
+        numTiles >= LARGE_IMAGE_BITMAP_MIN_TILES
       );
 
       const shouldRunLargeProbe = useBitmapRegion && (
@@ -1491,6 +1490,23 @@ let slotCentersByFile = null;
     let settledTiles = 0;
     let skippedTiles = 0;
     const failedBitmapFiles = new Map();
+    const failedSourceFiles = new Map();
+
+    const recordFailedSourceFile = (fileName, reason, details) => {
+      const key = fileName || "image";
+      if (!failedSourceFiles.has(key)) {
+        failedSourceFiles.set(key, {
+          fileName: key,
+          reason: reason || "import-failed",
+          details: details || null,
+        });
+      }
+      console.warn("[Image Align Tool] source file failed", {
+        fileName: key,
+        reason,
+        details,
+      });
+    };
 
     const markJobSettled = (job, status, details) => {
       if (job && job.__settled) return;
@@ -1513,12 +1529,15 @@ let slotCentersByFile = null;
     const markBitmapFileFailed = (file, error, job) => {
       if (!file) return;
       if (!failedBitmapFiles.has(file)) {
+        const failedFileName = (job && job.file && job.file.name) || (file && file.name) || "image";
+        const failedMessage = error && error.message ? error.message : String(error || "bitmap file failed");
         failedBitmapFiles.set(file, {
-          fileName: (job && job.file && job.file.name) || (file && file.name) || "image",
-          message: error && error.message ? error.message : String(error || "bitmap file failed"),
+          fileName: failedFileName,
+          message: failedMessage,
         });
+        recordFailedSourceFile(failedFileName, "bitmap-file-failed", failedMessage);
         console.warn("[Image Align Tool] bitmap file failed; skipping remaining tiles", {
-          fileName: (job && job.file && job.file.name) || (file && file.name) || "image",
+          fileName: failedFileName,
           error,
         });
       }
@@ -2637,11 +2656,35 @@ setProgress(totalTiles, totalTiles);
       console.warn("[Image Align Tool] stats failed:", e);
     }
 
-    const skippedCount = (adaptiveResult && adaptiveResult.skippedCount) || 0;
-    const importedMsg = `Imported ${fileInfos.length} source image${
-      fileInfos.length === 1 ? "" : "s"
-    } into ${totalTiles} tile${totalTiles === 1 ? "" : "s"}.`;
-    if (skippedCount > 0) {
+    const skippedCount = ((adaptiveResult && adaptiveResult.skippedCount) || 0) + ((bitmapResult && bitmapResult.skippedCount) || 0);
+    const failedFileCount = failedSourceFiles.size;
+    const importedFileCount = Math.max(0, fileInfos.length - failedFileCount);
+
+    if (failedSourceFiles.size) {
+      console.table(Array.from(failedSourceFiles.values()));
+    }
+
+    if (createdTiles <= 0 && failedFileCount > 0) {
+      await notifyError(
+        `Failed to import ${failedFileCount} file${failedFileCount === 1 ? "" : "s"}`,
+        {
+          failedFiles: Array.from(failedSourceFiles.values()),
+          totalTiles,
+          skippedCount,
+        }
+      );
+    } else if (failedFileCount > 0) {
+      await notifyWarning(
+        `Failed to import ${failedFileCount} file${failedFileCount === 1 ? "" : "s"}`,
+        {
+          failedFiles: Array.from(failedSourceFiles.values()),
+          importedFileCount,
+          createdTiles,
+          totalTiles,
+          skippedCount,
+        }
+      );
+    } else if (skippedCount > 0) {
       await notifyWarning("Import completed with skipped tiles", {
         importedSources: fileInfos.length,
         totalTiles,
