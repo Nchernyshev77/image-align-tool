@@ -1,10 +1,11 @@
 // app.js
-// Image Align Tool_34: Sorting + Stitch/Slice
-// Base: Image Align Tool_33
-// Changes in _34:
-// - Make the large-image probe validate the real full-tile JPEG path.
-// - Re-decode the encoded probe tile and compare it with the source preview.
-// - Stop import when encode/decode of a real tile becomes black/empty/corrupted.
+// Image Align Tool_35: Sorting + Stitch/Slice
+// Base: Image Align Tool_26
+// Changes in _35:
+// - Keep Miro notifications short and log details only to the console.
+// - Remove the hard per-side reject and use runtime bitmap-region probe instead.
+// - Slice large images via createImageBitmap(file, sx, sy, sw, sh) to avoid black tiles.
+// - Keep panel.html unchanged and preserve the rest of the current flow.
 
 const { board } = window.miro;
 
@@ -28,11 +29,9 @@ const UPLOAD_CONCURRENCY_MIN = 1;
 const UPLOAD_CONCURRENCY_MAX = 5;
 const UPLOAD_CONCURRENCY_INITIAL_LARGE = 4;
 const META_APP_ID = "image-align-tool";
-const MAX_NOTIFICATION_MESSAGE_LEN = 80;
-const LARGE_IMAGE_PROBE_REF_SIZE = 128;
-const LARGE_IMAGE_PROBE_BLACK_LUMA_MAX = 1.5;
-const LARGE_IMAGE_PROBE_SIGNAL_LUMA_MIN = 6;
-const LARGE_IMAGE_PROBE_DIFF_MIN = 8;
+const MAX_NOTIFICATION_MESSAGE_LENGTH = 80;
+const BITMAP_SLICE_PROBE_TILE = 2048;
+const LARGE_IMAGE_DIMENSION_WARNING = 16384;
 
 // ---------- авто-детект лимита по стороне через WebGL ----------
 
@@ -56,40 +55,6 @@ function detectMaxSliceDim() {
     console.warn("Slice: failed to detect MAX_TEXTURE_SIZE, using fallback.", e);
   }
 }
-
-function normalizeNotificationMessage(message) {
-  const raw = String(message ?? "").replace(/\s+/g, " ").trim();
-  if (!raw) return "Done";
-  if (raw.length <= MAX_NOTIFICATION_MESSAGE_LEN) return raw;
-  return `${raw.slice(0, MAX_NOTIFICATION_MESSAGE_LEN - 1).trimEnd()}…`;
-}
-
-async function showSafeNotification(methodName, message, details) {
-  const safeMessage = normalizeNotificationMessage(message);
-  if (details !== undefined) {
-    console.log(`[Image Align Tool] ${methodName}:`, details);
-    if (safeMessage !== String(message ?? "").replace(/\s+/g, " ").trim()) {
-      console.log(`[Image Align Tool] ${methodName} original message:`, message);
-    }
-  }
-
-  const fn = board && board.notifications && board.notifications[methodName];
-  if (typeof fn !== "function") return;
-  await fn.call(board.notifications, safeMessage);
-}
-
-function notifyInfo(message, details) {
-  return showSafeNotification("showInfo", message, details);
-}
-
-function notifyWarning(message, details) {
-  return showSafeNotification("showWarning", message, details);
-}
-
-function notifyError(message, details) {
-  return showSafeNotification("showError", message, details);
-}
-
 
 // ---------- helpers: titles & numbers ----------
 
@@ -190,6 +155,206 @@ class DataUrlTooLargeError extends Error {
     this.length = length;
     this.limit = limit;
   }
+}
+
+
+function clampNotificationMessage(message, fallback = "Operation failed") {
+  const raw = (message == null ? "" : String(message)).replace(/\s+/g, " ").trim();
+  const safe = raw || fallback;
+  if (safe.length <= MAX_NOTIFICATION_MESSAGE_LENGTH) return safe;
+  return safe.slice(0, MAX_NOTIFICATION_MESSAGE_LENGTH - 1).trimEnd() + "…";
+}
+
+async function notify(kind, message, details) {
+  const safeMessage = clampNotificationMessage(message);
+  try {
+    if (details !== undefined) {
+      const logger = kind === "showError" ? console.error : kind === "showWarning" ? console.warn : console.log;
+      logger("[Image Align Tool] notification:", safeMessage, details);
+    }
+    await board.notifications[kind](safeMessage);
+  } catch (e) {
+    console.error("[Image Align Tool] notification failed", {
+      kind,
+      safeMessage,
+      details,
+      error: e,
+    });
+  }
+}
+
+function notifyInfo(message, details) {
+  return notify("showInfo", message, details);
+}
+
+function notifyWarning(message, details) {
+  return notify("showWarning", message, details);
+}
+
+function notifyError(message, details) {
+  return notify("showError", message, details);
+}
+
+function createProbePoints(width, height) {
+  const points = [
+    { x: 0, y: 0 },
+    { x: Math.max(0, width - 1), y: 0 },
+    { x: 0, y: Math.max(0, height - 1) },
+    { x: Math.max(0, width - 1), y: Math.max(0, height - 1) },
+    { x: Math.floor(width / 2), y: Math.floor(height / 2) },
+  ];
+  const seen = new Set();
+  return points.filter((p) => {
+    const key = `${p.x}:${p.y}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function getCanvasStats(canvas) {
+  const statsCanvas = document.createElement("canvas");
+  statsCanvas.width = 64;
+  statsCanvas.height = 64;
+  const statsCtx = get2dContextSrgb(statsCanvas);
+  statsCtx.imageSmoothingEnabled = false;
+  statsCtx.clearRect(0, 0, 64, 64);
+  statsCtx.drawImage(canvas, 0, 0, 64, 64);
+
+  const data = statsCtx.getImageData(0, 0, 64, 64).data;
+  let minLuma = 255;
+  let maxLuma = 0;
+  let sumLuma = 0;
+  let alphaZero = 0;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const a = data[i + 3];
+    const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    if (luma < minLuma) minLuma = luma;
+    if (luma > maxLuma) maxLuma = luma;
+    sumLuma += luma;
+    if (a === 0) alphaZero += 1;
+  }
+
+  const pixelCount = data.length / 4;
+  return {
+    minLuma: Number(minLuma.toFixed(2)),
+    maxLuma: Number(maxLuma.toFixed(2)),
+    avgLuma: Number((sumLuma / pixelCount).toFixed(2)),
+    alphaZero,
+    pixelCount,
+  };
+}
+
+async function decodeImageFromFile(file) {
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    return await loadImage(objectUrl);
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+async function renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH) {
+  if (typeof createImageBitmap !== "function") {
+    throw new Error("createImageBitmap is not available");
+  }
+
+  const bitmap = await createImageBitmap(file, sx, sy, sw, sh);
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = outW;
+    canvas.height = outH;
+    const ctx = get2dContextSrgb(canvas);
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, outW, outH);
+    ctx.drawImage(bitmap, 0, 0, outW, outH);
+    return canvas;
+  } finally {
+    if (bitmap && typeof bitmap.close === "function") {
+      bitmap.close();
+    }
+  }
+}
+
+async function probeBitmapSlicePath(file, width, height) {
+  const diag = {
+    fileName: file && file.name ? file.name : "image",
+    width,
+    height,
+    maxTextureSize: MAX_SLICE_DIM,
+    decodeOk: false,
+    bitmapRegionOk: false,
+    drawOk: false,
+    encodeOk: false,
+    stats: [],
+    stopReason: null,
+  };
+
+  try {
+    const imgEl = await decodeImageFromFile(file);
+    diag.decodeOk = true;
+    try {
+      imgEl.src = "";
+    } catch (_) {}
+  } catch (e) {
+    diag.stopReason = "decode_failed";
+    diag.error = String(e && e.message ? e.message : e);
+    return { ok: false, diag, message: "Cannot decode image" };
+  }
+
+  const probeSize = Math.min(BITMAP_SLICE_PROBE_TILE, width, height);
+  const points = createProbePoints(width - probeSize + 1, height - probeSize + 1)
+    .slice(0, 3)
+    .map((p) => ({
+      sx: Math.min(Math.max(0, p.x), Math.max(0, width - probeSize)),
+      sy: Math.min(Math.max(0, p.y), Math.max(0, height - probeSize)),
+      sw: probeSize,
+      sh: probeSize,
+    }));
+
+  try {
+    for (const region of points) {
+      const canvas = await renderBitmapRegionToCanvas(
+        file,
+        region.sx,
+        region.sy,
+        region.sw,
+        region.sh,
+        region.sw,
+        region.sh
+      );
+
+      diag.bitmapRegionOk = true;
+      diag.drawOk = true;
+
+      const stats = getCanvasStats(canvas);
+      diag.stats.push({ ...region, ...stats });
+
+      const preview = document.createElement("canvas");
+      preview.width = 64;
+      preview.height = 64;
+      const previewCtx = get2dContextSrgb(preview);
+      previewCtx.imageSmoothingEnabled = false;
+      previewCtx.clearRect(0, 0, 64, 64);
+      previewCtx.drawImage(canvas, 0, 0, 64, 64);
+
+      const dataUrl = preview.toDataURL("image/jpeg", 0.8);
+      if (!dataUrl || !dataUrl.startsWith("data:image/jpeg")) {
+        throw new Error("preview_encode_failed");
+      }
+      diag.encodeOk = true;
+    }
+  } catch (e) {
+    diag.stopReason = "bitmap_slice_failed";
+    diag.error = String(e && e.message ? e.message : e);
+    return { ok: false, diag, message: "Large image probe failed" };
+  }
+
+  return { ok: true, diag };
 }
 
 /**
@@ -564,9 +729,9 @@ async function handleSortingSubmit(event) {
     }
 
     if (sortMode === "color") {
-      await notifyInfo("Sorting by color…");
+      await notifyInfo("Sorting by color");
     } else if (sortMode === "size") {
-      await notifyInfo("Sorting by size…");
+      await notifyInfo("Sorting by size");
     }
 
     const orderedImages = await orderImagesForSorting(images, {
@@ -583,10 +748,13 @@ async function handleSortingSubmit(event) {
       startCorner,
     });
 
-    await notifyInfo(`Aligned ${orderedImages.length} image${orderedImages.length === 1 ? "" : "s"}`);
+    await notifyInfo(
+      `Aligned ${orderedImages.length} image${orderedImages.length === 1 ? "" : "s"}`,
+      { alignedImages: orderedImages.length }
+    );
   } catch (err) {
     console.error(err);
-    await notifyError("Sorting failed", err);
+    await notifyError("Align images failed", err);
   }
 }
 
@@ -658,335 +826,6 @@ function canvasToDataUrlUnderLimit(canvas) {
   return dataUrl;
 }
 
-function buildLargeImageProbeSamples(width, height) {
-  const tileW = Math.max(1, Math.min(SLICE_TILE_SIZE, width));
-  const tileH = Math.max(1, Math.min(SLICE_TILE_SIZE, height));
-  const positions = [
-    { label: "top-left", x: 0, y: 0 },
-    {
-      label: "center",
-      x: Math.max(0, Math.floor((width - tileW) / 2)),
-      y: Math.max(0, Math.floor((height - tileH) / 2)),
-    },
-    {
-      label: "bottom-right",
-      x: Math.max(0, width - tileW),
-      y: Math.max(0, height - tileH),
-    },
-  ];
-
-  const unique = [];
-  const seen = new Set();
-  for (const pos of positions) {
-    const key = `${pos.x}:${pos.y}:${tileW}:${tileH}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push({
-      label: pos.label,
-      sx: pos.x,
-      sy: pos.y,
-      sw: tileW,
-      sh: tileH,
-      outW: tileW,
-      outH: tileH,
-    });
-  }
-  return unique;
-}
-
-function summarizeProbePreviewCanvas(canvas) {
-  const ctx = canvas.getContext("2d");
-  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const data = imageData.data;
-  const pixels = data.length / 4;
-
-  let alphaSum = 0;
-  let rgbSum = 0;
-  let lumaSum = 0;
-  let nonZeroPixels = 0;
-
-  for (let i = 0; i < data.length; i += 4) {
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
-    const a = data[i + 3];
-
-    alphaSum += a;
-    rgbSum += r + g + b;
-
-    const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    lumaSum += luma;
-
-    if (r > 0 || g > 0 || b > 0 || a > 0) {
-      nonZeroPixels += 1;
-    }
-  }
-
-  return {
-    pixels,
-    alphaSum,
-    rgbSum,
-    nonZeroPixels,
-    avgLuma: pixels ? lumaSum / pixels : 0,
-    avgRgb: pixels ? rgbSum / (pixels * 3) : 0,
-  };
-}
-
-function compareProbePreviewCanvases(aCanvas, bCanvas) {
-  const aCtx = aCanvas.getContext("2d");
-  const bCtx = bCanvas.getContext("2d");
-  const aData = aCtx.getImageData(0, 0, aCanvas.width, aCanvas.height).data;
-  const bData = bCtx.getImageData(0, 0, bCanvas.width, bCanvas.height).data;
-
-  let totalDiff = 0;
-  let compared = 0;
-
-  for (let i = 0; i < aData.length; i += 4) {
-    totalDiff += Math.abs(aData[i] - bData[i]);
-    totalDiff += Math.abs(aData[i + 1] - bData[i + 1]);
-    totalDiff += Math.abs(aData[i + 2] - bData[i + 2]);
-    compared += 3;
-  }
-
-  return {
-    meanAbsDiff: compared ? totalDiff / compared : 0,
-  };
-}
-
-function makeProbePreviewFromSource(imgEl, sample) {
-  const canvas = document.createElement("canvas");
-  canvas.width = LARGE_IMAGE_PROBE_REF_SIZE;
-  canvas.height = LARGE_IMAGE_PROBE_REF_SIZE;
-  const ctx = get2dContextSrgb(canvas);
-  ctx.imageSmoothingEnabled = false;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(
-    imgEl,
-    sample.sx,
-    sample.sy,
-    sample.sw,
-    sample.sh,
-    0,
-    0,
-    canvas.width,
-    canvas.height
-  );
-  return canvas;
-}
-
-function makeProbePreviewFromCanvas(sourceCanvas) {
-  const canvas = document.createElement("canvas");
-  canvas.width = LARGE_IMAGE_PROBE_REF_SIZE;
-  canvas.height = LARGE_IMAGE_PROBE_REF_SIZE;
-  const ctx = get2dContextSrgb(canvas);
-  ctx.imageSmoothingEnabled = false;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(sourceCanvas, 0, 0, sourceCanvas.width, sourceCanvas.height, 0, 0, canvas.width, canvas.height);
-  return canvas;
-}
-
-async function probeLargeImageRuntime(imgEl, { fileName, width, height, maxTextureSize }) {
-  const diag = {
-    fileName,
-    width,
-    height,
-    maxTextureSize,
-    decodeOk: true,
-    probeRenderOk: false,
-    probeEncodeOk: false,
-    stopReason: null,
-    samples: [],
-  };
-
-  const summarizeForDiag = (summary) => ({
-    avgLuma: Number(summary.avgLuma.toFixed(2)),
-    avgRgb: Number(summary.avgRgb.toFixed(2)),
-    nonZeroPixels: summary.nonZeroPixels,
-    alphaSum: summary.alphaSum,
-  });
-
-  const isBlackOrEmptyMismatch = (referenceSummary, candidateSummary, diff) => {
-    const referenceHasVisibleSignal =
-      referenceSummary.alphaSum > 0 && referenceSummary.avgLuma >= LARGE_IMAGE_PROBE_SIGNAL_LUMA_MIN;
-    const candidateLooksBlack =
-      candidateSummary.alphaSum > 0 &&
-      candidateSummary.avgLuma <= LARGE_IMAGE_PROBE_BLACK_LUMA_MAX &&
-      candidateSummary.nonZeroPixels > 0;
-    const candidateLooksEmpty =
-      candidateSummary.alphaSum === 0 || candidateSummary.nonZeroPixels === 0;
-    const mismatch = diff >= LARGE_IMAGE_PROBE_DIFF_MIN;
-
-    if ((referenceHasVisibleSignal && candidateLooksBlack && mismatch) ||
-        (referenceSummary.alphaSum > 0 && candidateLooksEmpty)) {
-      return {
-        failed: true,
-        kind: candidateLooksEmpty ? "empty" : "black",
-      };
-    }
-
-    return {
-      failed: false,
-      kind: null,
-    };
-  };
-
-  console.groupCollapsed(`[Image Align Tool] Large image probe: ${fileName}`);
-  console.log("Image:", { width, height, maxTextureSize, tileSize: SLICE_TILE_SIZE });
-
-  try {
-    const samples = buildLargeImageProbeSamples(width, height);
-
-    for (const sample of samples) {
-      const sampleDiag = {
-        label: sample.label,
-        sx: sample.sx,
-        sy: sample.sy,
-        sw: sample.sw,
-        sh: sample.sh,
-        outW: sample.outW,
-        outH: sample.outH,
-      };
-
-      try {
-        const referencePreview = makeProbePreviewFromSource(imgEl, sample);
-        const referenceSummary = summarizeProbePreviewCanvas(referencePreview);
-        sampleDiag.reference = summarizeForDiag(referenceSummary);
-
-        const tileCanvas = document.createElement("canvas");
-        tileCanvas.width = sample.outW;
-        tileCanvas.height = sample.outH;
-        const tileCtx = get2dContextSrgb(tileCanvas);
-        if (!tileCtx) {
-          sampleDiag.ok = false;
-          sampleDiag.error = "2d-context-unavailable";
-          diag.samples.push(sampleDiag);
-          diag.stopReason = "2d-context-unavailable";
-          return { ok: false, diag };
-        }
-
-        tileCtx.imageSmoothingEnabled = false;
-        tileCtx.clearRect(0, 0, tileCanvas.width, tileCanvas.height);
-        tileCtx.drawImage(
-          imgEl,
-          sample.sx,
-          sample.sy,
-          sample.sw,
-          sample.sh,
-          0,
-          0,
-          tileCanvas.width,
-          tileCanvas.height
-        );
-
-        const tilePreview = makeProbePreviewFromCanvas(tileCanvas);
-        const tileSummary = summarizeProbePreviewCanvas(tilePreview);
-        const renderComparison = compareProbePreviewCanvases(referencePreview, tilePreview);
-        sampleDiag.tile = summarizeForDiag(tileSummary);
-        sampleDiag.renderMeanAbsDiff = Number(renderComparison.meanAbsDiff.toFixed(2));
-
-        const renderCheck = isBlackOrEmptyMismatch(
-          referenceSummary,
-          tileSummary,
-          renderComparison.meanAbsDiff
-        );
-        if (renderCheck.failed) {
-          sampleDiag.ok = false;
-          sampleDiag.error = renderCheck.kind === "empty" ? "tile-render-empty" : "tile-render-black";
-          diag.samples.push(sampleDiag);
-          diag.stopReason = renderCheck.kind === "empty" ? "probe-empty-tile" : "probe-black-tile";
-          console.warn("Large image probe tile render mismatch:", sampleDiag);
-          return { ok: false, diag };
-        }
-
-        let encodedUrl;
-        try {
-          encodedUrl = canvasToDataUrlUnderLimit(tileCanvas);
-          diag.probeEncodeOk = typeof encodedUrl === "string" && encodedUrl.startsWith("data:image/jpeg");
-          if (!diag.probeEncodeOk) {
-            sampleDiag.ok = false;
-            sampleDiag.error = "probe-encode-empty";
-            diag.samples.push(sampleDiag);
-            diag.stopReason = "probe-encode-empty";
-            return { ok: false, diag };
-          }
-          sampleDiag.encodedLength = encodedUrl.length;
-        } catch (e) {
-          sampleDiag.ok = false;
-          sampleDiag.error = e && e.message ? e.message : String(e);
-          diag.samples.push(sampleDiag);
-          diag.stopReason = "probe-encode-failed";
-          console.warn("Large image probe full-tile encode failed:", e);
-          return { ok: false, diag };
-        }
-
-        try {
-          const encodedImgEl = await loadImage(encodedUrl);
-          const encodedPreview = makeProbePreviewFromSource(encodedImgEl, {
-            sx: 0,
-            sy: 0,
-            sw: encodedImgEl.naturalWidth || encodedImgEl.width,
-            sh: encodedImgEl.naturalHeight || encodedImgEl.height,
-          });
-          const encodedSummary = summarizeProbePreviewCanvas(encodedPreview);
-          const encodedComparison = compareProbePreviewCanvases(referencePreview, encodedPreview);
-          sampleDiag.encoded = summarizeForDiag(encodedSummary);
-          sampleDiag.encodedMeanAbsDiff = Number(encodedComparison.meanAbsDiff.toFixed(2));
-
-          const encodedCheck = isBlackOrEmptyMismatch(
-            referenceSummary,
-            encodedSummary,
-            encodedComparison.meanAbsDiff
-          );
-          if (encodedCheck.failed) {
-            sampleDiag.ok = false;
-            sampleDiag.error = encodedCheck.kind === "empty" ? "tile-encode-empty" : "tile-encode-black";
-            diag.samples.push(sampleDiag);
-            diag.stopReason = encodedCheck.kind === "empty" ? "probe-encoded-empty" : "probe-encoded-black";
-            console.warn("Large image probe encoded tile mismatch:", sampleDiag);
-            return { ok: false, diag };
-          }
-
-          try { encodedImgEl.src = ""; } catch (_) {}
-        } catch (e) {
-          sampleDiag.ok = false;
-          sampleDiag.error = e && e.message ? e.message : String(e);
-          diag.samples.push(sampleDiag);
-          diag.stopReason = "probe-encoded-decode-failed";
-          console.warn("Large image probe encoded tile decode failed:", e);
-          return { ok: false, diag };
-        }
-
-        sampleDiag.ok = true;
-        diag.samples.push(sampleDiag);
-      } catch (e) {
-        sampleDiag.ok = false;
-        sampleDiag.error = e && e.message ? e.message : String(e);
-        diag.samples.push(sampleDiag);
-        diag.stopReason = "probe-render-failed";
-        console.warn("Large image probe render failed:", { sample, error: e });
-        return { ok: false, diag };
-      }
-    }
-
-    diag.probeRenderOk = true;
-    diag.probeEncodeOk = true;
-    diag.stopReason = null;
-    return { ok: true, diag };
-  } catch (e) {
-    diag.stopReason = "probe-exception";
-    console.warn("Large image probe crashed:", e);
-    return { ok: false, diag, error: e };
-  } finally {
-    console.log("Probe result:", {
-      decodeOk: diag.decodeOk,
-      probeRenderOk: diag.probeRenderOk,
-      probeEncodeOk: diag.probeEncodeOk,
-      stopReason: diag.stopReason,
-    });
-    if (diag.samples.length) console.table(diag.samples);
-    console.groupEnd();
-  }
-}
 
 
 function computeVariableSlotCenters(
@@ -1305,7 +1144,7 @@ if (!setProgress._throttleWrapped) {
     const files = input ? input.files : null;
 
     if (!files || !files.length) {
-      await notifyError("Select image files");
+      await notifyError("Select one or more image files");
       return;
     }
 
@@ -1391,66 +1230,33 @@ setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
       updatePrepEta(i + 1, prepTotalSteps);
       // Даем браузеру шанс отрисовать прогресс на больших партиях
       await new Promise((r) => setTimeout(r, 0));
-
-      // Используем object URL вместо dataURL, чтобы не держать гигантские base64-строки в памяти.
-      const objectUrl = URL.createObjectURL(file);
-
-      let imgEl;
-      try {
-        // Для objectUrl crossOrigin не нужен, но в loadImage он выставлен — это ок.
-        imgEl = await loadImage(objectUrl);
-        URL.revokeObjectURL(objectUrl);
-      } catch (e) {
-        URL.revokeObjectURL(objectUrl);
-
-        console.error("Stitch/Slice: browser failed to decode image", file.name, e);
-        await notifyError("Cannot decode image", {
-          fileName: file.name,
-          decodeOk: false,
-          error: e && e.message ? e.message : String(e),
-        });
-        continue;
-      }
+// Use object URL to avoid holding giant base64 strings in memory.
+let imgEl;
+try {
+  imgEl = await decodeImageFromFile(file);
+} catch (e) {
+  console.error("Stitch/Slice: browser failed to decode image", file.name, e);
+  await notifyError("Cannot decode image", { fileName: file.name, error: e });
+  continue;
+}
 
       const width = imgEl.naturalWidth || imgEl.width;
       const height = imgEl.naturalHeight || imgEl.height;
 
       if (!width || !height) {
         console.error("Stitch/Slice: invalid dimensions", width, height, file.name);
-        await notifyError("Invalid image dimensions", {
-          fileName: file.name,
-          width,
-          height,
-        });
-        try { imgEl.src = ""; } catch (_) {}
+        await notifyError("Invalid image size", { fileName: file.name, width, height });
+        try { imgEl.src = ""; } catch (e) {}
         continue;
       }
 
-      const exceedsTextureHint = width > MAX_SLICE_DIM || height > MAX_SLICE_DIM;
-      if (exceedsTextureHint) {
-        console.warn("Stitch/Slice: image exceeds MAX_TEXTURE_SIZE hint, running probe.", {
-          fileName: file.name,
-          width,
-          height,
-          maxTextureSize: MAX_SLICE_DIM,
-          decodeOk: true,
-        });
-
-        const probe = await probeLargeImageRuntime(imgEl, {
+      if (width > MAX_SLICE_DIM || height > MAX_SLICE_DIM) {
+        console.warn("Stitch/Slice: image exceeds MAX_TEXTURE_SIZE hint", {
           fileName: file.name,
           width,
           height,
           maxTextureSize: MAX_SLICE_DIM,
         });
-
-        if (!probe.ok) {
-          console.warn("Stitch/Slice: large image probe failed; import stopped.", probe.diag);
-          await notifyWarning("Image is too large for this browser", probe.diag);
-          try { imgEl.src = ""; } catch (_) {}
-          continue;
-        }
-
-        console.log("Stitch/Slice: large image probe passed; continuing with slicing.", probe.diag);
       }
 
       let brightness = 0.5;
@@ -1489,9 +1295,19 @@ setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
         tilesY = Math.ceil(height / SLICE_TILE_SIZE);
         numTiles = tilesX * tilesY;
       }
-      // Освобождаем ссылку на декодированное изображение (помогает GC на больших партиях)
-      try { imgEl.src = ""; } catch (e) {}
 
+      if (needsSlice) {
+        const probe = await probeBitmapSlicePath(file, width, height);
+        console.log("[Image Align Tool] large image probe", probe.diag);
+        if (!probe.ok) {
+          await notifyWarning(probe.message || "Large image probe failed", probe.diag);
+          try { imgEl.src = ""; } catch (e) {}
+          continue;
+        }
+      }
+
+      // Release the decoded preview image after analysis.
+      try { imgEl.src = ""; } catch (e) {}
 
       fileInfos.push({
         file,
@@ -1500,6 +1316,7 @@ setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
         briCode,
         satCode,
         needsSlice,
+        useBitmapRegion: needsSlice,
         tilesX,
         tilesY,
         numTiles,
@@ -1553,7 +1370,7 @@ setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
     );
 
     if (anySliced && skipMissingTiles) {
-      await notifyInfo("Skip missing tiles is ignored");
+      await notifyInfo("Skip missing tiles ignored");
     }
 
     // 4) layout planning (не доводим прогресс до 100% ДО завершения расчётов)
@@ -2317,8 +2134,8 @@ for (let i = 0; i < orderedInfos.length; i++) {
   }
 }
 
-// ---- Decoded image cache (so 256 tiles don't decode the same source 256 times) ----
-const imageCache = new Map(); // file -> { imgPromise, imgEl }
+// ---- Decoded image cache (used for non-sliced source images only) ----
+const imageCache = new Map(); // file -> { imgPromise }
 
 const getDecodedImage = async (file) => {
   const cached = imageCache.get(file);
@@ -2326,16 +2143,7 @@ const getDecodedImage = async (file) => {
     return cached.imgPromise;
   }
 
-  const objectUrl = URL.createObjectURL(file);
-  const imgPromise = (async () => {
-    try {
-      const imgEl = await loadImage(objectUrl);
-      return imgEl;
-    } finally {
-      URL.revokeObjectURL(objectUrl);
-    }
-  })();
-
+  const imgPromise = decodeImageFromFile(file);
   imageCache.set(file, { imgPromise });
   return imgPromise;
 };
@@ -2360,9 +2168,13 @@ const releaseDecodedImageIfDone = (file) => {
 
 const processOneJob = async (job) => {
   const { file, info } = job;
-  const imgEl = await getDecodedImage(file);
-
   const fileName = originalNameByFile.get(file) || "image";
+  const usesBitmapRegion = !!(info && info.useBitmapRegion);
+
+  let imgEl = null;
+  if (!usesBitmapRegion) {
+    imgEl = await getDecodedImage(file);
+  }
 
   const uploadOne = async ({ url, x, y, title, meta }) => {
     const imgWidget = await createImageWithRetry({ url, x, y, title });
@@ -2378,7 +2190,11 @@ const processOneJob = async (job) => {
     return imgWidget;
   };
 
-  const renderRegionToCanvas = ({ sx, sy, sw, sh, outW, outH }) => {
+  const renderRegionToCanvas = async ({ sx, sy, sw, sh, outW, outH }) => {
+    if (usesBitmapRegion) {
+      return await renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH);
+    }
+
     const canvas = document.createElement("canvas");
     canvas.width = outW;
     canvas.height = outH;
@@ -2392,7 +2208,7 @@ const processOneJob = async (job) => {
   const uploadRegionWithSubslice = async (region) => {
     // region: {sx,sy,sw,sh, left, top, w, h, titleBase, metaBase, depth}
     const depth = region.depth || 0;
-    const canvas = renderRegionToCanvas({
+    const canvas = await renderRegionToCanvas({
       sx: region.sx,
       sy: region.sy,
       sw: region.sw,
@@ -2418,11 +2234,8 @@ const processOneJob = async (job) => {
       const isTooLarge = e && e.name === "DataUrlTooLargeError";
       if (!isTooLarge) throw e;
 
-      // Sub-slice this region (2x2) until each part fits.
-      // NOTE: This increases the number of images on the board but keeps quality=0.8.
       const minSub = 512;
       if (region.w <= minSub || region.h <= minSub) {
-        // Can't reasonably sub-slice further.
         throw e;
       }
 
@@ -2436,7 +2249,6 @@ const processOneJob = async (job) => {
       const swR = region.sw - sw2;
       const shB = region.sh - sh2;
 
-      // One region becomes 4 → add +3 to totalTiles so progress stays sane.
       totalTiles += 3;
       updateCreationProgress();
 
@@ -2454,7 +2266,6 @@ const processOneJob = async (job) => {
       });
 
       const parts = [
-        // top-left
         {
           sx: region.sx,
           sy: region.sy,
@@ -2468,7 +2279,6 @@ const processOneJob = async (job) => {
           metaBase: mkMeta(0, 0),
           depth: nextDepth,
         },
-        // top-right
         {
           sx: region.sx + sw2,
           sy: region.sy,
@@ -2482,7 +2292,6 @@ const processOneJob = async (job) => {
           metaBase: mkMeta(0, 1),
           depth: nextDepth,
         },
-        // bottom-left
         {
           sx: region.sx,
           sy: region.sy + sh2,
@@ -2496,7 +2305,6 @@ const processOneJob = async (job) => {
           metaBase: mkMeta(1, 0),
           depth: nextDepth,
         },
-        // bottom-right
         {
           sx: region.sx + sw2,
           sy: region.sy + sh2,
@@ -2512,14 +2320,12 @@ const processOneJob = async (job) => {
         },
       ];
 
-      // Upload parts sequentially to avoid multiplying peak memory for very detailed tiles.
       for (const p of parts) {
         await uploadRegionWithSubslice(p);
       }
     }
   };
 
-  // Build initial region for this job.
   if (job.kind === "full") {
     const titleBase = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${fileName}`;
     const left = job.x - job.width / 2;
@@ -2669,18 +2475,19 @@ setProgress(totalTiles, totalTiles);
     }
 
     const skippedCount = (adaptiveResult && adaptiveResult.skippedCount) || 0;
-    const importSummary = {
-      sourceImages: fileInfos.length,
-      totalTiles,
-      createdTiles,
-      skippedCount,
-    };
+    const importedMsg = `Imported ${fileInfos.length} source image${
+      fileInfos.length === 1 ? "" : "s"
+    } into ${totalTiles} tile${totalTiles === 1 ? "" : "s"}.`;
     if (skippedCount > 0) {
-      await notifyWarning("Import completed with skipped tiles", importSummary);
+      await notifyWarning("Import completed with skipped tiles", {
+        importedSources: fileInfos.length,
+        totalTiles,
+        skippedCount,
+      });
     } else {
       await notifyInfo(
         `Imported ${fileInfos.length} image${fileInfos.length === 1 ? "" : "s"}`,
-        importSummary
+        { importedSources: fileInfos.length, totalTiles }
       );
     }
   } catch (err) {
