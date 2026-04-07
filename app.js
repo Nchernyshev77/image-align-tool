@@ -1,10 +1,12 @@
 // app.js
-// Image Align Tool_47: Sorting + Stitch/Slice
-// Base: Image Align Tool_46
-// Changes in _47:
-// - Add a WebGL tile renderer for large sliced images when the full source fits into one GPU texture.
-// - Prefer the WebGL path for huge-image slicing instead of browser-specific ImageBitmap region extraction.
-// - Keep 2048 tiles and concurrency 1 for huge-image mode while falling back to existing paths when WebGL is unavailable.
+// Image Align Tool_41: Sorting + Stitch/Slice
+// Base: Image Align Tool_26
+// Base: Image Align Tool_40
+// Changes in _41:
+// - Show large-image failure directly in the panel UI.
+// - Make the failure text red.
+// - Hide the progress bar on fatal prepare/upload failures.
+// - Replace the stage label with "Fail" on fatal UI errors.
 
 const { board } = window.miro;
 
@@ -31,13 +33,13 @@ const META_APP_ID = "image-align-tool";
 const MAX_NOTIFICATION_MESSAGE_LENGTH = 80;
 const BITMAP_SLICE_PROBE_TILE = 1024;
 const BITMAP_SLICE_PROBE_OUTPUT = 512;
+const BITMAP_SLICE_PROBE_TIMEOUT_MS = 8000;
 const LARGE_IMAGE_DIMENSION_WARNING = 16384;
 const LARGE_IMAGE_BITMAP_MIN_DIM = 24000;
 const LARGE_IMAGE_BITMAP_MIN_TILES = 36;
 const LARGE_IMAGE_PROBE_MIN_DIM = 24000;
 const LARGE_IMAGE_PROBE_MIN_TILES = 36;
-const BITMAP_JOB_CONCURRENCY = 1;
-const LARGE_IMAGE_BITMAP_TILE_SIZE = 2048;
+const BITMAP_JOB_CONCURRENCY = 2;
 const BITMAP_FILE_CREATE_IMAGE_MAX_RETRIES = 1;
 const BITMAP_FILE_MAX_JOB_ATTEMPTS = 1;
 const TOO_LARGE_IMPORT_MESSAGE = "Image is too large for this browser";
@@ -156,275 +158,6 @@ function logCanvasColorSpace(prefix) {
   } catch (_) {
     // ignore
   }
-}
-
-function isFirefoxBrowser() {
-  try {
-    const ua = (typeof navigator !== "undefined" && navigator.userAgent) ? navigator.userAgent : "";
-    return /firefox/i.test(ua) && !/seamonkey/i.test(ua);
-  } catch (_) {
-    return false;
-  }
-}
-
-
-let WEBGL_SLICE_CAPS = null;
-
-function getWebGLSliceCaps() {
-  if (WEBGL_SLICE_CAPS) return WEBGL_SLICE_CAPS;
-
-  try {
-    const canvas = document.createElement("canvas");
-    const gl = canvas.getContext("webgl", {
-      alpha: false,
-      antialias: false,
-      depth: false,
-      stencil: false,
-      preserveDrawingBuffer: true,
-      premultipliedAlpha: false,
-    }) || canvas.getContext("experimental-webgl", {
-      alpha: false,
-      antialias: false,
-      depth: false,
-      stencil: false,
-      preserveDrawingBuffer: true,
-      premultipliedAlpha: false,
-    });
-
-    if (!gl) {
-      WEBGL_SLICE_CAPS = { available: false, reason: "webgl-unavailable", maxTextureSize: 0 };
-      return WEBGL_SLICE_CAPS;
-    }
-
-    WEBGL_SLICE_CAPS = {
-      available: true,
-      reason: null,
-      maxTextureSize: Number(gl.getParameter(gl.MAX_TEXTURE_SIZE)) || 0,
-    };
-    try {
-      const loseCtx = gl.getExtension("WEBGL_lose_context");
-      if (loseCtx && typeof loseCtx.loseContext === "function") loseCtx.loseContext();
-    } catch (_) {}
-    return WEBGL_SLICE_CAPS;
-  } catch (e) {
-    WEBGL_SLICE_CAPS = {
-      available: false,
-      reason: e && e.message ? e.message : String(e),
-      maxTextureSize: 0,
-    };
-    return WEBGL_SLICE_CAPS;
-  }
-}
-
-function canUseWebGLSliceForImage(width, height) {
-  const caps = getWebGLSliceCaps();
-  return !!(caps && caps.available && width > 0 && height > 0 && width <= caps.maxTextureSize && height <= caps.maxTextureSize);
-}
-
-function createShader(gl, type, source) {
-  const shader = gl.createShader(type);
-  if (!shader) throw new Error("Failed to create shader");
-  gl.shaderSource(shader, source);
-  gl.compileShader(shader);
-  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    const info = gl.getShaderInfoLog(shader) || "Shader compile failed";
-    gl.deleteShader(shader);
-    throw new Error(info);
-  }
-  return shader;
-}
-
-function createProgram(gl, vertexSource, fragmentSource) {
-  const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexSource);
-  const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
-  const program = gl.createProgram();
-  if (!program) throw new Error("Failed to create program");
-  gl.attachShader(program, vertexShader);
-  gl.attachShader(program, fragmentShader);
-  gl.linkProgram(program);
-  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    const info = gl.getProgramInfoLog(program) || "Program link failed";
-    gl.deleteProgram(program);
-    gl.deleteShader(vertexShader);
-    gl.deleteShader(fragmentShader);
-    throw new Error(info);
-  }
-  gl.deleteShader(vertexShader);
-  gl.deleteShader(fragmentShader);
-  return program;
-}
-
-function createWebGLTileRenderer(imgEl) {
-  const srcWidth = imgEl && (imgEl.naturalWidth || imgEl.width) ? (imgEl.naturalWidth || imgEl.width) : 0;
-  const srcHeight = imgEl && (imgEl.naturalHeight || imgEl.height) ? (imgEl.naturalHeight || imgEl.height) : 0;
-  if (!srcWidth || !srcHeight) {
-    throw new Error("Invalid image size for WebGL renderer");
-  }
-
-  const caps = getWebGLSliceCaps();
-  if (!caps.available) {
-    throw new Error(caps.reason || "WebGL is not available");
-  }
-  if (srcWidth > caps.maxTextureSize || srcHeight > caps.maxTextureSize) {
-    throw new Error(`Image exceeds WebGL texture limit ${caps.maxTextureSize}`);
-  }
-
-  const canvas = document.createElement("canvas");
-  canvas.width = 1;
-  canvas.height = 1;
-  const gl = canvas.getContext("webgl", {
-    alpha: false,
-    antialias: false,
-    depth: false,
-    stencil: false,
-    preserveDrawingBuffer: true,
-    premultipliedAlpha: false,
-  }) || canvas.getContext("experimental-webgl", {
-    alpha: false,
-    antialias: false,
-    depth: false,
-    stencil: false,
-    preserveDrawingBuffer: true,
-    premultipliedAlpha: false,
-  });
-
-  if (!gl) {
-    throw new Error("WebGL renderer could not be created");
-  }
-
-  const vertexSource = `
-    attribute vec2 a_position;
-    attribute vec2 a_texCoord;
-    varying vec2 v_texCoord;
-    void main() {
-      gl_Position = vec4(a_position, 0.0, 1.0);
-      v_texCoord = a_texCoord;
-    }
-  `;
-
-  const fragmentSource = `
-    precision mediump float;
-    varying vec2 v_texCoord;
-    uniform sampler2D u_image;
-    void main() {
-      gl_FragColor = texture2D(u_image, v_texCoord);
-    }
-  `;
-
-  const program = createProgram(gl, vertexSource, fragmentSource);
-  const positionLocation = gl.getAttribLocation(program, "a_position");
-  const texCoordLocation = gl.getAttribLocation(program, "a_texCoord");
-  const samplerLocation = gl.getUniformLocation(program, "u_image");
-  if (positionLocation < 0 || texCoordLocation < 0 || !samplerLocation) {
-    throw new Error("WebGL renderer attributes not available");
-  }
-
-  const positionBuffer = gl.createBuffer();
-  const texCoordBuffer = gl.createBuffer();
-  const texture = gl.createTexture();
-  if (!positionBuffer || !texCoordBuffer || !texture) {
-    throw new Error("WebGL renderer buffers not available");
-  }
-
-  gl.useProgram(program);
-
-  gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-  gl.bufferData(
-    gl.ARRAY_BUFFER,
-    new Float32Array([
-      -1, -1,
-       1, -1,
-      -1,  1,
-       1,  1,
-    ]),
-    gl.STATIC_DRAW
-  );
-  gl.enableVertexAttribArray(positionLocation);
-  gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
-
-  gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
-  gl.bufferData(
-    gl.ARRAY_BUFFER,
-    new Float32Array([
-      0, 1,
-      1, 1,
-      0, 0,
-      1, 0,
-    ]),
-    gl.DYNAMIC_DRAW
-  );
-  gl.enableVertexAttribArray(texCoordLocation);
-  gl.vertexAttribPointer(texCoordLocation, 2, gl.FLOAT, false, 0, 0);
-
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, texture);
-  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-  try { gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE); } catch (_) {}
-  try { gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false); } catch (_) {}
-  try { gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true); } catch (_) {}
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imgEl);
-  gl.uniform1i(samplerLocation, 0);
-
-  const renderRegionToCanvas = async (sx, sy, sw, sh, outW, outH) => {
-    canvas.width = Math.max(1, outW);
-    canvas.height = Math.max(1, outH);
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-
-    const u0 = sx / srcWidth;
-    const u1 = (sx + sw) / srcWidth;
-    const v0 = sy / srcHeight;
-    const v1 = (sy + sh) / srcHeight;
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
-    gl.bufferData(
-      gl.ARRAY_BUFFER,
-      new Float32Array([
-        u0, v1,
-        u1, v1,
-        u0, v0,
-        u1, v0,
-      ]),
-      gl.DYNAMIC_DRAW
-    );
-    gl.vertexAttribPointer(texCoordLocation, 2, gl.FLOAT, false, 0, 0);
-
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    gl.finish();
-
-    const outCanvas = document.createElement("canvas");
-    outCanvas.width = canvas.width;
-    outCanvas.height = canvas.height;
-    const outCtx = get2dContextSrgb(outCanvas);
-    outCtx.imageSmoothingEnabled = false;
-    outCtx.clearRect(0, 0, outCanvas.width, outCanvas.height);
-    outCtx.drawImage(canvas, 0, 0);
-    return outCanvas;
-  };
-
-  const dispose = () => {
-    try { gl.deleteTexture(texture); } catch (_) {}
-    try { gl.deleteBuffer(positionBuffer); } catch (_) {}
-    try { gl.deleteBuffer(texCoordBuffer); } catch (_) {}
-    try { gl.deleteProgram(program); } catch (_) {}
-    try {
-      const loseCtx = gl.getExtension("WEBGL_lose_context");
-      if (loseCtx && typeof loseCtx.loseContext === "function") loseCtx.loseContext();
-    } catch (_) {}
-  };
-
-  return {
-    width: srcWidth,
-    height: srcHeight,
-    maxTextureSize: caps.maxTextureSize,
-    renderRegionToCanvas,
-    dispose,
-  };
 }
 
 class DataUrlTooLargeError extends Error {
@@ -548,12 +281,25 @@ async function decodeImageFromFile(file) {
   }
 }
 
-async function renderBitmapRegionToCanvas(source, sx, sy, sw, sh, outW, outH) {
+function withTimeout(promise, ms, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label || "operation"} timed out after ${ms}ms`));
+    }, ms);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+async function renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH) {
   if (typeof createImageBitmap !== "function") {
     throw new Error("createImageBitmap is not available");
   }
 
-  const bitmap = await createImageBitmap(source, sx, sy, sw, sh);
+  const bitmap = await createImageBitmap(file, sx, sy, sw, sh);
   try {
     const canvas = document.createElement("canvas");
     canvas.width = outW;
@@ -569,6 +315,73 @@ async function renderBitmapRegionToCanvas(source, sx, sy, sw, sh, outW, outH) {
     }
   }
 }
+
+async function probeBitmapSlicePath(file, width, height) {
+  const diag = {
+    fileName: file && file.name ? file.name : "image",
+    width,
+    height,
+    maxTextureSize: MAX_SLICE_DIM,
+    decodeOk: true,
+    bitmapRegionOk: false,
+    drawOk: false,
+    encodeOk: false,
+    stats: [],
+    stopReason: null,
+    timeoutMs: BITMAP_SLICE_PROBE_TIMEOUT_MS,
+    probeTile: Math.min(BITMAP_SLICE_PROBE_TILE, width, height),
+    outputTile: Math.min(BITMAP_SLICE_PROBE_OUTPUT, width, height),
+  };
+
+  const probeSize = Math.min(BITMAP_SLICE_PROBE_TILE, width, height);
+  const outputSize = Math.min(BITMAP_SLICE_PROBE_OUTPUT, width, height);
+  const centerRegion = {
+    sx: Math.max(0, Math.floor((width - probeSize) / 2)),
+    sy: Math.max(0, Math.floor((height - probeSize) / 2)),
+    sw: probeSize,
+    sh: probeSize,
+  };
+
+  try {
+    const canvas = await withTimeout(
+      renderBitmapRegionToCanvas(
+        file,
+        centerRegion.sx,
+        centerRegion.sy,
+        centerRegion.sw,
+        centerRegion.sh,
+        outputSize,
+        outputSize
+      ),
+      BITMAP_SLICE_PROBE_TIMEOUT_MS,
+      "bitmap probe"
+    );
+
+    diag.bitmapRegionOk = true;
+    diag.drawOk = true;
+
+    const stats = getCanvasStats(canvas);
+    diag.stats.push({ ...centerRegion, outW: outputSize, outH: outputSize, ...stats });
+
+    const dataUrl = withTimeout(
+      Promise.resolve(canvas.toDataURL("image/jpeg", 0.8)),
+      BITMAP_SLICE_PROBE_TIMEOUT_MS,
+      "bitmap probe encode"
+    );
+    const encoded = await dataUrl;
+    if (!encoded || !encoded.startsWith("data:image/jpeg")) {
+      throw new Error("probe_encode_failed");
+    }
+    diag.encodeOk = true;
+  } catch (e) {
+    diag.stopReason = "bitmap_slice_failed";
+    diag.error = String(e && e.message ? e.message : e);
+    return { ok: false, diag, message: "Large image probe failed" };
+  }
+
+  return { ok: true, diag };
+}
+
 
 /**
  * Возвращает яркость и "сырую" сатурацию по ROI:
@@ -1479,7 +1292,8 @@ if (!setProgress._throttleWrapped) {
 
     const fileInfos = [];
     let anySliced = false;
-    const hugePathUnsupportedFailures = [];
+    let softProbeFailures = 0;
+    const tooLargeProbeFailures = [];
 
         startPrepEta();
 setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
@@ -1551,74 +1365,48 @@ try {
       let tilesX = 1;
       let tilesY = 1;
       let numTiles = 1;
-      let sliceTileSize = SLICE_TILE_SIZE;
-      let previewTilesX = 1;
-      let previewTilesY = 1;
-      let previewNumTiles = 1;
       if (needsSlice) {
-        previewTilesX = Math.ceil(width / SLICE_TILE_SIZE);
-        previewTilesY = Math.ceil(height / SLICE_TILE_SIZE);
-        previewNumTiles = previewTilesX * previewTilesY;
+        tilesX = Math.ceil(width / SLICE_TILE_SIZE);
+        tilesY = Math.ceil(height / SLICE_TILE_SIZE);
+        numTiles = tilesX * tilesY;
       }
 
       const useBitmapRegion = needsSlice && (
         width > LARGE_IMAGE_BITMAP_MIN_DIM ||
         height > LARGE_IMAGE_BITMAP_MIN_DIM ||
-        previewNumTiles >= LARGE_IMAGE_BITMAP_MIN_TILES
-      );
-      const useWebGLRegion = needsSlice && canUseWebGLSliceForImage(width, height) && (
-        useBitmapRegion ||
-        width > LARGE_IMAGE_DIMENSION_WARNING ||
-        height > LARGE_IMAGE_DIMENSION_WARNING
+        numTiles >= LARGE_IMAGE_BITMAP_MIN_TILES
       );
 
-      if (useBitmapRegion || useWebGLRegion) {
-        sliceTileSize = LARGE_IMAGE_BITMAP_TILE_SIZE;
-      }
+      const shouldRunLargeProbe = useBitmapRegion && (
+        width >= LARGE_IMAGE_PROBE_MIN_DIM ||
+        height >= LARGE_IMAGE_PROBE_MIN_DIM ||
+        numTiles >= LARGE_IMAGE_PROBE_MIN_TILES
+      );
 
-      if (needsSlice) {
-        tilesX = Math.ceil(width / sliceTileSize);
-        tilesY = Math.ceil(height / sliceTileSize);
-        numTiles = tilesX * tilesY;
-      }
-
-      if (useBitmapRegion && !useWebGLRegion && typeof createImageBitmap !== "function") {
-        hugePathUnsupportedFailures.push({
-          fileName: file.name,
-          width,
-          height,
-          tilesX,
-          tilesY,
-          numTiles,
-          stopReason: "bitmap-api-unavailable",
-          error: "createImageBitmap is not available",
-        });
-        console.warn("[Image Align Tool] huge image path unavailable; file skipped", {
-          fileName: file.name,
-          width,
-          height,
-          tilesX,
-          tilesY,
-          numTiles,
-        });
-        try { imgEl.src = ""; } catch (e) {}
-        continue;
-      }
-
-      if (useBitmapRegion || useWebGLRegion) {
-        const webglCaps = getWebGLSliceCaps();
-        console.log("[Image Align Tool] huge image accepted after decode", {
-          fileName: file.name,
-          width,
-          height,
-          tilesX,
-          tilesY,
-          numTiles,
-          sliceTileSize,
-          renderPath: useWebGLRegion ? "webgl-region" : (isFirefoxBrowser() ? "imgEl-region" : "file-region"),
-          webglAvailable: !!(webglCaps && webglCaps.available),
-          webglMaxTextureSize: webglCaps ? webglCaps.maxTextureSize : 0,
-        });
+      let probeFailedSoft = false;
+      if (shouldRunLargeProbe) {
+        setProgress(i + 1, prepTotalSteps, "Preparing files… (large image probe)", i + 1, filesArray.length);
+        const probe = await probeBitmapSlicePath(file, width, height);
+        console.log("[Image Align Tool] large image probe", probe.diag);
+        if (!probe.ok) {
+          probeFailedSoft = true;
+          softProbeFailures += 1;
+          tooLargeProbeFailures.push({
+            fileName: file.name,
+            width,
+            height,
+            tilesX,
+            tilesY,
+            numTiles,
+            stopReason: probe && probe.diag ? probe.diag.stopReason : null,
+            error: probe && probe.diag ? probe.diag.error : null,
+          });
+          console.warn("[Image Align Tool] large image probe failed; file skipped", probe.diag);
+          try { imgEl.src = ""; } catch (e) {}
+          setProgress(i + 1, prepTotalSteps, "Preparing files…", i + 1, filesArray.length);
+          continue;
+        }
+        setProgress(i + 1, prepTotalSteps, "Preparing files…", i + 1, filesArray.length);
       }
 
       // Release the decoded preview image after analysis.
@@ -1632,12 +1420,10 @@ try {
         satCode,
         needsSlice,
         useBitmapRegion,
-        useWebGLRegion,
-        probeFailedSoft: false,
+        probeFailedSoft,
         tilesX,
         tilesY,
         numTiles,
-        sliceTileSize,
       });
     }
 
@@ -1645,12 +1431,12 @@ try {
     let prepDone = filesArray.length;
 
     if (!fileInfos.length) {
-      if (hugePathUnsupportedFailures.length > 0) {
+      if (tooLargeProbeFailures.length > 0) {
         if (setProgress.flush) setProgress.flush();
         if (setEtaText.flush) setEtaText.flush();
         setEtaText(null);
         showFailedProgressState("Image is too large");
-        await notifyWarning(TOO_LARGE_IMPORT_MESSAGE, { failedFiles: hugePathUnsupportedFailures });
+        await notifyWarning(TOO_LARGE_IMPORT_MESSAGE, { failedFiles: tooLargeProbeFailures });
         return;
       }
       setProgress(0, 0, "Nothing to import.");
@@ -1658,11 +1444,13 @@ try {
       return;
     }
 
-    if (hugePathUnsupportedFailures.length > 0) {
+    if (tooLargeProbeFailures.length > 0) {
       await notifyWarning(
-        hugePathUnsupportedFailures.length === 1 ? TOO_LARGE_IMPORT_MESSAGE : "Some images are too large",
-        { failedFiles: hugePathUnsupportedFailures }
+        tooLargeProbeFailures.length === 1 ? TOO_LARGE_IMPORT_MESSAGE : "Some images are too large",
+        { failedFiles: tooLargeProbeFailures }
       );
+    } else if (softProbeFailures > 0) {
+      await notifyWarning("Probe failed, trying upload", { softProbeFailures });
     }
 
     // 1) sorting
@@ -2442,7 +2230,6 @@ const getFileCenter = (info, fileIndex) => {
 for (let i = 0; i < orderedInfos.length; i++) {
   const info = orderedInfos[i];
   const { file, needsSlice, width, height, tilesX, tilesY } = info;
-  const sliceTileSize = info.sliceTileSize || SLICE_TILE_SIZE;
 
   const center = getFileCenter(info, i);
   const originalName = file.name || "image";
@@ -2470,10 +2257,10 @@ for (let i = 0; i < orderedInfos.length; i++) {
   const rowHeights = [];
 
   for (let tx = 0; tx < tilesX; tx++) {
-    colWidths.push(Math.min(sliceTileSize, width - tx * sliceTileSize));
+    colWidths.push(Math.min(SLICE_TILE_SIZE, width - tx * SLICE_TILE_SIZE));
   }
   for (let ty = 0; ty < tilesY; ty++) {
-    rowHeights.push(Math.min(sliceTileSize, height - ty * sliceTileSize));
+    rowHeights.push(Math.min(SLICE_TILE_SIZE, height - ty * SLICE_TILE_SIZE));
   }
 
   const mosaicW = colWidths.reduce((sum, w) => sum + w, 0);
@@ -2497,8 +2284,8 @@ for (let i = 0; i < orderedInfos.length; i++) {
       const sw = colWidths[tx];
       const sh = rowHeights[ty];
 
-      const sx = tx * sliceTileSize;
-      const sy = ty * sliceTileSize;
+      const sx = tx * SLICE_TILE_SIZE;
+      const sy = ty * SLICE_TILE_SIZE;
 
       const tileLeft = mosaicLeft + colPrefix[tx];
       const tileTop = mosaicTop + rowPrefix[ty];
@@ -2533,7 +2320,6 @@ for (let i = 0; i < orderedInfos.length; i++) {
 
 // ---- Decoded image cache (used for non-sliced source images only) ----
 const imageCache = new Map(); // file -> { imgPromise }
-const webglRendererCache = new Map(); // file -> { rendererPromise }
 
 const getDecodedImage = async (file) => {
   const cached = imageCache.get(file);
@@ -2546,32 +2332,10 @@ const getDecodedImage = async (file) => {
   return imgPromise;
 };
 
-const getWebGLRendererForFile = async (file, imgEl) => {
-  const cached = webglRendererCache.get(file);
-  if (cached) {
-    return cached.rendererPromise;
-  }
-
-  const rendererPromise = Promise.resolve().then(() => createWebGLTileRenderer(imgEl));
-  webglRendererCache.set(file, { rendererPromise });
-  return rendererPromise;
-};
-
 const releaseDecodedImageIfDone = (file) => {
   const left = (remainingJobsByFile.get(file) || 0) - 1;
   if (left <= 0) {
     remainingJobsByFile.delete(file);
-    const rendererCached = webglRendererCache.get(file);
-    if (rendererCached) {
-      rendererCached.rendererPromise
-        .then((renderer) => {
-          if (renderer && typeof renderer.dispose === "function") {
-            try { renderer.dispose(); } catch (_) {}
-          }
-        })
-        .catch(() => {});
-      webglRendererCache.delete(file);
-    }
     const cached = imageCache.get(file);
     if (cached) {
       cached.imgPromise
@@ -2592,22 +2356,16 @@ const processOneJob = async (job) => {
   const { file, info } = job;
   const fileName = originalNameByFile.get(file) || "image";
   const usesBitmapRegion = !!(info && info.useBitmapRegion);
-  const usesWebGLRegion = !!(info && info.useWebGLRegion);
-  const useFirefoxImageBitmapFromImage = usesBitmapRegion && !usesWebGLRegion && isFirefoxBrowser();
 
-  if ((usesBitmapRegion || usesWebGLRegion) && failedBitmapFiles.has(file)) {
+  if (usesBitmapRegion && failedBitmapFiles.has(file)) {
     markJobSettled(job, "skipped", { reason: "file-already-failed" });
     releaseDecodedImageIfDone(file);
     return;
   }
 
   let imgEl = null;
-  let webglRenderer = null;
-  if (!usesBitmapRegion || useFirefoxImageBitmapFromImage || usesWebGLRegion) {
+  if (!usesBitmapRegion) {
     imgEl = await getDecodedImage(file);
-  }
-  if (usesWebGLRegion) {
-    webglRenderer = await getWebGLRendererForFile(file, imgEl);
   }
 
   try {
@@ -2629,13 +2387,8 @@ const processOneJob = async (job) => {
     };
 
     const renderRegionToCanvas = async ({ sx, sy, sw, sh, outW, outH }) => {
-      if (usesWebGLRegion) {
-        return await webglRenderer.renderRegionToCanvas(sx, sy, sw, sh, outW, outH);
-      }
-
       if (usesBitmapRegion) {
-        const bitmapSource = useFirefoxImageBitmapFromImage && imgEl ? imgEl : file;
-        return await renderBitmapRegionToCanvas(bitmapSource, sx, sy, sw, sh, outW, outH);
+        return await renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH);
       }
 
       const canvas = document.createElement("canvas");
