@@ -1,81 +1,61 @@
 // app.js
-// Image Align Tool_41: Sorting + Stitch/Slice
-// Base: Image Align Tool_26
-// Base: Image Align Tool_40
-// Changes in _41:
-// - Show large-image failure directly in the panel UI.
-// - Make the failure text red.
-// - Hide the progress bar on fatal prepare/upload failures.
-// - Replace the stage label with "Fail" on fatal UI errors.
+// Image Align Tool_48: Sorting + Stitch/Slice
+// Base: Image Align Tool_41
+// Changes in _48:
+// - Keep the old stable logic for normal images.
+// - Add a new huge-image mode that slices tiles through slice-worker.js.
+// - Huge-image mode uses 2048 tiles, concurrency 1, PNG tiles, and object URLs.
+// - panel.html is unchanged.
 
 const { board } = window.miro;
 
 // ---- color / slice settings ----
 const SAT_CODE_MAX = 99;
 const SAT_BOOST = 4.0;
-const SAT_GROUP_THRESHOLD = 35;      // <= серые, > цветные
+const SAT_GROUP_THRESHOLD = 35;
 const SLICE_TILE_SIZE = 4096;
+const HUGE_SLICE_TILE_SIZE = 2048;
 const SLICE_THRESHOLD_WIDTH = 8192;
 const SLICE_THRESHOLD_HEIGHT = 4096;
-let   MAX_SLICE_DIM = 16384;         // уточняем через WebGL
-// dataURL length (chars) hard cap to avoid SDK crashes.
-// Note: data URLs are base64, so the string is ~33% larger than the underlying bytes.
-// A higher cap reduces unnecessary sub-slicing for detailed 4K tiles.
+let MAX_SLICE_DIM = 16384;
 const MAX_URL_BYTES = 11000000;
-const TARGET_URL_BYTES = 4500000;   // целевой размер dataURL (~4.5 МБ на тайл/изображение)
 const CREATE_IMAGE_MAX_RETRIES = 5;
 const CREATE_IMAGE_BASE_DELAY_MS = 500;
 
-const UPLOAD_CONCURRENCY_MIN = 1;
-const UPLOAD_CONCURRENCY_MAX = 5;
-const UPLOAD_CONCURRENCY_INITIAL_LARGE = 4;
+const UPLOAD_CONCURRENCY_NORMAL = 4;
+const UPLOAD_CONCURRENCY_HUGE = 1;
 const META_APP_ID = "image-align-tool";
 const MAX_NOTIFICATION_MESSAGE_LENGTH = 80;
-const BITMAP_SLICE_PROBE_TILE = 1024;
-const BITMAP_SLICE_PROBE_OUTPUT = 512;
-const BITMAP_SLICE_PROBE_TIMEOUT_MS = 8000;
 const LARGE_IMAGE_DIMENSION_WARNING = 16384;
-const LARGE_IMAGE_BITMAP_MIN_DIM = 24000;
-const LARGE_IMAGE_BITMAP_MIN_TILES = 36;
-const LARGE_IMAGE_PROBE_MIN_DIM = 24000;
-const LARGE_IMAGE_PROBE_MIN_TILES = 36;
-const BITMAP_JOB_CONCURRENCY = 2;
-const BITMAP_FILE_CREATE_IMAGE_MAX_RETRIES = 1;
-const BITMAP_FILE_MAX_JOB_ATTEMPTS = 1;
+const LARGE_IMAGE_WORKER_MIN_DIM = 24000;
+const LARGE_IMAGE_WORKER_MIN_TILES = 36;
 const TOO_LARGE_IMPORT_MESSAGE = "Image is too large for this browser";
 const FAILURE_UI_COLOR = "#c62828";
-
-// ---------- авто-детект лимита по стороне через WebGL ----------
+const HUGE_WORKER_PATH = "./slice-worker.js";
+const HUGE_TILE_MIME = "image/png";
 
 function detectMaxSliceDim() {
   try {
     const canvas = document.createElement("canvas");
-    const gl =
-      canvas.getContext("webgl") ||
-      canvas.getContext("experimental-webgl");
-
+    const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
     if (!gl) {
       console.warn("Slice: WebGL not available, using fallback 16384.");
       return;
     }
-
     const maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     console.log("Slice: MAX_TEXTURE_SIZE =", maxTexSize);
-
     MAX_SLICE_DIM = Math.min(maxTexSize || 16384, 32767);
   } catch (e) {
     console.warn("Slice: failed to detect MAX_TEXTURE_SIZE, using fallback.", e);
   }
 }
 
-// ---------- helpers: titles & numbers ----------
-
 function getTitle(item) {
   return (item.title || "").toString();
 }
 
 function extractTrailingNumber(str) {
-  const match = str.match(/(\d+)(?!.*\d)/);
+  const match = String(str || "").match(/(\d+)(?!.*\d)/);
   if (!match) return null;
   const num = Number.parseInt(match[1], 10);
   return Number.isNaN(num) ? null : num;
@@ -91,11 +71,9 @@ function sortByGeometry(images) {
   });
 }
 
-
 function getCornerFlip(startCorner) {
   let flipX = false;
   let flipY = false;
-
   switch (startCorner) {
     case "top-right":
       flipX = true;
@@ -110,13 +88,8 @@ function getCornerFlip(startCorner) {
     default:
       break;
   }
-
   return { flipX, flipY };
 }
-
-
-
-// ---------- helpers: image loading & brightness ----------
 
 function loadImage(url) {
   return new Promise((resolve, reject) => {
@@ -128,10 +101,7 @@ function loadImage(url) {
   });
 }
 
-// --- Canvas helpers (prefer sRGB) ---
 function get2dContextSrgb(canvas) {
-  // Some browsers support Canvas 2D colorSpace.
-  // We prefer sRGB to reduce unexpected conversions.
   try {
     const ctx = canvas.getContext("2d", { colorSpace: "srgb", alpha: false });
     if (ctx) return ctx;
@@ -155,9 +125,7 @@ function logCanvasColorSpace(prefix) {
       supported = false;
     }
     console.log(`${prefix}: 2D colorSpace request=srgb supported=${supported} actual=${actual}`);
-  } catch (_) {
-    // ignore
-  }
+  } catch (_) {}
 }
 
 class DataUrlTooLargeError extends Error {
@@ -169,17 +137,16 @@ class DataUrlTooLargeError extends Error {
   }
 }
 
-class FatalBitmapFileError extends Error {
+class FatalHugeFileError extends Error {
   constructor(file, fileName, cause) {
-    const message = cause && cause.message ? cause.message : String(cause || "Bitmap tile failed");
+    const message = cause && cause.message ? cause.message : String(cause || "Huge tile failed");
     super(message);
-    this.name = "FatalBitmapFileError";
+    this.name = "FatalHugeFileError";
     this.file = file;
     this.fileName = fileName || (file && file.name) || "image";
     this.cause = cause;
   }
 }
-
 
 function clampNotificationMessage(message, fallback = "Operation failed") {
   const raw = (message == null ? "" : String(message)).replace(/\s+/g, " ").trim();
@@ -197,80 +164,13 @@ async function notify(kind, message, details) {
     }
     await board.notifications[kind](safeMessage);
   } catch (e) {
-    console.error("[Image Align Tool] notification failed", {
-      kind,
-      safeMessage,
-      details,
-      error: e,
-    });
+    console.error("[Image Align Tool] notification failed", { kind, safeMessage, details, error: e });
   }
 }
 
-function notifyInfo(message, details) {
-  return notify("showInfo", message, details);
-}
-
-function notifyWarning(message, details) {
-  return notify("showWarning", message, details);
-}
-
-function notifyError(message, details) {
-  return notify("showError", message, details);
-}
-
-function createProbePoints(width, height) {
-  const points = [
-    { x: 0, y: 0 },
-    { x: Math.max(0, width - 1), y: 0 },
-    { x: 0, y: Math.max(0, height - 1) },
-    { x: Math.max(0, width - 1), y: Math.max(0, height - 1) },
-    { x: Math.floor(width / 2), y: Math.floor(height / 2) },
-  ];
-  const seen = new Set();
-  return points.filter((p) => {
-    const key = `${p.x}:${p.y}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function getCanvasStats(canvas) {
-  const statsCanvas = document.createElement("canvas");
-  statsCanvas.width = 64;
-  statsCanvas.height = 64;
-  const statsCtx = get2dContextSrgb(statsCanvas);
-  statsCtx.imageSmoothingEnabled = false;
-  statsCtx.clearRect(0, 0, 64, 64);
-  statsCtx.drawImage(canvas, 0, 0, 64, 64);
-
-  const data = statsCtx.getImageData(0, 0, 64, 64).data;
-  let minLuma = 255;
-  let maxLuma = 0;
-  let sumLuma = 0;
-  let alphaZero = 0;
-
-  for (let i = 0; i < data.length; i += 4) {
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
-    const a = data[i + 3];
-    const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    if (luma < minLuma) minLuma = luma;
-    if (luma > maxLuma) maxLuma = luma;
-    sumLuma += luma;
-    if (a === 0) alphaZero += 1;
-  }
-
-  const pixelCount = data.length / 4;
-  return {
-    minLuma: Number(minLuma.toFixed(2)),
-    maxLuma: Number(maxLuma.toFixed(2)),
-    avgLuma: Number((sumLuma / pixelCount).toFixed(2)),
-    alphaZero,
-    pixelCount,
-  };
-}
+const notifyInfo = (message, details) => notify("showInfo", message, details);
+const notifyWarning = (message, details) => notify("showWarning", message, details);
+const notifyError = (message, details) => notify("showError", message, details);
 
 async function decodeImageFromFile(file) {
   const objectUrl = URL.createObjectURL(file);
@@ -281,114 +181,6 @@ async function decodeImageFromFile(file) {
   }
 }
 
-function withTimeout(promise, ms, label) {
-  let timer = null;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      reject(new Error(`${label || "operation"} timed out after ${ms}ms`));
-    }, ms);
-  });
-
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timer) clearTimeout(timer);
-  });
-}
-
-async function renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH) {
-  if (typeof createImageBitmap !== "function") {
-    throw new Error("createImageBitmap is not available");
-  }
-
-  const bitmap = await createImageBitmap(file, sx, sy, sw, sh);
-  try {
-    const canvas = document.createElement("canvas");
-    canvas.width = outW;
-    canvas.height = outH;
-    const ctx = get2dContextSrgb(canvas);
-    ctx.imageSmoothingEnabled = false;
-    ctx.clearRect(0, 0, outW, outH);
-    ctx.drawImage(bitmap, 0, 0, outW, outH);
-    return canvas;
-  } finally {
-    if (bitmap && typeof bitmap.close === "function") {
-      bitmap.close();
-    }
-  }
-}
-
-async function probeBitmapSlicePath(file, width, height) {
-  const diag = {
-    fileName: file && file.name ? file.name : "image",
-    width,
-    height,
-    maxTextureSize: MAX_SLICE_DIM,
-    decodeOk: true,
-    bitmapRegionOk: false,
-    drawOk: false,
-    encodeOk: false,
-    stats: [],
-    stopReason: null,
-    timeoutMs: BITMAP_SLICE_PROBE_TIMEOUT_MS,
-    probeTile: Math.min(BITMAP_SLICE_PROBE_TILE, width, height),
-    outputTile: Math.min(BITMAP_SLICE_PROBE_OUTPUT, width, height),
-  };
-
-  const probeSize = Math.min(BITMAP_SLICE_PROBE_TILE, width, height);
-  const outputSize = Math.min(BITMAP_SLICE_PROBE_OUTPUT, width, height);
-  const centerRegion = {
-    sx: Math.max(0, Math.floor((width - probeSize) / 2)),
-    sy: Math.max(0, Math.floor((height - probeSize) / 2)),
-    sw: probeSize,
-    sh: probeSize,
-  };
-
-  try {
-    const canvas = await withTimeout(
-      renderBitmapRegionToCanvas(
-        file,
-        centerRegion.sx,
-        centerRegion.sy,
-        centerRegion.sw,
-        centerRegion.sh,
-        outputSize,
-        outputSize
-      ),
-      BITMAP_SLICE_PROBE_TIMEOUT_MS,
-      "bitmap probe"
-    );
-
-    diag.bitmapRegionOk = true;
-    diag.drawOk = true;
-
-    const stats = getCanvasStats(canvas);
-    diag.stats.push({ ...centerRegion, outW: outputSize, outH: outputSize, ...stats });
-
-    const dataUrl = withTimeout(
-      Promise.resolve(canvas.toDataURL("image/jpeg", 0.8)),
-      BITMAP_SLICE_PROBE_TIMEOUT_MS,
-      "bitmap probe encode"
-    );
-    const encoded = await dataUrl;
-    if (!encoded || !encoded.startsWith("data:image/jpeg")) {
-      throw new Error("probe_encode_failed");
-    }
-    diag.encodeOk = true;
-  } catch (e) {
-    diag.stopReason = "bitmap_slice_failed";
-    diag.error = String(e && e.message ? e.message : e);
-    return { ok: false, diag, message: "Large image probe failed" };
-  }
-
-  return { ok: true, diag };
-}
-
-
-/**
- * Возвращает яркость и "сырую" сатурацию по ROI:
- *   - уменьшаем до smallSize
- *   - блюрим (blurPx)
- *   - обрезаем верх и боковые поля
- */
 function getBrightnessAndSaturationFromImageElement(
   img,
   smallSize = 50,
@@ -398,10 +190,8 @@ function getBrightnessAndSaturationFromImageElement(
 ) {
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
-
   const width = smallSize;
   const height = smallSize;
-
   canvas.width = width;
   canvas.height = height;
 
@@ -409,16 +199,13 @@ function getBrightnessAndSaturationFromImageElement(
   try {
     ctx.filter = `blur(${blurPx}px)`;
   } catch (_) {}
-
   ctx.drawImage(img, 0, 0, width, height);
   ctx.filter = prevFilter;
 
   const cropY = Math.floor(height * cropTopRatio);
   const cropH = height - cropY;
-
   const cropX = Math.floor(width * cropSideRatio);
   const cropW = width - 2 * cropX;
-
   if (cropH <= 0 || cropW <= 0) return null;
 
   let imageData;
@@ -438,35 +225,20 @@ function getBrightnessAndSaturationFromImageElement(
     const r = data[i];
     const g = data[i + 1];
     const b = data[i + 2];
-
     const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
     sumY += y;
-
     const maxv = Math.max(r, g, b);
     const minv = Math.min(r, g, b);
     sumDiff += maxv - minv;
   }
 
-  const avgY = sumY / totalPixels;
-  const avgDiff = sumDiff / totalPixels;
-
-  const brightness = avgY / 255;
-  const saturationApprox = avgDiff / 255;
-
-  return { brightness, saturation: saturationApprox };
+  const brightness = (sumY / totalPixels) / 255;
+  const saturation = (sumDiff / totalPixels) / 255;
+  return { brightness, saturation };
 }
 
-// ---------- alignment (Sorting) ----------
-
 async function alignImagesInGivenOrder(images, config) {
-  const {
-    imagesPerRow,
-    horizontalGap,
-    verticalGap,
-    sizeMode,
-    startCorner,
-  } = config;
-
+  const { imagesPerRow, horizontalGap, verticalGap, sizeMode, startCorner } = config;
   if (!images.length) return;
 
   if (sizeMode === "width") {
@@ -482,29 +254,21 @@ async function alignImagesInGivenOrder(images, config) {
   const total = images.length;
   const cols = Math.max(1, imagesPerRow);
   const rows = Math.ceil(total / cols);
-
   const rowHeights = new Array(rows).fill(0);
   const rowWidths = new Array(rows).fill(0);
 
   for (let i = 0; i < total; i++) {
     const r = Math.floor(i / cols);
     const img = images[i];
-
     if (img.height > rowHeights[r]) rowHeights[r] = img.height;
-
     if (rowWidths[r] > 0) rowWidths[r] += horizontalGap;
     rowWidths[r] += img.width;
   }
 
   const gridWidth = rowWidths.length ? Math.max(...rowWidths) : 0;
-  const gridHeight =
-    rowHeights.reduce((sum, h) => sum + h, 0) +
-    verticalGap * Math.max(0, rows - 1);
-
+  const gridHeight = rowHeights.reduce((sum, h) => sum + h, 0) + verticalGap * Math.max(0, rows - 1);
   const rowTop = new Array(rows).fill(0);
-  for (let r = 1; r < rows; r++) {
-    rowTop[r] = rowTop[r - 1] + rowHeights[r - 1] + verticalGap;
-  }
+  for (let r = 1; r < rows; r++) rowTop[r] = rowTop[r - 1] + rowHeights[r - 1] + verticalGap;
 
   const baseX = new Array(total).fill(0);
   const baseY = new Array(total).fill(0);
@@ -513,13 +277,8 @@ async function alignImagesInGivenOrder(images, config) {
   for (let i = 0; i < total; i++) {
     const r = Math.floor(i / cols);
     const img = images[i];
-
-    const centerY = rowTop[r] + rowHeights[r] / 2;
-    const centerX = rowCursorX[r] + img.width / 2;
-
-    baseX[i] = centerX;
-    baseY[i] = centerY;
-
+    baseY[i] = rowTop[r] + rowHeights[r] / 2;
+    baseX[i] = rowCursorX[r] + img.width / 2;
     rowCursorX[r] += img.width + horizontalGap;
   }
 
@@ -529,49 +288,36 @@ async function alignImagesInGivenOrder(images, config) {
     right: img.x + img.width / 2,
     bottom: img.y + img.height / 2,
   }));
-
   const minLeft = Math.min(...bounds.map((b) => b.left));
   const minTop = Math.min(...bounds.map((b) => b.top));
   const maxRight = Math.max(...bounds.map((b) => b.right));
   const maxBottom = Math.max(...bounds.map((b) => b.bottom));
 
-  
-const { flipX, flipY } = getCornerFlip(startCorner);
+  const { flipX, flipY } = getCornerFlip(startCorner);
+  const originLeft = flipX ? (maxRight - gridWidth) : minLeft;
+  const originTop = flipY ? (maxBottom - gridHeight) : minTop;
 
-const originLeft = flipX ? (maxRight - gridWidth) : minLeft;
-const originTop = flipY ? (maxBottom - gridHeight) : minTop;
-
-for (let i = 0; i < total; i++) {
+  for (let i = 0; i < total; i++) {
     let x0 = baseX[i];
     let y0 = baseY[i];
-
     if (flipX) x0 = gridWidth - x0;
     if (flipY) y0 = gridHeight - y0;
-
-    const img = images[i];
-    img.x = originLeft + x0;
-    img.y = originTop + y0;
+    images[i].x = originLeft + x0;
+    images[i].y = originTop + y0;
   }
 
   await Promise.all(images.map((img) => img.sync()));
 }
 
-
-// ---------- SORTING: order images ----------
-
 async function orderImagesForSorting(images, { sortMode, sizeMode, sizeOrder }) {
   if (!images.length) return [];
 
   if (sortMode === "number") {
-    // If any image has an empty title, create numeric titles based on geometry order first.
     const hasAnyEmptyTitle = images.some((img) => !getTitle(img));
     if (hasAnyEmptyTitle) {
       const geoOrder = sortByGeometry(images);
       let counter = 1;
-      for (const img of geoOrder) {
-        img.title = String(counter);
-        counter++;
-      }
+      for (const img of geoOrder) img.title = String(counter++);
       await Promise.all(geoOrder.map((img) => img.sync()));
       images = geoOrder;
     }
@@ -580,30 +326,22 @@ async function orderImagesForSorting(images, { sortMode, sizeMode, sizeOrder }) 
       const title = getTitle(img);
       const lower = title.toLowerCase();
       const num = extractTrailingNumber(title);
-      const hasNumber = num !== null;
-      return { img, index, title, lower, hasNumber, num };
+      return { img, index, lower, num, hasNumber: num !== null };
     });
-
-    console.groupCollapsed("Sorting (number) – titles & numbers");
-    meta.forEach((m) => console.log(m.title || m.img.id, "=>", m.num));
-    console.groupEnd();
 
     meta.sort((a, b) => {
       if (a.hasNumber && !b.hasNumber) return -1;
       if (!a.hasNumber && b.hasNumber) return 1;
-
       if (a.hasNumber && b.hasNumber) {
         if (a.num !== b.num) return a.num - b.num;
         if (a.lower < b.lower) return -1;
         if (a.lower > b.lower) return 1;
         return a.index - b.index;
       }
-
       if (a.lower < b.lower) return -1;
       if (a.lower > b.lower) return 1;
       return a.index - b.index;
     });
-
     return meta.map((m) => m.img);
   }
 
@@ -611,51 +349,14 @@ async function orderImagesForSorting(images, { sortMode, sizeMode, sizeOrder }) 
     const meta = images.map((img, index) => {
       const title = getTitle(img);
       const match = title.match(/^C(\d{2})\/(\d{3})\s+/);
-
-      if (!match) {
-        return {
-          img,
-          index,
-          title,
-          hasCode: false,
-          group: 1,
-          satCode: null,
-          briCode: null,
-        };
-      }
-
+      if (!match) return { img, index, hasCode: false, group: 1, satCode: null, briCode: null };
       const satCode = Number.parseInt(match[1], 10);
       const briCode = Number.parseInt(match[2], 10);
       const group = satCode <= SAT_GROUP_THRESHOLD ? 0 : 1;
-
-      return {
-        img,
-        index,
-        title,
-        hasCode: true,
-        satCode,
-        briCode,
-        group,
-      };
+      return { img, index, hasCode: true, satCode, briCode, group };
     });
 
-    const anyCode = meta.some((m) => m.hasCode);
-    if (!anyCode) {
-      console.warn("No color codes found in titles; falling back to geometry sort.");
-      return sortByGeometry(images);
-    }
-
-    console.groupCollapsed("Sorting (color) – titles, sat & bri");
-    meta.forEach((m) => {
-      console.log(
-        m.title || m.img.id,
-        "=>",
-        m.hasCode
-          ? `group=${m.group}, sat=${m.satCode}, bri=${m.briCode}`
-          : "no-code"
-      );
-    });
-    console.groupEnd();
+    if (!meta.some((m) => m.hasCode)) return sortByGeometry(images);
 
     meta.sort((a, b) => {
       if (a.hasCode && b.hasCode) {
@@ -668,32 +369,21 @@ async function orderImagesForSorting(images, { sortMode, sizeMode, sizeOrder }) 
       if (b.hasCode) return 1;
       return a.index - b.index;
     });
-
     return meta.map((m) => m.img);
   }
 
   if (sortMode === "size") {
     const order = sizeOrder === "asc" ? 1 : -1;
-
-    // Sort by *effective* area after applying the selected resize mode.
-    // If resize is "Match width/height", the key reflects the size you will see after resizing.
     let targetWidth = null;
     let targetHeight = null;
-
-    if (sizeMode === "width") {
-      targetWidth = Math.min(...images.map((img) => img.width));
-    } else if (sizeMode === "height") {
-      targetHeight = Math.min(...images.map((img) => img.height));
-    }
+    if (sizeMode === "width") targetWidth = Math.min(...images.map((img) => img.width));
+    else if (sizeMode === "height") targetHeight = Math.min(...images.map((img) => img.height));
 
     const withKeys = images.map((img, index) => {
       const w0 = img.width || 0;
       const h0 = img.height || 0;
-
       let w = w0;
       let h = h0;
-
-      // Miro keeps aspect ratio when setting width/height, so we simulate that here.
       if (targetWidth && w0 > 0) {
         const scale = targetWidth / w0;
         w = targetWidth;
@@ -703,31 +393,24 @@ async function orderImagesForSorting(images, { sortMode, sizeMode, sizeOrder }) 
         h = targetHeight;
         w = w0 * scale;
       }
-
-      const area = w * h;
-
-      return { img, index, area, w0, h0 };
+      return { img, index, area: w * h, w0, h0 };
     });
 
     withKeys.sort((a, b) => {
       if (a.area !== b.area) return (a.area - b.area) * order;
       if (a.w0 !== b.w0) return (a.w0 - b.w0) * order;
       if (a.h0 !== b.h0) return (a.h0 - b.h0) * order;
-      return a.index - b.index; // stable fallback
+      return a.index - b.index;
     });
 
     return withKeys.map((x) => x.img);
   }
 
-  // Unknown mode: keep as-is.
   return images;
 }
 
-// ---------- SORTING handler ----------
-
 async function handleSortingSubmit(event) {
   event.preventDefault();
-
   try {
     const form = document.getElementById("sorting-form");
     if (!form) return;
@@ -743,73 +426,34 @@ async function handleSortingSubmit(event) {
 
     const selection = await board.getSelection();
     const images = selection.filter((i) => i.type === "image");
-
     if (!images.length) {
       await notifyInfo("Select at least one image");
       return;
     }
-
     if (imagesPerRow < 1) {
       await notifyError("Rows must be greater than 0");
       return;
     }
 
-    if (sortMode === "color") {
-      await notifyInfo("Sorting by color");
-    } else if (sortMode === "size") {
-      await notifyInfo("Sorting by size");
-    }
-
-    const orderedImages = await orderImagesForSorting(images, {
-      sortMode,
-      sizeMode,
-      sizeOrder,
-    });
-
-    await alignImagesInGivenOrder(orderedImages, {
-      imagesPerRow,
-      horizontalGap,
-      verticalGap,
-      sizeMode,
-      startCorner,
-    });
-
-    await notifyInfo(
-      `Aligned ${orderedImages.length} image${orderedImages.length === 1 ? "" : "s"}`,
-      { alignedImages: orderedImages.length }
-    );
+    const orderedImages = await orderImagesForSorting(images, { sortMode, sizeMode, sizeOrder });
+    await alignImagesInGivenOrder(orderedImages, { imagesPerRow, horizontalGap, verticalGap, sizeMode, startCorner });
+    await notifyInfo(`Aligned ${orderedImages.length} image${orderedImages.length === 1 ? "" : "s"}`);
   } catch (err) {
     console.error(err);
     await notifyError("Align images failed", err);
   }
 }
 
-// ---------- STITCH/S SLICE helpers ----------
-
-
 function sortFilesByNameWithNumber(files) {
   const arr = Array.from(files).map((file, index) => {
     const name = file.name || "";
     const lower = name.toLowerCase();
     const num = extractTrailingNumber(name);
-    return {
-      file,
-      index,
-      name,
-      lower,
-      hasNumber: num !== null,
-      num,
-    };
+    return { file, index, lower, num, hasNumber: num !== null };
   });
 
-  console.groupCollapsed("Stitch/Slice – files & numbers");
-  arr.forEach((m) => console.log(m.name, "=>", m.num));
-  console.groupEnd();
-
   const anyHasNumber = arr.some((m) => m.hasNumber);
-
   if (!anyHasNumber) {
-    // если ни у кого нет номера — просто рандомно перемешиваем
     for (let i = arr.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [arr[i], arr[j]] = [arr[j], arr[i]];
@@ -818,28 +462,21 @@ function sortFilesByNameWithNumber(files) {
     arr.sort((a, b) => {
       if (a.hasNumber && !b.hasNumber) return -1;
       if (!a.hasNumber && b.hasNumber) return 1;
-
       if (a.hasNumber && b.hasNumber) {
         if (a.num !== b.num) return a.num - b.num;
         if (a.lower < b.lower) return -1;
         if (a.lower > b.lower) return 1;
         return a.index - b.index;
       }
-
       if (a.lower < b.lower) return -1;
       if (a.lower > b.lower) return 1;
       return a.index - b.index;
     });
   }
-
   return arr.map((m) => m.file);
 }
 
 function canvasToDataUrlUnderLimit(canvas) {
-  // Tool_26 policy:
-  // - EXACTLY one JPEG encoding pass at fixed quality.
-  // - If it doesn't fit, we do NOT downscale and we do NOT reduce quality further.
-  //   The caller must sub-slice the region into smaller tiles.
   const q = 0.8;
   const dataUrl = canvas.toDataURL("image/jpeg", q);
   if (dataUrl.length > MAX_URL_BYTES) {
@@ -852,46 +489,48 @@ function canvasToDataUrlUnderLimit(canvas) {
   return dataUrl;
 }
 
+function rgbaBufferToPngBlob(buffer, width, height) {
+  return new Promise((resolve, reject) => {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = get2dContextSrgb(canvas);
+      ctx.imageSmoothingEnabled = false;
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(buffer), width, height), 0, 0);
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          reject(new Error("PNG tile encode failed"));
+          return;
+        }
+        resolve(blob);
+      }, HUGE_TILE_MIME);
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
 
-
-function computeVariableSlotCenters(
-  orderedInfos,
-  imagesPerRow,
-  startCorner,
-  viewCenterX,
-  viewCenterY
-) {
+function computeVariableSlotCenters(orderedInfos, imagesPerRow, startCorner, viewCenterX, viewCenterY) {
   const totalSlots = orderedInfos.length;
   if (!totalSlots) return [];
-
   const cols = Math.max(1, imagesPerRow);
   const rows = Math.ceil(totalSlots / cols);
-  const horizontalGap = 0;
-  const verticalGap = 0;
-
   const rowHeights = new Array(rows).fill(0);
   const rowWidths = new Array(rows).fill(0);
 
   for (let i = 0; i < totalSlots; i++) {
     const r = Math.floor(i / cols);
     const info = orderedInfos[i];
-    const w = info.width;
-    const h = info.height;
-
-    if (h > rowHeights[r]) rowHeights[r] = h;
-    if (rowWidths[r] > 0) rowWidths[r] += horizontalGap;
-    rowWidths[r] += w;
+    if (info.height > rowHeights[r]) rowHeights[r] = info.height;
+    if (rowWidths[r] > 0) rowWidths[r] += 0;
+    rowWidths[r] += info.width;
   }
 
   const gridWidth = rowWidths.length ? Math.max(...rowWidths) : 0;
-  const gridHeight =
-    rowHeights.reduce((sum, h) => sum + h, 0) +
-    verticalGap * Math.max(0, rows - 1);
-
+  const gridHeight = rowHeights.reduce((sum, h) => sum + h, 0);
   const rowTop = new Array(rows).fill(0);
-  for (let r = 1; r < rows; r++) {
-    rowTop[r] = rowTop[r - 1] + rowHeights[r - 1] + verticalGap;
-  }
+  for (let r = 1; r < rows; r++) rowTop[r] = rowTop[r - 1] + rowHeights[r - 1];
 
   const baseX = new Array(totalSlots).fill(0);
   const baseY = new Array(totalSlots).fill(0);
@@ -900,57 +539,29 @@ function computeVariableSlotCenters(
   for (let i = 0; i < totalSlots; i++) {
     const r = Math.floor(i / cols);
     const info = orderedInfos[i];
-    const w = info.width;
-
-    const centerY = rowTop[r] + rowHeights[r] / 2;
-    const centerX = rowCursorX[r] + w / 2;
-
-    baseX[i] = centerX;
-    baseY[i] = centerY;
-
-    rowCursorX[r] += w + horizontalGap;
+    baseY[i] = rowTop[r] + rowHeights[r] / 2;
+    baseX[i] = rowCursorX[r] + info.width / 2;
+    rowCursorX[r] += info.width;
   }
 
-    const { flipX, flipY } = getCornerFlip(startCorner);
-
-const centers = [];
+  const { flipX, flipY } = getCornerFlip(startCorner);
+  const centers = [];
   for (let i = 0; i < totalSlots; i++) {
     let x0 = baseX[i] - gridWidth / 2;
     let y0 = baseY[i] - gridHeight / 2;
-
     if (flipX) x0 = -x0;
     if (flipY) y0 = -y0;
-
-    const cx = viewCenterX + x0;
-    const cy = viewCenterY + y0;
-    centers.push({ x: cx, y: cy });
+    centers.push({ x: viewCenterX + x0, y: viewCenterY + y0 });
   }
-
   return centers;
 }
 
-function computeSkipMissingSlotCenters(
-  tileInfos,
-  imagesPerRow,
-  startCorner,
-  viewCenterX,
-  viewCenterY
-) {
+function computeSkipMissingSlotCenters(tileInfos, imagesPerRow, startCorner, viewCenterX, viewCenterY) {
   if (!tileInfos.length) return [];
-
-  // IMPORTANT:
-  // When the smallest tile number is not aligned to the start of a row (num % cols !== 0),
-  // a naive normalization by minNum causes "wrap" across rows:
-  // tiles that should be on the left of later rows can end up on the far right.
-  // Fix: anchor by (minRow, minCol) in the source grid and normalize by row/col.
   const cols = Math.max(1, imagesPerRow);
   const cellWidth = tileInfos[0].info.width;
   const cellHeight = tileInfos[0].info.height;
-
-  let minRow = Infinity;
-  let maxRow = -Infinity;
-  let minCol = Infinity;
-  let maxCol = -Infinity;
+  let minRow = Infinity, maxRow = -Infinity, minCol = Infinity, maxCol = -Infinity;
 
   for (const { num } of tileInfos) {
     const row = Math.floor(num / cols);
@@ -963,77 +574,132 @@ function computeSkipMissingSlotCenters(
 
   const normCols = Math.max(1, maxCol - minCol + 1);
   const normRows = Math.max(1, maxRow - minRow + 1);
-
   const gridWidth = normCols * cellWidth;
   const gridHeight = normRows * cellHeight;
-
   let flipX = false;
   let flipY = false;
   switch (startCorner) {
-    case "top-right":
-      flipX = true;
-      break;
-    case "bottom-left":
-      flipY = true;
-      break;
-    case "bottom-right":
-      flipX = true;
-      flipY = true;
-      break;
-    default:
-      break;
+    case "top-right": flipX = true; break;
+    case "bottom-left": flipY = true; break;
+    case "bottom-right": flipX = true; flipY = true; break;
+    default: break;
   }
 
   const centersByFileId = new Map();
-
   for (const { info, num } of tileInfos) {
-    // Normalize to the bounding rectangle of provided tiles.
-    // This preserves correct adjacency even when the batch starts mid-row.
     let row = Math.floor(num / cols) - minRow;
     let col = (num % cols) - minCol;
-
     if (flipX) col = normCols - 1 - col;
     if (flipY) row = normRows - 1 - row;
-
     const left = viewCenterX - gridWidth / 2 + col * cellWidth;
     const top = viewCenterY - gridHeight / 2 + row * cellHeight;
-
-    const cx = left + cellWidth / 2;
-    const cy = top + cellHeight / 2;
-
-    centersByFileId.set(info.file, { x: cx, y: cy });
+    centersByFileId.set(info.file, { x: left + cellWidth / 2, y: top + cellHeight / 2 });
   }
-
   return centersByFileId;
 }
 
-// ---------- STITCH/S SLICE handler ----------
+function createHugeSliceManager() {
+  let worker = null;
+  let requestId = 1;
+  let fileId = 1;
+  const pending = new Map();
+  const sessions = new WeakMap();
+
+  function ensureWorker() {
+    if (worker) return worker;
+    worker = new Worker(HUGE_WORKER_PATH);
+    worker.onmessage = (event) => {
+      const msg = event.data || {};
+      const pendingReq = pending.get(msg.reqId);
+      if (!pendingReq) return;
+      pending.delete(msg.reqId);
+      if (msg.type && msg.type.endsWith("-error")) {
+        pendingReq.reject(new Error(msg.error || "Worker request failed"));
+        return;
+      }
+      pendingReq.resolve(msg);
+    };
+    worker.onerror = (event) => {
+      console.error("[Image Align Tool] huge worker crashed", event);
+      for (const [id, req] of pending.entries()) {
+        pending.delete(id);
+        req.reject(new Error("Huge slice worker crashed"));
+      }
+    };
+    return worker;
+  }
+
+  function callWorker(message, transfer = []) {
+    const id = requestId++;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      ensureWorker().postMessage({ ...message, reqId: id }, transfer);
+    });
+  }
+
+  async function openFile(file) {
+    let session = sessions.get(file);
+    if (session && session.openPromise) return session.openPromise;
+    const currentFileId = `huge-${fileId++}`;
+    session = { fileId: currentFileId, openPromise: null };
+    sessions.set(file, session);
+    session.openPromise = callWorker({ type: "open", fileId: currentFileId, file }, [file])
+      .then((msg) => ({ fileId: currentFileId, width: msg.width, height: msg.height }))
+      .catch((err) => {
+        sessions.delete(file);
+        throw err;
+      });
+    return session.openPromise;
+  }
+
+  async function renderTile(file, sx, sy, sw, sh) {
+    const session = sessions.get(file);
+    if (!session || !session.openPromise) throw new Error("Huge file session is not open");
+    await session.openPromise;
+    const msg = await callWorker({ type: "render", fileId: session.fileId, sx, sy, sw, sh });
+    return { width: msg.width, height: msg.height, buffer: msg.buffer };
+  }
+
+  async function closeFile(file) {
+    const session = sessions.get(file);
+    if (!session) return;
+    try {
+      await callWorker({ type: "close", fileId: session.fileId });
+    } catch (e) {
+      console.warn("[Image Align Tool] huge worker close failed", e);
+    }
+    sessions.delete(file);
+  }
+
+  async function disposeAll() {
+    if (worker) {
+      try {
+        worker.terminate();
+      } catch (_) {}
+      worker = null;
+    }
+    pending.clear();
+  }
+
+  return { openFile, renderTile, closeFile, disposeAll };
+}
 
 async function handleStitchSubmit(event) {
   event.preventDefault();
-
   logCanvasColorSpace("Stitch/Slice");
 
-
-  // ---- run-level timers & stats (declared early to avoid TDZ across reruns) ----
-  var prepStartTs = performance.now();
-  var prepEndTs = null;
-  var uploadStartTs = null;
-  var uploadEndTs = null;
-  var uploadRetryEvents = 0;
-  var uploadedBytesDone = 0;
-
-  // createImage wall-time (includes retries/backoff)
-  var createImageWallTimesMs = [];
-  var createImageWallTimeSumMs = 0;
-  var createImageWallTimeCount = 0;
+  const hugeManager = createHugeSliceManager();
+  let uploadedBytesDone = 0;
+  let uploadRetryEvents = 0;
+  const createImageWallTimesMs = [];
+  let createImageWallTimeSumMs = 0;
+  let createImageWallTimeCount = 0;
 
   const stitchButton = document.getElementById("stitchButton");
   const progressBarEl = document.getElementById("stitchProgressBar");
   const progressMainEl = document.getElementById("stitchProgressMain");
   const progressEtaEl = document.getElementById("stitchProgressEta");
 
-  // Stage label under the progress bar (inserted dynamically to avoid editing panel.html)
   let progressStageEl = document.getElementById("stitchProgressStage");
   if (!progressStageEl && progressMainEl && progressMainEl.parentNode) {
     progressStageEl = document.createElement("div");
@@ -1046,9 +712,8 @@ async function handleStitchSubmit(event) {
     progressMainEl.parentNode.insertBefore(progressStageEl, progressMainEl);
   }
 
-
   const STAGES_TOTAL = 2;
-  let stageIndex = 1; // 1/2 = Preparing, 2/2 = Uploading
+  let stageIndex = 1;
 
   const resetProgressUiState = () => {
     if (progressBarEl) {
@@ -1098,45 +763,27 @@ async function handleStitchSubmit(event) {
 
   const setStage = (idx) => {
     stageIndex = Math.max(1, Math.min(STAGES_TOTAL, idx));
-    if (progressStageEl) {
-      progressStageEl.textContent = `Stage ${stageIndex}/${STAGES_TOTAL}`;
-    }
+    if (progressStageEl) progressStageEl.textContent = `Stage ${stageIndex}/${STAGES_TOTAL}`;
   };
 
-  let setProgress = (done, total, labelOverride, displayDone, displayTotal) => {
-  // total === 0 используется для "статусных" сообщений (например, Calculating layout…)
-  // В этом случае НЕ трогаем ширину прогресс-бара, чтобы не было скачков.
-  if (total > 0 && progressBarEl) {
-    const frac = done / total;
-    progressBarEl.style.width = `${(frac * 100).toFixed(1)}%`;
-  }
-
-  if (!progressMainEl) return;
-
-  const labelRaw = labelOverride !== undefined ? String(labelOverride) : "Creating";
-  const label = labelRaw;
-
-  // For some phases (e.g., Preparing), we want the progress bar to use "done/total steps"
-  // but the visible counter to stay on "filesDone/filesTotal" to avoid confusion like 260/260 for 256 files.
-  const showDisplayCounts =
-    Number.isFinite(displayTotal) && displayTotal > 0 && Number.isFinite(displayDone);
-
-  if (total > 0) {
-    if (done < total) {
-      progressMainEl.textContent = showDisplayCounts ? `${label} ${displayDone} / ${displayTotal}` : `${label} ${done} / ${total}`;
-    } else {
-      // Не показываем "Done!" после Preparing — это выглядит как будто всё закончилось.
-      const keepCounts = labelRaw.startsWith("Preparing") || labelRaw.startsWith("Uploading");
-      progressMainEl.textContent = keepCounts ? (showDisplayCounts ? `${label} ${displayDone} / ${displayTotal}` : `${label} ${done} / ${total}`) : "Done!";
+  const setProgress = (done, total, labelOverride, displayDone, displayTotal) => {
+    if (total > 0 && progressBarEl) {
+      const frac = done / total;
+      progressBarEl.style.width = `${(frac * 100).toFixed(1)}%`;
     }
-    return;
-  }
+    if (!progressMainEl) return;
+    const label = labelOverride !== undefined ? String(labelOverride) : "Creating";
+    const showDisplayCounts = Number.isFinite(displayTotal) && displayTotal > 0 && Number.isFinite(displayDone);
+    if (total > 0) {
+      const shownDone = showDisplayCounts ? displayDone : done;
+      const shownTotal = showDisplayCounts ? displayTotal : total;
+      progressMainEl.textContent = `${label} ${shownDone} / ${shownTotal}`;
+      return;
+    }
+    progressMainEl.textContent = labelOverride !== undefined ? label : "";
+  };
 
-  // total === 0: просто статусная строка
-  progressMainEl.textContent = labelOverride !== undefined ? label : "";
-};
-
-  let setEtaText = (ms) => {
+  const setEtaText = (ms) => {
     if (!progressEtaEl) return;
     if (ms == null || !Number.isFinite(ms) || ms < 0) {
       progressEtaEl.textContent = "";
@@ -1146,72 +793,18 @@ async function handleStitchSubmit(event) {
     const mins = Math.floor(totalSeconds / 60);
     const secs = totalSeconds % 60;
     const secsStr = secs.toString().padStart(2, "0");
-    const text = mins ? `${mins}m ${secsStr}s left` : `${secsStr}s left`;
-    progressEtaEl.textContent = text;
+    progressEtaEl.textContent = mins ? `${mins}m ${secsStr}s left` : `${secsStr}s left`;
   };
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ---- UI update throttling (avoids excessive DOM reflows on 1000+ tiles) ----
-const makeThrottled = (fn, intervalMs = 200) => {
-  let lastCall = 0;
-  let timer = null;
-  let lastArgs = null;
-
-  const throttled = (...args) => {
-    lastArgs = args;
-    const now = performance.now();
-    const elapsed = now - lastCall;
-
-    if (elapsed >= intervalMs) {
-      lastCall = now;
-      fn(...lastArgs);
-      return;
-    }
-
-    if (timer) return;
-
-    timer = setTimeout(() => {
-      timer = null;
-      lastCall = performance.now();
-      fn(...lastArgs);
-    }, Math.max(0, intervalMs - elapsed));
-  };
-
-  throttled.flush = () => {
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
-    }
-    if (lastArgs) {
-      lastCall = performance.now();
-      fn(...lastArgs);
-    }
-  };
-
-  return throttled;
-};
-
-// Wrap progress UI updates with throttling (only once per session)
-if (!setProgress._throttleWrapped) {
-  const _setProgressNow = setProgress;
-  const _setEtaTextNow = setEtaText;
-  const sp = makeThrottled(_setProgressNow, 200);
-  const se = makeThrottled(_setEtaTextNow, 200);
-  sp._throttleWrapped = true;
-  se._throttleWrapped = true;
-  setProgress = sp;
-  setEtaText = se;
-}
   try {
-    prepStartTs = performance.now();
-
     const form = document.getElementById("stitch-form");
     if (!form) return;
 
     const imagesPerRow = Number(form.stitchImagesPerRow.value) || 1;
     const startCorner = form.stitchStartCorner.value;
     const skipMissingTiles = form.stitchSkipMissing.checked;
-
     const input = document.getElementById("stitchFolderInput");
     const files = input ? input.files : null;
 
@@ -1219,7 +812,6 @@ if (!setProgress._throttleWrapped) {
       await notifyError("Select one or more image files");
       return;
     }
-
     if (imagesPerRow < 1) {
       await notifyError("Rows must be greater than 0");
       return;
@@ -1229,56 +821,11 @@ if (!setProgress._throttleWrapped) {
     resetProgressUiState();
     setProgress(0, 0, "");
     setEtaText(null);
-    if (setEtaText.flush) setEtaText.flush();
-
 
     const filesArray = Array.from(files);
-
-    // Stage 1/2: preparing (decode + analyze + planning). Мы НЕ храним base64 в памяти.
     setStage(1);
-    const PREP_EXTRA_STEPS = 4; // sorting + indexing + tile counting + layout planning
+    const PREP_EXTRA_STEPS = 4;
     const prepTotalSteps = filesArray.length + PREP_EXTRA_STEPS;
-
-    // ---- ETA for preparing (Stage 1/2) ----
-    let prepLastTs = null;
-    let prepLastDone = 0;
-    let ewmaPrepRateStepsPerMs = null;
-    const PREP_ETA_EWMA_ALPHA = 0.25;
-
-    const startPrepEta = () => {
-      prepLastTs = performance.now();
-
-      prepLastDone = 0;
-      ewmaPrepRateStepsPerMs = null;
-      setEtaText(null);
-    };
-
-    const updatePrepEta = (doneSteps, totalSteps) => {
-      if (!prepStartTs || !Number.isFinite(totalSteps) || totalSteps <= 0) return;
-
-      const now = performance.now();
-      const dt = now - (prepLastTs || now);
-      const dd = doneSteps - prepLastDone;
-
-      if (dt < 200 || dd <= 0) return;
-
-      const instRate = dd / dt; // steps per ms
-      ewmaPrepRateStepsPerMs =
-        ewmaPrepRateStepsPerMs == null
-          ? instRate
-          : PREP_ETA_EWMA_ALPHA * instRate + (1 - PREP_ETA_EWMA_ALPHA) * ewmaPrepRateStepsPerMs;
-
-      prepLastTs = now;
-      prepLastDone = doneSteps;
-
-      const remaining = totalSteps - doneSteps;
-      if (remaining <= 0 || !ewmaPrepRateStepsPerMs || ewmaPrepRateStepsPerMs <= 0) {
-        setEtaText(null);
-        return;
-      }
-      const etaMs = remaining / ewmaPrepRateStepsPerMs;
-      setEtaText(etaMs);
-    };
 
     let viewCenterX = 0;
     let viewCenterY = 0;
@@ -1292,36 +839,29 @@ if (!setProgress._throttleWrapped) {
 
     const fileInfos = [];
     let anySliced = false;
-    let softProbeFailures = 0;
-    const tooLargeProbeFailures = [];
+    const hugeInitFailures = [];
 
-        startPrepEta();
-setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
+    setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
 
     for (let i = 0; i < filesArray.length; i++) {
       const file = filesArray[i];
-      // Обновляем прогресс на этапе подготовки файлов
       setProgress(i + 1, prepTotalSteps, "Preparing files…", i + 1, filesArray.length);
-      updatePrepEta(i + 1, prepTotalSteps);
-      // Даем браузеру шанс отрисовать прогресс на больших партиях
-      await new Promise((r) => setTimeout(r, 0));
-// Use object URL to avoid holding giant base64 strings in memory.
-let imgEl;
-try {
-  imgEl = await decodeImageFromFile(file);
-} catch (e) {
-  console.error("Stitch/Slice: browser failed to decode image", file.name, e);
-  await notifyError("Cannot decode image", { fileName: file.name, error: e });
-  continue;
-}
+      await sleep(0);
+
+      let imgEl;
+      try {
+        imgEl = await decodeImageFromFile(file);
+      } catch (e) {
+        console.error("Stitch/Slice: browser failed to decode image", file.name, e);
+        await notifyError("Cannot decode image", { fileName: file.name, error: e });
+        continue;
+      }
 
       const width = imgEl.naturalWidth || imgEl.width;
       const height = imgEl.naturalHeight || imgEl.height;
-
       if (!width || !height) {
-        console.error("Stitch/Slice: invalid dimensions", width, height, file.name);
         await notifyError("Invalid image size", { fileName: file.name, width, height });
-        try { imgEl.src = ""; } catch (e) {}
+        try { imgEl.src = ""; } catch (_) {}
         continue;
       }
 
@@ -1343,75 +883,55 @@ try {
           saturation = res.saturation;
         }
       } catch (e) {
-        console.warn(
-          "Stitch/Slice: brightness/saturation calc failed for",
-          file.name,
-          e
-        );
+        console.warn("Stitch/Slice: brightness/saturation calc failed for", file.name, e);
       }
 
-      const briCodeRaw = Math.round((1 - brightness) * 999);
-      const briCode = Math.max(0, Math.min(999, briCodeRaw));
-
-      const boostedSat = Math.min(1, saturation * SAT_BOOST);
-      const satCodeRaw = Math.round(boostedSat * SAT_CODE_MAX);
-      const satCode = Math.max(0, Math.min(SAT_CODE_MAX, satCodeRaw));
-
-      const needsSlice =
-        width > SLICE_THRESHOLD_WIDTH || height > SLICE_THRESHOLD_HEIGHT;
-
+      const briCode = Math.max(0, Math.min(999, Math.round((1 - brightness) * 999)));
+      const satCode = Math.max(0, Math.min(SAT_CODE_MAX, Math.round(Math.min(1, saturation * SAT_BOOST) * SAT_CODE_MAX)));
+      const needsSlice = width > SLICE_THRESHOLD_WIDTH || height > SLICE_THRESHOLD_HEIGHT;
       if (needsSlice) anySliced = true;
 
-      let tilesX = 1;
-      let tilesY = 1;
-      let numTiles = 1;
+      let previewTilesX = 1;
+      let previewTilesY = 1;
+      let previewNumTiles = 1;
       if (needsSlice) {
-        tilesX = Math.ceil(width / SLICE_TILE_SIZE);
-        tilesY = Math.ceil(height / SLICE_TILE_SIZE);
-        numTiles = tilesX * tilesY;
+        previewTilesX = Math.ceil(width / SLICE_TILE_SIZE);
+        previewTilesY = Math.ceil(height / SLICE_TILE_SIZE);
+        previewNumTiles = previewTilesX * previewTilesY;
       }
 
-      const useBitmapRegion = needsSlice && (
-        width > LARGE_IMAGE_BITMAP_MIN_DIM ||
-        height > LARGE_IMAGE_BITMAP_MIN_DIM ||
-        numTiles >= LARGE_IMAGE_BITMAP_MIN_TILES
+      const useHugeWorker = needsSlice && (
+        width > LARGE_IMAGE_WORKER_MIN_DIM ||
+        height > LARGE_IMAGE_WORKER_MIN_DIM ||
+        previewNumTiles >= LARGE_IMAGE_WORKER_MIN_TILES
       );
+      const sliceTileSize = useHugeWorker ? HUGE_SLICE_TILE_SIZE : SLICE_TILE_SIZE;
+      const tilesX = needsSlice ? Math.ceil(width / sliceTileSize) : 1;
+      const tilesY = needsSlice ? Math.ceil(height / sliceTileSize) : 1;
+      const numTiles = tilesX * tilesY;
 
-      const shouldRunLargeProbe = useBitmapRegion && (
-        width >= LARGE_IMAGE_PROBE_MIN_DIM ||
-        height >= LARGE_IMAGE_PROBE_MIN_DIM ||
-        numTiles >= LARGE_IMAGE_PROBE_MIN_TILES
-      );
-
-      let probeFailedSoft = false;
-      if (shouldRunLargeProbe) {
-        setProgress(i + 1, prepTotalSteps, "Preparing files… (large image probe)", i + 1, filesArray.length);
-        const probe = await probeBitmapSlicePath(file, width, height);
-        console.log("[Image Align Tool] large image probe", probe.diag);
-        if (!probe.ok) {
-          probeFailedSoft = true;
-          softProbeFailures += 1;
-          tooLargeProbeFailures.push({
+      if (useHugeWorker) {
+        try {
+          const sessionMeta = await hugeManager.openFile(file);
+          console.log("[Image Align Tool] huge mode init", {
             fileName: file.name,
             width,
             height,
+            workerWidth: sessionMeta.width,
+            workerHeight: sessionMeta.height,
             tilesX,
             tilesY,
-            numTiles,
-            stopReason: probe && probe.diag ? probe.diag.stopReason : null,
-            error: probe && probe.diag ? probe.diag.error : null,
+            sliceTileSize,
           });
-          console.warn("[Image Align Tool] large image probe failed; file skipped", probe.diag);
-          try { imgEl.src = ""; } catch (e) {}
-          setProgress(i + 1, prepTotalSteps, "Preparing files…", i + 1, filesArray.length);
+        } catch (e) {
+          hugeInitFailures.push({ fileName: file.name, width, height, error: e && e.message ? e.message : String(e) });
+          console.error("[Image Align Tool] huge mode init failed", { fileName: file.name, error: e });
+          try { imgEl.src = ""; } catch (_) {}
           continue;
         }
-        setProgress(i + 1, prepTotalSteps, "Preparing files…", i + 1, filesArray.length);
       }
 
-      // Release the decoded preview image after analysis.
-      try { imgEl.src = ""; } catch (e) {}
-
+      try { imgEl.src = ""; } catch (_) {}
       fileInfos.push({
         file,
         width,
@@ -1419,24 +939,20 @@ try {
         briCode,
         satCode,
         needsSlice,
-        useBitmapRegion,
-        probeFailedSoft,
+        useHugeWorker,
         tilesX,
         tilesY,
         numTiles,
+        sliceTileSize,
       });
     }
 
-    // Доп. шаги подготовки (раньше здесь было ощущение "простоя")
     let prepDone = filesArray.length;
 
     if (!fileInfos.length) {
-      if (tooLargeProbeFailures.length > 0) {
-        if (setProgress.flush) setProgress.flush();
-        if (setEtaText.flush) setEtaText.flush();
-        setEtaText(null);
+      if (hugeInitFailures.length > 0) {
         showFailedProgressState("Image is too large");
-        await notifyWarning(TOO_LARGE_IMPORT_MESSAGE, { failedFiles: tooLargeProbeFailures });
+        await notifyWarning(TOO_LARGE_IMPORT_MESSAGE, { failedFiles: hugeInitFailures });
         return;
       }
       setProgress(0, 0, "Nothing to import.");
@@ -1444,154 +960,90 @@ try {
       return;
     }
 
-    if (tooLargeProbeFailures.length > 0) {
+    if (hugeInitFailures.length > 0) {
       await notifyWarning(
-        tooLargeProbeFailures.length === 1 ? TOO_LARGE_IMPORT_MESSAGE : "Some images are too large",
-        { failedFiles: tooLargeProbeFailures }
+        hugeInitFailures.length === 1 ? TOO_LARGE_IMPORT_MESSAGE : "Some images are too large",
+        { failedFiles: hugeInitFailures }
       );
-    } else if (softProbeFailures > 0) {
-      await notifyWarning("Probe failed, trying upload", { softProbeFailures });
     }
 
-    // 1) sorting
     prepDone += 1;
     setProgress(prepDone, prepTotalSteps, "Preparing files… (sorting)", filesArray.length, filesArray.length);
-    updatePrepEta(prepDone, prepTotalSteps);
-    await new Promise((r) => setTimeout(r, 0));
+    await sleep(0);
 
     const orderedFiles = sortFilesByNameWithNumber(filesArray);
-
-    // 2) indexing
     prepDone += 1;
     setProgress(prepDone, prepTotalSteps, "Preparing files… (indexing)", filesArray.length, filesArray.length);
-    updatePrepEta(prepDone, prepTotalSteps);
-    await new Promise((r) => setTimeout(r, 0));
+    await sleep(0);
+
     const infoByFile = new Map();
     fileInfos.forEach((info) => infoByFile.set(info.file, info));
-
-    const orderedInfos = orderedFiles
-      .map((f) => infoByFile.get(f))
-      .filter(Boolean);
+    const orderedInfos = orderedFiles.map((f) => infoByFile.get(f)).filter(Boolean);
 
     if (!orderedInfos.length) {
       setProgress(0, 0, "Nothing to import.");
-      setEtaText(null);
       return;
     }
 
-    // 3) tile counting
     prepDone += 1;
     setProgress(prepDone, prepTotalSteps, "Preparing files… (counting tiles)", filesArray.length, filesArray.length);
-    updatePrepEta(prepDone, prepTotalSteps);
-    await new Promise((r) => setTimeout(r, 0));
+    await sleep(0);
 
-    let totalTiles = orderedInfos.reduce(
-      (sum, info) => sum + (info.needsSlice ? info.numTiles : 1),
-      0
-    );
-
+    let totalTiles = orderedInfos.reduce((sum, info) => sum + (info.needsSlice ? info.numTiles : 1), 0);
     if (anySliced && skipMissingTiles) {
       await notifyInfo("Skip missing tiles ignored");
     }
 
-    // 4) layout planning (не доводим прогресс до 100% ДО завершения расчётов)
+    prepDone += 1;
     setProgress(prepDone, prepTotalSteps, "Preparing files… (layout)", filesArray.length, filesArray.length);
-    updatePrepEta(prepDone, prepTotalSteps);
-    await new Promise((r) => setTimeout(r, 0));
+    await sleep(0);
 
-let slotCentersByFile = null;
+    let slotCentersByFile = null;
     let slotCentersArray = null;
-
-    const hasAnyNumber = orderedInfos.some((info) => {
-      const name = info.file.name || "";
-      return extractTrailingNumber(name) !== null;
-    });
-
+    const hasAnyNumber = orderedInfos.some((info) => extractTrailingNumber(info.file.name || "") !== null);
     if (!anySliced && skipMissingTiles && hasAnyNumber) {
       const tileInfos = [];
-      let minNum = Infinity;
       let maxNum = -Infinity;
-
       for (const info of orderedInfos) {
-        const name = info.file.name || "";
-        const num = extractTrailingNumber(name);
+        const num = extractTrailingNumber(info.file.name || "");
         if (num === null) continue;
         tileInfos.push({ info, num });
-        if (num < minNum) minNum = num;
         if (num > maxNum) maxNum = num;
       }
-
       if (!tileInfos.length) {
-        slotCentersArray = computeVariableSlotCenters(
-          orderedInfos,
-          imagesPerRow,
-          startCorner,
-          viewCenterX,
-          viewCenterY
-        );
+        slotCentersArray = computeVariableSlotCenters(orderedInfos, imagesPerRow, startCorner, viewCenterX, viewCenterY);
       } else {
         let current = maxNum;
         for (const info of orderedInfos) {
           const already = tileInfos.find((t) => t.info.file === info.file);
-          if (!already) {
-            current += 1;
-            tileInfos.push({ info, num: current });
-          }
+          if (!already) tileInfos.push({ info, num: ++current });
         }
-        slotCentersByFile = computeSkipMissingSlotCenters(
-          tileInfos,
-          imagesPerRow,
-          startCorner,
-          viewCenterX,
-          viewCenterY
-        );
+        slotCentersByFile = computeSkipMissingSlotCenters(tileInfos, imagesPerRow, startCorner, viewCenterX, viewCenterY);
       }
     } else {
-      slotCentersArray = computeVariableSlotCenters(
-        orderedInfos,
-        imagesPerRow,
-        startCorner,
-        viewCenterX,
-        viewCenterY
-      );
+      slotCentersArray = computeVariableSlotCenters(orderedInfos, imagesPerRow, startCorner, viewCenterX, viewCenterY);
     }
-
-    // Завершили layout planning
-    prepDone += 1;
-    setProgress(prepDone, prepTotalSteps, "Preparing files… (layout)", filesArray.length, filesArray.length);
-    updatePrepEta(prepDone, prepTotalSteps);
-    await new Promise((r) => setTimeout(r, 0));
 
     const allCreatedTiles = [];
     let createdTiles = 0;
     let settledTiles = 0;
     let skippedTiles = 0;
-    const failedBitmapFiles = new Map();
+    const failedHugeFiles = new Map();
     const failedSourceFiles = new Map();
 
     const recordFailedSourceFile = (fileName, reason, details) => {
       const key = fileName || "image";
       if (!failedSourceFiles.has(key)) {
-        failedSourceFiles.set(key, {
-          fileName: key,
-          reason: reason || "import-failed",
-          details: details || null,
-        });
+        failedSourceFiles.set(key, { fileName: key, reason: reason || "import-failed", details: details || null });
       }
-      console.warn("[Image Align Tool] source file failed", {
-        fileName: key,
-        reason,
-        details,
-      });
+      console.warn("[Image Align Tool] source file failed", { fileName: key, reason, details });
     };
 
     const markJobSettled = (job, status, details) => {
       if (job && job.__settled) return;
       if (job) job.__settled = true;
       settledTiles += 1;
-      if (status === "skipped") {
-        skippedTiles += 1;
-      }
+      if (status === "skipped") skippedTiles += 1;
       if (details) {
         console.log("[Image Align Tool] job settled", {
           status,
@@ -1600,856 +1052,194 @@ let slotCentersByFile = null;
           details,
         });
       }
-      updateCreationProgress();
-    };
-
-    const markBitmapFileFailed = (file, error, job) => {
-      if (!file) return;
-      if (!failedBitmapFiles.has(file)) {
-        const failedFileName = (job && job.file && job.file.name) || (file && file.name) || "image";
-        const failedMessage = error && error.message ? error.message : String(error || "bitmap file failed");
-        failedBitmapFiles.set(file, {
-          fileName: failedFileName,
-          message: failedMessage,
-        });
-        recordFailedSourceFile(failedFileName, "bitmap-file-failed", failedMessage);
-        console.warn("[Image Align Tool] bitmap file failed; skipping remaining tiles", {
-          fileName: failedFileName,
-          error,
-        });
-      }
-    };
-
-    // ---- ETA: считаем по фактической пропускной способности (учитывает параллелизм) ----
-    // adaptive concurrency diagnostics
-    let maxConcurrencySeen = 0;
-    const concurrencyDecisions = []; // {idx, conc, mbps, ips, retriesPerTile, msPerTile, action}
-    let lastEtaUpdateTs = null;
-    let lastEtaCreated = 0;
-    let ewmaRateTilesPerMs = null;
-    // uploadedBytesDone is declared at the run-level (var) and reused here
-    let lastEtaBytesDone = 0;
-    let ewmaRateBytesPerMs = null;
-    const ETA_EWMA_ALPHA = 0.25;
-
-    const startEta = () => {
-      uploadStartTs = performance.now();
-      lastEtaUpdateTs = uploadStartTs;
-      lastEtaCreated = 0;
-      ewmaRateTilesPerMs = null;
-
-      uploadedBytesDone = 0;
-      lastEtaBytesDone = 0;
-      ewmaRateBytesPerMs = null;
-    };
-
-    const pad2 = (n) => String(n).padStart(2, "0");
-    const pad3 = (n) => String(n).padStart(3, "0");
-
-    const updateCreationProgress = () => {
       setProgress(settledTiles, totalTiles, "Uploading to board…");
-
-      if (!uploadStartTs) {
-        setEtaText(null);
-        return;
-      }
-
-      const remainingTiles = totalTiles - settledTiles;
-      if (remainingTiles <= 0) {
-        setEtaText(null);
-        return;
-      }
-
-
-      const ETA_MIN_SAMPLES = 6;
-      if (createdTiles < ETA_MIN_SAMPLES) {
-        setEtaText(null);
-        return;
-      }
-      const now = performance.now();
-      const dt = now - (lastEtaUpdateTs || now);
-
-      // Обновляем EWMA-рейт не чаще чем раз в ~200мс и только если был прогресс.
-      const dc = createdTiles - lastEtaCreated;
-      const db = uploadedBytesDone - lastEtaBytesDone;
-
-      if (dt >= 200 && (dc > 0 || db > 0)) {
-        if (dc > 0) {
-          const instRateTiles = dc / dt; // tiles per ms
-          ewmaRateTilesPerMs =
-            ewmaRateTilesPerMs == null
-              ? instRateTiles
-              : ETA_EWMA_ALPHA * instRateTiles + (1 - ETA_EWMA_ALPHA) * ewmaRateTilesPerMs;
-        }
-
-        if (db > 0) {
-          const instRateBytes = db / dt; // bytes per ms
-          ewmaRateBytesPerMs =
-            ewmaRateBytesPerMs == null
-              ? instRateBytes
-              : ETA_EWMA_ALPHA * instRateBytes + (1 - ETA_EWMA_ALPHA) * ewmaRateBytesPerMs;
-        }
-
-        lastEtaUpdateTs = now;
-        lastEtaCreated = createdTiles;
-        lastEtaBytesDone = uploadedBytesDone;
-      }
-
-      const elapsed = now - uploadStartTs;
-      if (elapsed <= 0) {
-        setEtaText(null);
-        return;
-      }
-
-      // ETA считаем и по байтам, и по количеству тайлов. Берём более "пессимистичную" оценку — так меньше расхождение.
-      const avgBytesPerTile = createdTiles > 0 ? (uploadedBytesDone / createdTiles) : null;
-      const rateBytes = ewmaRateBytesPerMs && ewmaRateBytesPerMs > 0 ? ewmaRateBytesPerMs : null;
-
-      let etaByBytes = null;
-      if (avgBytesPerTile && rateBytes) {
-        const remainingBytes = remainingTiles * avgBytesPerTile;
-        etaByBytes = remainingBytes / rateBytes;
-      }
-
-      // Fallback: по тайлам
-      const overallRateTiles = createdTiles > 0 ? createdTiles / elapsed : 0;
-      const rateTiles =
-        ewmaRateTilesPerMs && ewmaRateTilesPerMs > 0 ? ewmaRateTilesPerMs : overallRateTiles;
-
-      if (!rateTiles || rateTiles <= 0) {
-        setEtaText(null);
-        return;
-      }
-
-      let etaByTiles = null;
-      if (rateTiles && rateTiles > 0) {
-        etaByTiles = remainingTiles / rateTiles;
-      }
-
-      let etaMs = null;
-      if (etaByBytes != null && etaByTiles != null) {
-        etaMs = Math.max(etaByBytes, etaByTiles);
-      } else {
-        etaMs = etaByBytes != null ? etaByBytes : etaByTiles;
-      }
-
-      setEtaText(etaMs);
     };
 
-    // Stage 2/2: uploading to board
-    prepEndTs = performance.now();
+    const markHugeFileFailed = async (file, error, job) => {
+      if (!file || failedHugeFiles.has(file)) return;
+      const failedFileName = (job && job.file && job.file.name) || (file && file.name) || "image";
+      const failedMessage = error && error.message ? error.message : String(error || "huge file failed");
+      failedHugeFiles.set(file, { fileName: failedFileName, message: failedMessage });
+      recordFailedSourceFile(failedFileName, "huge-file-failed", failedMessage);
+      console.warn("[Image Align Tool] huge file failed; skipping remaining tiles", { fileName: failedFileName, error });
+      await hugeManager.closeFile(file);
+    };
+
     setStage(2);
-    startEta();
     setProgress(0, totalTiles, "Uploading to board…");
-    setEtaText(null);
 
-    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-    // Real concurrency metric: how many board.createImage calls are actually in-flight
-    let inFlightCreateImage = 0;
-    let maxInFlightCreateImage = 0;
-
-
-    const createImageWithRetry = async (params, options = {}) => {
-  const maxRetries = Number.isFinite(options.maxRetries)
-    ? Math.max(0, Math.floor(options.maxRetries))
-    : CREATE_IMAGE_MAX_RETRIES;
-
-  let attempt = 0;
-  let lastErr = null;
-
-  const tStart = performance.now();
-
-  while (attempt <= maxRetries) {
-    try {
-      // Track real in-flight createImage requests (not just "allowed concurrency")
-      inFlightCreateImage += 1;
-      if (inFlightCreateImage > maxInFlightCreateImage) {
-        maxInFlightCreateImage = inFlightCreateImage;
+    const createImageWithRetry = async (params, maxRetries = CREATE_IMAGE_MAX_RETRIES) => {
+      let attempt = 0;
+      let lastErr = null;
+      const tStart = performance.now();
+      while (attempt <= maxRetries) {
+        try {
+          const res = await board.createImage(params);
+          const dt = performance.now() - tStart;
+          createImageWallTimesMs.push(dt);
+          createImageWallTimeSumMs += dt;
+          createImageWallTimeCount += 1;
+          return res;
+        } catch (e) {
+          lastErr = e;
+          attempt += 1;
+          uploadRetryEvents += 1;
+          if (attempt > maxRetries) break;
+          const base = CREATE_IMAGE_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+          const jitter = Math.random() * 250;
+          await sleep(base + jitter);
+        }
       }
+      throw lastErr;
+    };
 
-      let res;
-      try {
-        res = await board.createImage(params);
-      } finally {
-        inFlightCreateImage -= 1;
-      }
-
-      const dt = performance.now() - tStart;
-      createImageWallTimesMs.push(dt);
-      createImageWallTimeSumMs += dt;
-      createImageWallTimeCount += 1;
-
-      return res;
-    } catch (e) {
-      lastErr = e;
-      attempt += 1;
-      uploadRetryEvents += 1;
-
-      if (attempt > maxRetries) break;
-
-      const msg = e && e.message ? e.message : String(e);
-      const isStackOverflow = msg.includes("Maximum call stack size exceeded");
-      const baseDelay = isStackOverflow
-        ? Math.max(1500, CREATE_IMAGE_BASE_DELAY_MS)
-        : CREATE_IMAGE_BASE_DELAY_MS;
-
-      const base = baseDelay * Math.pow(2, attempt - 1);
-      const jitter = Math.random() * 250;
-      await sleep(base + jitter);
-    }
-  }
-
-  throw lastErr;
-};
-
-
-    const runWithConcurrency = async (items, worker, concurrency) => {
+    const runWithConcurrency = async (items, workerFn, concurrency) => {
       let cursor = 0;
-
       const runners = new Array(concurrency).fill(0).map(async () => {
         while (true) {
           const i = cursor;
           cursor += 1;
           if (i >= items.length) break;
-          await worker(items[i], i);
+          await workerFn(items[i], i);
         }
       });
-
       await Promise.all(runners);
     };
 
-
-
-const runWithAdaptiveConcurrency = async (
-  items,
-  worker,
-  initialConcurrency,
-  minConcurrency,
-  maxConcurrency
-) => {
-  // Adaptive concurrency by tile-jobs (1 job = 1 createImage).
-  //
-  // Key differences vs file-based:
-  // - Real responsiveness (we can react within tens of tiles, not per whole-file).
-  // - Enables a safe one-time "forced probe" at conc=5 on big imports.
-  //
-  // Notes:
-  // - Concurrency here is "how many jobs run in parallel".
-  // - Real in-flight createImage is tracked separately in createImageWithRetry.
-
-  let concurrency = Math.max(minConcurrency, Math.min(maxConcurrency, initialConcurrency));
-  let lockedMax = maxConcurrency;
-
-  const MAX_JOB_ATTEMPTS = 3; // hard retry per regular tile-job (bitmap-region jobs use a stricter path)
-  const skippedJobs = []; // { item, error }
-  let totalBatchErrors = 0;
-  let totalJobFailures = 0;
-
-  const EWMA_ALPHA = 0.25;
-  const GAIN_THRESHOLD = 1.10; // need ~10% throughput gain to justify higher concurrency
-  const PROBE_ONLY_IF_TILES_AT_LEAST = 200;
-
-  // One-time forced probe at 5 for big imports (2 windows + tail guard)
-  const shouldForcedProbe = items.length >= PROBE_ONLY_IF_TILES_AT_LEAST && maxConcurrency >= 5;
-  const probeCfg = shouldForcedProbe
-    ? {
-        phase: "warmup", // warmup -> baseline -> probe -> done
-        done: false,
-
-        baseConc: Math.min(concurrency, 4),
-        warmupTiles: 60,
-
-        windowTiles: 20,
-        windowsTarget: 2,
-
-        // per-phase windows
-        baselineWindows: [], // { mbps, ips, msPerTile, p95WallMs }
-        probeWindows: [],
-
-        // accumulators for the current window
-        accTiles: 0,
-        accBytes: 0,
-        accMs: 0,
-        accWall: [],
-
-        // decision details (for logging/table)
-        lastGain: null,
-        lastTailFactor: null,
-      }
-    : null;
-
-  const resetProbeAcc = () => {
-    if (!probeCfg) return;
-    probeCfg.accTiles = 0;
-    probeCfg.accBytes = 0;
-    probeCfg.accMs = 0;
-    probeCfg.accWall = [];
-  };
-  const quantileMs = (arr, p) => {
-    if (!arr || !arr.length) return null;
-    const xs = arr.slice().sort((a, b) => a - b);
-    const i = Math.min(xs.length - 1, Math.max(0, Math.round((xs.length - 1) * p)));
-    return Math.round(xs[i]);
-  };
-
-let idx = 0;
-  let tpEwmaMbps = null;
-  let cooldownBatches = 0;
-
-  while (idx < items.length) {
-    // Keep "allowed concurrency" metric (for diagnostics)
-    maxConcurrencySeen = Math.max(maxConcurrencySeen, concurrency);
-
-    const concUsed = concurrency;
-
-    const batchSize = Math.min(
-      items.length - idx,
-      Math.max(concUsed * 4, 16)
-    );
-    const batch = items.slice(idx, idx + batchSize);
-
-    const retryBefore = uploadRetryEvents;
-    const bytesBefore = uploadedBytesDone;
-    const tilesBefore = createdTiles;
-    const wallBefore = createImageWallTimesMs.length;
-    const t0 = performance.now();
-
-    const failures = []; // items to retry later (after lowering concurrency)
-    let skippedInBatch = 0;
-    await runWithConcurrency(
-      batch,
-      async (item) => {
-        item.__jobAttempts = (item.__jobAttempts || 0) + 1;
-
-        try {
-          await worker(item);
-        } catch (e) {
-          const attempts = item.__jobAttempts || 1;
-          const maxAttemptsForItem = item.info && item.info.useBitmapRegion
-            ? BITMAP_FILE_MAX_JOB_ATTEMPTS
-            : MAX_JOB_ATTEMPTS;
-
-          // If a tile-job keeps failing, don't loop forever.
-          if (attempts >= maxAttemptsForItem) {
-            skippedJobs.push({ item, error: e });
-            skippedInBatch += 1;
-            markJobSettled(item, "skipped", { reason: "repeated-failure" });
-            try { releaseDecodedImageIfDone(item.file); } catch (_) {}
-            console.warn(
-              "Stitch/Slice: skipping a tile after repeated failures",
-              { attempts, title: item.title || null, kind: item.kind || null, error: e }
-            );
-            return;
-          }
-
-          failures.push({ item, error: e });
-        }
-      },
-      concUsed
-    );
-
-    const wallAfter = createImageWallTimesMs.length;
-    const wallSlice = createImageWallTimesMs.slice(wallBefore, wallAfter);
-    const p50WallMs = quantileMs(wallSlice, 0.5);
-    const p95WallMs = quantileMs(wallSlice, 0.95);
-
-    const batchErrors = failures.length + skippedInBatch;
-    totalBatchErrors += batchErrors;
-    totalJobFailures += batchErrors;
-    if (batchErrors > 0) {
-      // Requeue failed jobs to be retried later (after we lower concurrency).
-      // Placement is deterministic anyway (x/y are fixed), so retry order doesn't matter.
-      for (const f of failures) items.push(f.item);
-    }
-
-    const dtMs = performance.now() - t0;
-    const retries = uploadRetryEvents - retryBefore;
-
-    const bytesDelta = uploadedBytesDone - bytesBefore;
-    const tilesDelta = createdTiles - tilesBefore;
-
-    const dtSec = Math.max(0.001, dtMs / 1000);
-    const mbps = (bytesDelta / 1_000_000) / dtSec; // MB/sec
-    const ips = tilesDelta / dtSec; // tiles/sec
-
-    tpEwmaMbps =
-      tpEwmaMbps == null ? mbps : EWMA_ALPHA * mbps + (1 - EWMA_ALPHA) * tpEwmaMbps;
-
-    const msPerTile = dtMs / Math.max(1, tilesDelta);
-    const retriesPerTile = retries / Math.max(1, tilesDelta);
-
-    // Stability heuristics
-    const unstable = retriesPerTile > 0.08 || msPerTile > 15000 || (p95WallMs != null && p95WallMs > 17000);
-    const stable = retriesPerTile < 0.03 && msPerTile < 11000 && (p95WallMs == null || p95WallMs < 13000);
-
-    let action = "keep";
-    let concNext = concurrency;
-
-    if (cooldownBatches > 0) cooldownBatches -= 1;
-
-    // Hard downshift on any createImage failures in this batch.
-    // We reduce stepwise: 4 -> 3 -> 2 -> 1 (minConcurrency is 1 in this build).
-    if (batchErrors > 0) {
-      if (probeCfg && !probeCfg.done) {
-        // Abort probe if the environment is unstable (errors during upload).
-        probeCfg.done = true;
-        probeCfg.phase = "done";
-      }
-
-      if (concurrency > minConcurrency) {
-        concNext = Math.max(minConcurrency, concurrency - 1);
-        lockedMax = Math.min(lockedMax, concNext);
-        action = "err-down";
-        cooldownBatches = Math.max(cooldownBatches, 2);
-      } else {
-        action = "err-hold";
-        cooldownBatches = Math.max(cooldownBatches, 2);
-      }
-    }
-
-    // ---- Forced probe (once) ----
-    const probePhase = probeCfg ? probeCfg.phase : null;
-
-    if (probeCfg && !probeCfg.done) {
-      const finalizeWindow = (kind) => {
-        const sec = Math.max(0.001, probeCfg.accMs / 1000);
-        const wMbps = (probeCfg.accBytes / 1_000_000) / sec;
-        const wIps = probeCfg.accTiles / sec;
-        const wMsPerTile = probeCfg.accMs / Math.max(1, probeCfg.accTiles);
-        const wP95 = quantileMs(probeCfg.accWall, 0.95);
-
-        const obj = {
-          mbps: Number.isFinite(wMbps) ? wMbps : null,
-          ips: Number.isFinite(wIps) ? wIps : null,
-          msPerTile: Number.isFinite(wMsPerTile) ? wMsPerTile : null,
-          p95WallMs: wP95,
-        };
-
-        if (kind === "baseline") probeCfg.baselineWindows.push(obj);
-        else if (kind === "probe") probeCfg.probeWindows.push(obj);
-
-        resetProbeAcc();
-      };
-
-      // Warmup: keep at base conc to "stabilize" startup noise
-      if (probeCfg.phase === "warmup") {
-        if (concUsed !== probeCfg.baseConc) {
-          lockedMax = probeCfg.baseConc;
-          concNext = probeCfg.baseConc;
-          action = "probe-warmup";
-          cooldownBatches = 1;
-        }
-        if (createdTiles >= probeCfg.warmupTiles) {
-          probeCfg.phase = "baseline";
-          resetProbeAcc();
-        }
-      }
-
-      // Baseline: collect 2 windows at base conc
-      if (probeCfg.phase === "baseline") {
-        if (concUsed !== probeCfg.baseConc) {
-          lockedMax = probeCfg.baseConc;
-          concNext = probeCfg.baseConc;
-          action = "probe-base";
-          cooldownBatches = 1;
-        } else {
-          probeCfg.accTiles += tilesDelta;
-          probeCfg.accBytes += bytesDelta;
-          probeCfg.accMs += dtMs;
-          if (wallSlice && wallSlice.length) probeCfg.accWall.push(...wallSlice);
-
-          if (probeCfg.accTiles >= probeCfg.windowTiles) {
-            finalizeWindow("baseline");
-          }
-
-          if (probeCfg.baselineWindows.length >= probeCfg.windowsTarget) {
-            probeCfg.phase = "probe";
-            resetProbeAcc();
-
-            lockedMax = 5;
-            concNext = 5;
-            action = "probe-up";
-            cooldownBatches = 1;
-          }
-        }
-      }
-
-      // Probe: collect 2 windows at conc=5, then decide using gain + p95 tail guard
-      if (probeCfg.phase === "probe") {
-        lockedMax = 5;
-
-        if (concUsed !== 5) {
-          concNext = 5;
-          action = "probe-up";
-          cooldownBatches = 1;
-        } else {
-          probeCfg.accTiles += tilesDelta;
-          probeCfg.accBytes += bytesDelta;
-          probeCfg.accMs += dtMs;
-          if (wallSlice && wallSlice.length) probeCfg.accWall.push(...wallSlice);
-
-          if (probeCfg.accTiles >= probeCfg.windowTiles) {
-            finalizeWindow("probe");
-          }
-
-          if (probeCfg.probeWindows.length >= probeCfg.windowsTarget) {
-            const median = (xs) => {
-              const ys = xs
-                .filter((v) => Number.isFinite(v))
-                .slice()
-                .sort((a, b) => a - b);
-              if (!ys.length) return null;
-              const mid = Math.floor((ys.length - 1) / 2);
-              return ys.length % 2 ? ys[mid] : (ys[mid] + ys[mid + 1]) / 2;
-            };
-
-            const baseMbpsMed = median(probeCfg.baselineWindows.map((w) => w.mbps));
-            const probeMbpsMed = median(probeCfg.probeWindows.map((w) => w.mbps));
-            const baseP95Med = median(probeCfg.baselineWindows.map((w) => w.p95WallMs));
-            const probeP95Med = median(probeCfg.probeWindows.map((w) => w.p95WallMs));
-            const baseMsMed = median(probeCfg.baselineWindows.map((w) => w.msPerTile));
-            const probeMsMed = median(probeCfg.probeWindows.map((w) => w.msPerTile));
-
-            const gain =
-              baseMbpsMed != null && probeMbpsMed != null
-                ? probeMbpsMed / Math.max(1e-9, baseMbpsMed)
-                : null;
-
-            const tailFactor =
-              baseP95Med != null && probeP95Med != null
-                ? probeP95Med / Math.max(1e-9, baseP95Med)
-                : null;
-
-            probeCfg.lastGain = gain;
-            probeCfg.lastTailFactor = tailFactor;
-
-            const strongGain = gain != null && gain >= 1.07;
-            const weakGain = gain != null && gain >= 1.03;
-
-            const tailOkStrong = tailFactor == null || tailFactor <= 1.15;
-            const tailOkWeak = tailFactor == null || tailFactor <= 1.05;
-            const tailHardBad = tailFactor != null && tailFactor >= 1.25;
-
-            // don't accept if per-tile time got worse (helps guard against noisy mbps)
-            const msNotWorse =
-              baseMsMed == null || probeMsMed == null || probeMsMed <= baseMsMed * 1.02;
-
-            let accept = false;
-            if (strongGain && tailOkStrong && msNotWorse) accept = true;
-            else if (weakGain && tailOkWeak && msNotWorse) accept = true;
-
-            if (!accept || tailHardBad) {
-              lockedMax = probeCfg.baseConc;
-              concNext = lockedMax;
-              action = "force-cap";
-            } else {
-              lockedMax = 5;
-              concNext = 5;
-              action = "force-accept";
-            }
-
-            probeCfg.done = true;
-            probeCfg.phase = "done";
-            cooldownBatches = 2;
-          }
-        }
-      }
-    }
-
-// ---- Normal adaptation (only if probe is done / not configured) ----
-    const probeBlocking = probeCfg && !probeCfg.done;
-    if (!probeBlocking) {
-      if (unstable && concurrency > minConcurrency) {
-        concNext = concurrency - 1;
-        lockedMax = Math.min(lockedMax, concNext);
-        action = action === "keep" ? "down" : action;
-        cooldownBatches = Math.max(cooldownBatches, 1);
-      } else if (stable && cooldownBatches === 0 && concurrency < lockedMax) {
-        // attempt an up-step; keep it only if it doesn't destabilize later
-        concNext = concurrency + 1;
-        action = action === "keep" ? "up" : action;
-        cooldownBatches = 1;
-      }
-    }
-
-    concurrencyDecisions.push({
-      idx,
-      concUsed,
-      concNext,
-      lockedMax,
-      mbps: Number.isFinite(mbps) ? Number(mbps.toFixed(2)) : null,
-      ips: Number.isFinite(ips) ? Number(ips.toFixed(2)) : null,
-      retriesPerTile: Number.isFinite(retriesPerTile) ? Number(retriesPerTile.toFixed(3)) : null,
-      msPerTile: Number.isFinite(msPerTile) ? Math.round(msPerTile) : null,
-      errors: batchErrors,
-      p50WallMs,
-      p95WallMs,
-      probePhase,
-      probeGain: probeCfg && probeCfg.lastGain != null ? Number(probeCfg.lastGain.toFixed(3)) : null,
-      probeTail: probeCfg && probeCfg.lastTailFactor != null ? Number(probeCfg.lastTailFactor.toFixed(3)) : null,
-      action,
-    });
-
-    concurrency = Math.max(minConcurrency, Math.min(lockedMax, concNext));
-    idx += batch.length;
-  }
-
-  if (skippedJobs.length) {
-    console.warn(`Stitch/Slice: ${skippedJobs.length} tile(s) were skipped after repeated failures.`);
-  }
-
-  return {
-    skippedJobs,
-    skippedCount: skippedJobs.length,
-    totalBatchErrors,
-  };
-};
-;
-
-    // ---- Build tile jobs (1 job = 1 board.createImage call) ----
-const tileJobs = [];
-const remainingJobsByFile = new Map();
-
-const registerJobForFile = (file) => {
-  remainingJobsByFile.set(file, (remainingJobsByFile.get(file) || 0) + 1);
-};
-
-const originalNameByFile = new Map();
-
-const getFileCenter = (info, fileIndex) => {
-  if (slotCentersByFile) {
-    return slotCentersByFile.get(info.file) || { x: viewCenterX, y: viewCenterY };
-  }
-  if (slotCentersArray) {
-    return slotCentersArray[fileIndex] || { x: viewCenterX, y: viewCenterY };
-  }
-  return { x: viewCenterX, y: viewCenterY };
-};
-
-for (let i = 0; i < orderedInfos.length; i++) {
-  const info = orderedInfos[i];
-  const { file, needsSlice, width, height, tilesX, tilesY } = info;
-
-  const center = getFileCenter(info, i);
-  const originalName = file.name || "image";
-  originalNameByFile.set(file, originalName);
-
-  if (!needsSlice) {
-    registerJobForFile(file);
-    tileJobs.push({
-      kind: "full",
-      file,
-      info,
-      x: center.x,
-      y: center.y,
-      width,
-      height,
-    });
-    continue;
-  }
-
-  const nameMatch = originalName.match(/^(.*?)(\.[^.]*$|$)/);
-  const baseName = nameMatch ? nameMatch[1] : originalName;
-  const originalExt = nameMatch && nameMatch[2] ? nameMatch[2] : "";
-
-  const colWidths = [];
-  const rowHeights = [];
-
-  for (let tx = 0; tx < tilesX; tx++) {
-    colWidths.push(Math.min(SLICE_TILE_SIZE, width - tx * SLICE_TILE_SIZE));
-  }
-  for (let ty = 0; ty < tilesY; ty++) {
-    rowHeights.push(Math.min(SLICE_TILE_SIZE, height - ty * SLICE_TILE_SIZE));
-  }
-
-  const mosaicW = colWidths.reduce((sum, w) => sum + w, 0);
-  const mosaicH = rowHeights.reduce((sum, h) => sum + h, 0);
-
-  const mosaicLeft = center.x - mosaicW / 2;
-  const mosaicTop = center.y - mosaicH / 2;
-
-  const colPrefix = [0];
-  for (let tx = 1; tx < tilesX; tx++) colPrefix[tx] = colPrefix[tx - 1] + colWidths[tx - 1];
-
-  const rowPrefix = [0];
-  for (let ty = 1; ty < tilesY; ty++) rowPrefix[ty] = rowPrefix[ty - 1] + rowHeights[ty - 1];
-
-  let tileIndex = 0;
-
-  for (let ty = 0; ty < tilesY; ty++) {
-    for (let tx = 0; tx < tilesX; tx++) {
-      tileIndex += 1;
-
-      const sw = colWidths[tx];
-      const sh = rowHeights[ty];
-
-      const sx = tx * SLICE_TILE_SIZE;
-      const sy = ty * SLICE_TILE_SIZE;
-
-      const tileLeft = mosaicLeft + colPrefix[tx];
-      const tileTop = mosaicTop + rowPrefix[ty];
-
-      const centerX = tileLeft + sw / 2;
-      const centerY = tileTop + sh / 2;
-
-      const tileSuffix = pad2(tileIndex); // 01, 02...
-      const tileBaseName = `${baseName}_${tileSuffix}`;
-      const tileFullName = originalExt ? `${tileBaseName}${originalExt}` : tileBaseName;
-      const title = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${tileFullName}`;
-
-      registerJobForFile(file);
-      tileJobs.push({
-        kind: "tile",
-        file,
-        info,
-        x: centerX,
-        y: centerY,
-        sx,
-        sy,
-        sw,
-        sh,
-        tileIndex,
-        tilesX,
-        tilesY,
-        title,
-      });
-    }
-  }
-}
-
-// ---- Decoded image cache (used for non-sliced source images only) ----
-const imageCache = new Map(); // file -> { imgPromise }
-
-const getDecodedImage = async (file) => {
-  const cached = imageCache.get(file);
-  if (cached) {
-    return cached.imgPromise;
-  }
-
-  const imgPromise = decodeImageFromFile(file);
-  imageCache.set(file, { imgPromise });
-  return imgPromise;
-};
-
-const releaseDecodedImageIfDone = (file) => {
-  const left = (remainingJobsByFile.get(file) || 0) - 1;
-  if (left <= 0) {
-    remainingJobsByFile.delete(file);
-    const cached = imageCache.get(file);
-    if (cached) {
-      cached.imgPromise
-        .then((imgEl) => {
-          try { imgEl.src = ""; } catch (_) {}
-        })
-        .catch(() => {});
-      imageCache.delete(file);
-    }
-    return;
-  }
-  remainingJobsByFile.set(file, left);
-};
-
-const processOneJob = async (job) => {
-  if (job && job.__settled) return;
-
-  const { file, info } = job;
-  const fileName = originalNameByFile.get(file) || "image";
-  const usesBitmapRegion = !!(info && info.useBitmapRegion);
-
-  if (usesBitmapRegion && failedBitmapFiles.has(file)) {
-    markJobSettled(job, "skipped", { reason: "file-already-failed" });
-    releaseDecodedImageIfDone(file);
-    return;
-  }
-
-  let imgEl = null;
-  if (!usesBitmapRegion) {
-    imgEl = await getDecodedImage(file);
-  }
-
-  try {
-    const uploadOne = async ({ url, x, y, title, meta }) => {
-      const imgWidget = await createImageWithRetry(
-        { url, x, y, title },
-        { maxRetries: usesBitmapRegion ? BITMAP_FILE_CREATE_IMAGE_MAX_RETRIES : CREATE_IMAGE_MAX_RETRIES }
-      );
-      try {
-        await imgWidget.setMetadata(META_APP_ID, meta);
-      } catch (e) {
-        console.warn("setMetadata failed:", e);
-      }
-      allCreatedTiles.push(imgWidget);
-      uploadedBytesDone += url ? url.length : 0;
-      createdTiles += 1;
-      markJobSettled(job, "created");
-      return imgWidget;
+    const tileJobs = [];
+    const remainingJobsByFile = new Map();
+    const originalNameByFile = new Map();
+
+    const registerJobForFile = (file) => {
+      remainingJobsByFile.set(file, (remainingJobsByFile.get(file) || 0) + 1);
     };
 
-    const renderRegionToCanvas = async ({ sx, sy, sw, sh, outW, outH }) => {
-      if (usesBitmapRegion) {
-        return await renderBitmapRegionToCanvas(file, sx, sy, sw, sh, outW, outH);
+    const getFileCenter = (info, fileIndex) => {
+      if (slotCentersByFile) return slotCentersByFile.get(info.file) || { x: viewCenterX, y: viewCenterY };
+      if (slotCentersArray) return slotCentersArray[fileIndex] || { x: viewCenterX, y: viewCenterY };
+      return { x: viewCenterX, y: viewCenterY };
+    };
+
+    for (let i = 0; i < orderedInfos.length; i++) {
+      const info = orderedInfos[i];
+      const { file, needsSlice, width, height, tilesX, tilesY, sliceTileSize } = info;
+      const center = getFileCenter(info, i);
+      const originalName = file.name || "image";
+      originalNameByFile.set(file, originalName);
+
+      if (!needsSlice) {
+        registerJobForFile(file);
+        tileJobs.push({ kind: "full", file, info, x: center.x, y: center.y, width, height });
+        continue;
       }
 
+      const nameMatch = originalName.match(/^(.*?)(\.[^.]*$|$)/);
+      const baseName = nameMatch ? nameMatch[1] : originalName;
+      const originalExt = nameMatch && nameMatch[2] ? nameMatch[2] : "";
+      const colWidths = [];
+      const rowHeights = [];
+      for (let tx = 0; tx < tilesX; tx++) colWidths.push(Math.min(sliceTileSize, width - tx * sliceTileSize));
+      for (let ty = 0; ty < tilesY; ty++) rowHeights.push(Math.min(sliceTileSize, height - ty * sliceTileSize));
+
+      const mosaicW = colWidths.reduce((sum, w) => sum + w, 0);
+      const mosaicH = rowHeights.reduce((sum, h) => sum + h, 0);
+      const mosaicLeft = center.x - mosaicW / 2;
+      const mosaicTop = center.y - mosaicH / 2;
+
+      const colPrefix = [0];
+      for (let tx = 1; tx < tilesX; tx++) colPrefix[tx] = colPrefix[tx - 1] + colWidths[tx - 1];
+      const rowPrefix = [0];
+      for (let ty = 1; ty < tilesY; ty++) rowPrefix[ty] = rowPrefix[ty - 1] + rowHeights[ty - 1];
+
+      let tileIndex = 0;
+      for (let ty = 0; ty < tilesY; ty++) {
+        for (let tx = 0; tx < tilesX; tx++) {
+          tileIndex += 1;
+          const sw = colWidths[tx];
+          const sh = rowHeights[ty];
+          const sx = tx * sliceTileSize;
+          const sy = ty * sliceTileSize;
+          const tileLeft = mosaicLeft + colPrefix[tx];
+          const tileTop = mosaicTop + rowPrefix[ty];
+          const centerX = tileLeft + sw / 2;
+          const centerY = tileTop + sh / 2;
+          const tileSuffix = String(tileIndex).padStart(2, "0");
+          const tileBaseName = `${baseName}_${tileSuffix}`;
+          const tileFullName = originalExt ? `${tileBaseName}${originalExt}` : tileBaseName;
+          const title = `C${String(info.satCode).padStart(2, "0")}/${String(info.briCode).padStart(3, "0")} ${tileFullName}`;
+          registerJobForFile(file);
+          tileJobs.push({
+            kind: "tile",
+            file,
+            info,
+            x: centerX,
+            y: centerY,
+            sx,
+            sy,
+            sw,
+            sh,
+            tileIndex,
+            tilesX,
+            tilesY,
+            title,
+          });
+        }
+      }
+    }
+
+    const imageCache = new Map();
+    const getDecodedImage = async (file) => {
+      const cached = imageCache.get(file);
+      if (cached) return cached;
+      const imgPromise = decodeImageFromFile(file);
+      imageCache.set(file, imgPromise);
+      return imgPromise;
+    };
+
+    const releaseImageIfDone = async (file, useHugeWorker) => {
+      const left = (remainingJobsByFile.get(file) || 0) - 1;
+      if (left <= 0) {
+        remainingJobsByFile.delete(file);
+        if (useHugeWorker) {
+          await hugeManager.closeFile(file);
+        }
+        const cached = imageCache.get(file);
+        if (cached) {
+          cached.then((imgEl) => { try { imgEl.src = ""; } catch (_) {} }).catch(() => {});
+          imageCache.delete(file);
+        }
+        return;
+      }
+      remainingJobsByFile.set(file, left);
+    };
+
+    const uploadRegularRegionWithSubslice = async (job, imgEl, region, uploadOne) => {
       const canvas = document.createElement("canvas");
-      canvas.width = outW;
-      canvas.height = outH;
+      canvas.width = region.w;
+      canvas.height = region.h;
       const ctx = get2dContextSrgb(canvas);
       ctx.imageSmoothingEnabled = false;
-      ctx.clearRect(0, 0, outW, outH);
-      ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, outW, outH);
-      return canvas;
-    };
-
-    const uploadRegionWithSubslice = async (region) => {
-      const depth = region.depth || 0;
-      const canvas = await renderRegionToCanvas({
-        sx: region.sx,
-        sy: region.sy,
-        sw: region.sw,
-        sh: region.sh,
-        outW: region.w,
-        outH: region.h,
-      });
-
+      ctx.clearRect(0, 0, region.w, region.h);
+      ctx.drawImage(imgEl, region.sx, region.sy, region.sw, region.sh, 0, 0, region.w, region.h);
       try {
         const url = canvasToDataUrlUnderLimit(canvas);
-        const title = region.titleBase;
-        const centerX = region.left + region.w / 2;
-        const centerY = region.top + region.h / 2;
-        await uploadOne({
-          url,
-          x: centerX,
-          y: centerY,
-          title,
-          meta: region.metaBase,
-        });
-        return;
+        await uploadOne(url, region.left + region.w / 2, region.top + region.h / 2, region.titleBase, region.metaBase, url.length);
       } catch (e) {
-        const isTooLarge = e && e.name === "DataUrlTooLargeError";
-        if (!isTooLarge) throw e;
-
+        if (!(e && e.name === "DataUrlTooLargeError")) throw e;
         const minSub = 512;
-        if (region.w <= minSub || region.h <= minSub) {
-          throw e;
-        }
-
+        if (region.w <= minSub || region.h <= minSub) throw e;
         const w2 = Math.ceil(region.w / 2);
         const h2 = Math.ceil(region.h / 2);
         const wR = region.w - w2;
         const hB = region.h - h2;
-
         const sw2 = Math.ceil(region.sw / 2);
         const sh2 = Math.ceil(region.sh / 2);
         const swR = region.sw - sw2;
         const shB = region.sh - sh2;
-
         totalTiles += 3;
-        updateCreationProgress();
-
-        const nextDepth = depth + 1;
+        setProgress(settledTiles, totalTiles, "Uploading to board…");
+        const nextDepth = (region.depth || 0) + 1;
         const base = region.titleBase;
-
         const mkMeta = (subRow, subCol) => ({
           ...region.metaBase,
           subSlice: true,
@@ -2459,188 +1249,140 @@ const processOneJob = async (job) => {
           subW: region.w,
           subH: region.h,
         });
-
         const parts = [
-          {
-            sx: region.sx,
-            sy: region.sy,
-            sw: sw2,
-            sh: sh2,
-            left: region.left,
-            top: region.top,
-            w: w2,
-            h: h2,
-            titleBase: `${base} s${nextDepth}a`,
-            metaBase: mkMeta(0, 0),
-            depth: nextDepth,
-          },
-          {
-            sx: region.sx + sw2,
-            sy: region.sy,
-            sw: swR,
-            sh: sh2,
-            left: region.left + w2,
-            top: region.top,
-            w: wR,
-            h: h2,
-            titleBase: `${base} s${nextDepth}b`,
-            metaBase: mkMeta(0, 1),
-            depth: nextDepth,
-          },
-          {
-            sx: region.sx,
-            sy: region.sy + sh2,
-            sw: sw2,
-            sh: shB,
-            left: region.left,
-            top: region.top + h2,
-            w: w2,
-            h: hB,
-            titleBase: `${base} s${nextDepth}c`,
-            metaBase: mkMeta(1, 0),
-            depth: nextDepth,
-          },
-          {
-            sx: region.sx + sw2,
-            sy: region.sy + sh2,
-            sw: swR,
-            sh: shB,
-            left: region.left + w2,
-            top: region.top + h2,
-            w: wR,
-            h: hB,
-            titleBase: `${base} s${nextDepth}d`,
-            metaBase: mkMeta(1, 1),
-            depth: nextDepth,
-          },
+          { sx: region.sx, sy: region.sy, sw: sw2, sh: sh2, left: region.left, top: region.top, w: w2, h: h2, titleBase: `${base} s${nextDepth}a`, metaBase: mkMeta(0, 0), depth: nextDepth },
+          { sx: region.sx + sw2, sy: region.sy, sw: swR, sh: sh2, left: region.left + w2, top: region.top, w: wR, h: h2, titleBase: `${base} s${nextDepth}b`, metaBase: mkMeta(0, 1), depth: nextDepth },
+          { sx: region.sx, sy: region.sy + sh2, sw: sw2, sh: shB, left: region.left, top: region.top + h2, w: w2, h: hB, titleBase: `${base} s${nextDepth}c`, metaBase: mkMeta(1, 0), depth: nextDepth },
+          { sx: region.sx + sw2, sy: region.sy + sh2, sw: swR, sh: shB, left: region.left + w2, top: region.top + h2, w: wR, h: hB, titleBase: `${base} s${nextDepth}d`, metaBase: mkMeta(1, 1), depth: nextDepth },
         ];
-
-        for (const p of parts) {
-          await uploadRegionWithSubslice(p);
+        for (const part of parts) {
+          await uploadRegularRegionWithSubslice(job, imgEl, part, uploadOne);
         }
       }
     };
 
-    if (job.kind === "full") {
-      const titleBase = `C${pad2(info.satCode)}/${pad3(info.briCode)} ${fileName}`;
-      const left = job.x - job.width / 2;
-      const top = job.y - job.height / 2;
-      await uploadRegionWithSubslice({
-        sx: 0,
-        sy: 0,
-        sw: job.width,
-        sh: job.height,
-        left,
-        top,
-        w: job.width,
-        h: job.height,
-        titleBase,
-        metaBase: {
-          fileName,
-          satCode: info.satCode,
-          briCode: info.briCode,
-        },
-        depth: 0,
-      });
-    } else {
-      const left = job.x - job.sw / 2;
-      const top = job.y - job.sh / 2;
-      await uploadRegionWithSubslice({
-        sx: job.sx,
-        sy: job.sy,
-        sw: job.sw,
-        sh: job.sh,
-        left,
-        top,
-        w: job.sw,
-        h: job.sh,
-        titleBase: job.title,
-        metaBase: {
-          fileName,
-          satCode: info.satCode,
-          briCode: info.briCode,
-          tileIndex: job.tileIndex,
-          tilesX: job.tilesX,
-          tilesY: job.tilesY,
-        },
-        depth: 0,
-      });
+    const processOneJob = async (job) => {
+      if (job.__settled) return;
+      const { file, info } = job;
+      const fileName = originalNameByFile.get(file) || "image";
+      const useHugeWorker = !!(info && info.useHugeWorker);
+      if (useHugeWorker && failedHugeFiles.has(file)) {
+        markJobSettled(job, "skipped", { reason: "file-already-failed" });
+        await releaseImageIfDone(file, useHugeWorker);
+        return;
+      }
+
+      const uploadOne = async (url, x, y, title, meta, byteCount, maxRetries) => {
+        const imgWidget = await createImageWithRetry({ url, x, y, title }, maxRetries);
+        try {
+          await imgWidget.setMetadata(META_APP_ID, meta);
+        } catch (e) {
+          console.warn("setMetadata failed:", e);
+        }
+        allCreatedTiles.push(imgWidget);
+        uploadedBytesDone += byteCount || 0;
+        createdTiles += 1;
+        markJobSettled(job, "created");
+      };
+
+      try {
+        if (useHugeWorker) {
+          const { width, height, buffer } = await hugeManager.renderTile(file, job.sx, job.sy, job.sw, job.sh);
+          const blob = await rgbaBufferToPngBlob(buffer, width, height);
+          const url = URL.createObjectURL(blob);
+          try {
+            await uploadOne(
+              url,
+              job.x,
+              job.y,
+              job.title,
+              {
+                fileName,
+                satCode: info.satCode,
+                briCode: info.briCode,
+                tileIndex: job.tileIndex,
+                tilesX: job.tilesX,
+                tilesY: job.tilesY,
+                hugeMode: true,
+                tileMime: HUGE_TILE_MIME,
+              },
+              blob.size,
+              1
+            );
+          } finally {
+            URL.revokeObjectURL(url);
+          }
+          return;
+        }
+
+        const imgEl = await getDecodedImage(file);
+        if (job.kind === "full") {
+          const titleBase = `C${String(info.satCode).padStart(2, "0")}/${String(info.briCode).padStart(3, "0")} ${fileName}`;
+          const left = job.x - job.width / 2;
+          const top = job.y - job.height / 2;
+          await uploadRegularRegionWithSubslice(job, imgEl, {
+            sx: 0,
+            sy: 0,
+            sw: job.width,
+            sh: job.height,
+            left,
+            top,
+            w: job.width,
+            h: job.height,
+            titleBase,
+            metaBase: { fileName, satCode: info.satCode, briCode: info.briCode },
+            depth: 0,
+          }, uploadOne);
+        } else {
+          const left = job.x - job.sw / 2;
+          const top = job.y - job.sh / 2;
+          await uploadRegularRegionWithSubslice(job, imgEl, {
+            sx: job.sx,
+            sy: job.sy,
+            sw: job.sw,
+            sh: job.sh,
+            left,
+            top,
+            w: job.sw,
+            h: job.sh,
+            titleBase: job.title,
+            metaBase: {
+              fileName,
+              satCode: info.satCode,
+              briCode: info.briCode,
+              tileIndex: job.tileIndex,
+              tilesX: job.tilesX,
+              tilesY: job.tilesY,
+            },
+            depth: 0,
+          }, uploadOne);
+        }
+      } catch (e) {
+        if (useHugeWorker) {
+          await markHugeFileFailed(file, new FatalHugeFileError(file, fileName, e), job);
+          markJobSettled(job, "skipped", { reason: "huge-file-failed" });
+          return;
+        }
+        throw e;
+      } finally {
+        if (job.__settled || failedHugeFiles.has(file)) {
+          await releaseImageIfDone(file, useHugeWorker);
+        }
+      }
+    };
+
+    const regularTileJobs = tileJobs.filter((job) => !(job.info && job.info.useHugeWorker));
+    const hugeTileJobs = tileJobs.filter((job) => !!(job.info && job.info.useHugeWorker));
+
+    if (regularTileJobs.length) {
+      await runWithConcurrency(regularTileJobs, async (job) => processOneJob(job), UPLOAD_CONCURRENCY_NORMAL);
     }
-  } catch (e) {
-    if (usesBitmapRegion) {
-      throw new FatalBitmapFileError(file, fileName, e);
-    }
-    throw e;
-  } finally {
-    if (job.__settled || failedBitmapFiles.has(file)) {
-      releaseDecodedImageIfDone(file);
-    }
-  }
-};
-
-const runBitmapJobsWithIsolation = async (items, worker, concurrency) => {
-  const skippedJobsLocal = [];
-
-  await runWithConcurrency(items, async (item) => {
-    if (item.__settled) return;
-
-    if (failedBitmapFiles.has(item.file)) {
-      markJobSettled(item, "skipped", { reason: "file-failed-earlier" });
-      try { releaseDecodedImageIfDone(item.file); } catch (_) {}
-      return;
+    if (hugeTileJobs.length) {
+      await runWithConcurrency(hugeTileJobs, async (job) => processOneJob(job), UPLOAD_CONCURRENCY_HUGE);
     }
 
-    try {
-      await worker(item);
-    } catch (e) {
-      markBitmapFileFailed(item.file, e, item);
-      skippedJobsLocal.push({ item, error: e });
-      markJobSettled(item, "skipped", { reason: "bitmap-file-failed" });
-      try { releaseDecodedImageIfDone(item.file); } catch (_) {}
-    }
-  }, Math.max(1, concurrency));
-
-  return {
-    skippedJobs: skippedJobsLocal,
-    skippedCount: skippedJobsLocal.length,
-    failedFiles: Array.from(failedBitmapFiles.values()),
-  };
-};
-
-// ---- Upload stage concurrency (tile-based) ----
-// Starts at 4 for large imports, then adapts down/up between 2..5 based on retries/latency.
-// For very large imports we also do a single forced probe at 5 to answer "can 5 help here?".
-const initialConcurrency = UPLOAD_CONCURRENCY_INITIAL_LARGE; // always start at 4
-const minConcurrency = UPLOAD_CONCURRENCY_MIN;
-const maxConcurrency = UPLOAD_CONCURRENCY_MAX;
-
-const regularTileJobs = tileJobs.filter((job) => !(job.info && job.info.useBitmapRegion));
-const bitmapTileJobs = tileJobs.filter((job) => !!(job.info && job.info.useBitmapRegion));
-
-let adaptiveResult = { skippedJobs: [], skippedCount: 0, totalBatchErrors: 0 };
-if (regularTileJobs.length) {
-  adaptiveResult = await runWithAdaptiveConcurrency(
-    regularTileJobs,
-    async (job) => processOneJob(job),
-    initialConcurrency,
-    minConcurrency,
-    maxConcurrency
-  );
-}
-
-let bitmapResult = { skippedJobs: [], skippedCount: 0, failedFiles: [] };
-if (bitmapTileJobs.length) {
-  bitmapResult = await runBitmapJobsWithIsolation(
-    bitmapTileJobs,
-    async (job) => processOneJob(job),
-    BITMAP_JOB_CONCURRENCY
-  );
-}
-
-setProgress(totalTiles, totalTiles);
-    if (setProgress.flush) setProgress.flush();
+    setProgress(totalTiles, totalTiles, "Uploading to board…");
     setEtaText(null);
-    if (setEtaText.flush) setEtaText.flush();
 
     if (allCreatedTiles.length) {
       try {
@@ -2650,143 +1392,46 @@ setProgress(totalTiles, totalTiles);
       }
     }
 
+    const totalMB = uploadedBytesDone / 1_000_000;
+    const avgMBPerTile = createdTiles ? totalMB / createdTiles : 0;
+    const avgCreateMs = createImageWallTimeCount ? Math.round(createImageWallTimeSumMs / createImageWallTimeCount) : null;
+    console.groupCollapsed("[Image Align Tool] Import stats");
+    console.log("Files (sources):", fileInfos.length);
+    console.log("Tiles:", { total: totalTiles, created: createdTiles, settled: settledTiles, skipped: skippedTiles });
+    console.log("Upload:", { totalMB: Math.round(totalMB * 10) / 10, avgMBPerTile: Math.round(avgMBPerTile * 100) / 100, retries: uploadRetryEvents, avgCreateMs });
+    if (failedSourceFiles.size) console.table(Array.from(failedSourceFiles.values()));
+    console.groupEnd();
 
-    // Mark end of upload stage for stats/ETA
-    uploadEndTs = performance.now();
-
-    // ---- console stats (console only) ----
-    try {
-      const fmtMs = (ms) => {
-        if (ms == null || !Number.isFinite(ms) || ms < 0) return null;
-        const s = Math.round(ms / 1000);
-        const mins = Math.floor(s / 60);
-        const secs = s % 60;
-        const secsStr = String(secs).padStart(2, "0");
-        return mins ? `${mins}m ${secsStr}s` : `${secsStr}s`;
-      };
-
-
-      const fmtSec = (ms) => {
-        if (ms == null || !Number.isFinite(ms) || ms < 0) return null;
-        return `${(ms / 1000).toFixed(2)}s`;
-      };
-
-      const percentile = (arr, p) => {
-        if (!arr || !arr.length) return null;
-        const xs = arr.slice().sort((a, b) => a - b);
-        const idx = Math.min(xs.length - 1, Math.max(0, Math.round((xs.length - 1) * p)));
-        return Math.round(xs[idx]);
-      };
-
-      const prepEnd = (prepEndTs != null ? prepEndTs : (uploadStartTs != null ? uploadStartTs : uploadEndTs));
-      const prepMs = prepStartTs != null && prepEnd != null ? prepEnd - prepStartTs : null;
-      const uploadMs = uploadStartTs != null && uploadEndTs != null ? uploadEndTs - uploadStartTs : null;
-      const totalEnd = (uploadEndTs != null ? uploadEndTs : performance.now());
-      const totalMs = prepStartTs != null ? totalEnd - prepStartTs : null;
-
-      const totalMB = uploadedBytesDone / 1_000_000;
-      const avgMBPerTile = createdTiles ? totalMB / createdTiles : 0;
-      const mbps = uploadMs ? totalMB / (uploadMs / 1000) : null;
-
-      const avgCreateMs = createImageWallTimeCount
-        ? Math.round(createImageWallTimeSumMs / createImageWallTimeCount)
-        : null;
-
-      console.groupCollapsed("[Image Align Tool] Import stats");
-      console.log("Files (sources):", fileInfos.length);
-      console.log("Tiles:", { total: totalTiles, created: createdTiles, settled: settledTiles, skipped: skippedTiles });
-      console.log("Time:", { preparing: fmtMs(prepMs), uploading: fmtMs(uploadMs), total: fmtMs(totalMs) });
-      console.log("Upload:", {
-        totalMB: Math.round(totalMB * 10) / 10,
-        avgMBPerTile: Math.round(avgMBPerTile * 100) / 100,
-        mbps: mbps != null ? Math.round(mbps * 100) / 100 : null,
-        retries: uploadRetryEvents,
-      });
-      const p50Ms = percentile(createImageWallTimesMs, 0.5);
-      const p95Ms = percentile(createImageWallTimesMs, 0.95);
-      const wallHuman = avgCreateMs != null
-        ? `${fmtSec(avgCreateMs)} avg (p50 ${fmtSec(p50Ms)}, p95 ${fmtSec(p95Ms)})`
-        : null;
-
-      console.log("createImage wall-time:", wallHuman);
-      console.log("createImage wall-time (ms):", { avg: avgCreateMs, p50: p50Ms, p95: p95Ms });
-      console.log("Concurrency:", {
-        maxSeen: maxInFlightCreateImage,
-        maxAllowedSeen: maxConcurrencySeen,
-        configuredMax: UPLOAD_CONCURRENCY_MAX,
-      });
-      console.log("Stitch/Slice reliability:", {
-        skippedTiles: skippedTiles,
-        regularSkipped: (adaptiveResult && adaptiveResult.skippedCount) || 0,
-        bitmapFailedFiles: bitmapResult && bitmapResult.failedFiles ? bitmapResult.failedFiles.length : 0,
-        batchErrors: (adaptiveResult && adaptiveResult.totalBatchErrors) || 0,
-      });
-      if (bitmapResult && bitmapResult.failedFiles && bitmapResult.failedFiles.length) {
-        console.table(bitmapResult.failedFiles);
-      }
-
-            if (concurrencyDecisions.length) {
-        console.table(concurrencyDecisions.slice(-12));
-      }
-      console.groupEnd();
-    } catch (e) {
-      console.warn("[Image Align Tool] stats failed:", e);
-    }
-
-    const skippedCount = ((adaptiveResult && adaptiveResult.skippedCount) || 0) + ((bitmapResult && bitmapResult.skippedCount) || 0);
     const failedFileCount = failedSourceFiles.size;
-    const importedFileCount = Math.max(0, fileInfos.length - failedFileCount);
-
-    if (failedSourceFiles.size) {
-      console.table(Array.from(failedSourceFiles.values()));
-    }
-
+    const skippedCount = skippedTiles;
     if (createdTiles <= 0 && failedFileCount > 0) {
-      await notifyError(
-        `Failed to import ${failedFileCount} file${failedFileCount === 1 ? "" : "s"}`,
-        {
-          failedFiles: Array.from(failedSourceFiles.values()),
-          totalTiles,
-          skippedCount,
-        }
-      );
-    } else if (failedFileCount > 0) {
-      await notifyWarning(
-        `Failed to import ${failedFileCount} file${failedFileCount === 1 ? "" : "s"}`,
-        {
-          failedFiles: Array.from(failedSourceFiles.values()),
-          importedFileCount,
-          createdTiles,
-          totalTiles,
-          skippedCount,
-        }
-      );
-    } else if (skippedCount > 0) {
-      await notifyWarning("Import completed with skipped tiles", {
-        importedSources: fileInfos.length,
+      await notifyError(`Failed to import ${failedFileCount} file${failedFileCount === 1 ? "" : "s"}`, {
+        failedFiles: Array.from(failedSourceFiles.values()),
         totalTiles,
         skippedCount,
       });
+    } else if (failedFileCount > 0) {
+      await notifyWarning(`Failed to import ${failedFileCount} file${failedFileCount === 1 ? "" : "s"}`, {
+        failedFiles: Array.from(failedSourceFiles.values()),
+        totalTiles,
+        skippedCount,
+      });
+    } else if (skippedCount > 0) {
+      await notifyWarning("Import completed with skipped tiles", { importedSources: fileInfos.length, totalTiles, skippedCount });
     } else {
-      await notifyInfo(
-        `Imported ${fileInfos.length} image${fileInfos.length === 1 ? "" : "s"}`,
-        { importedSources: fileInfos.length, totalTiles }
-      );
+      await notifyInfo(`Imported ${fileInfos.length} image${fileInfos.length === 1 ? "" : "s"}`, { importedSources: fileInfos.length, totalTiles });
     }
   } catch (err) {
     console.error(err);
-    if (setProgress.flush) setProgress.flush();
-    if (setEtaText.flush) setEtaText.flush();
-    setEtaText(null);
     showFailedProgressState("Import failed");
     await notifyError("Image import failed", err);
   } finally {
-    const stitchButton = document.getElementById("stitchButton");
+    try {
+      await hugeManager.disposeAll();
+    } catch (_) {}
     if (stitchButton) stitchButton.disabled = false;
   }
 }
-
-// ---------- init ----------
 
 window.addEventListener("DOMContentLoaded", () => {
   detectMaxSliceDim();
@@ -2795,7 +1440,6 @@ window.addEventListener("DOMContentLoaded", () => {
   const sortingForm = document.getElementById("sorting-form");
   if (sortingForm) sortingForm.addEventListener("submit", handleSortingSubmit);
 
-  // Show "Size order" only when Sort by = Size
   const sortModeSelect = document.getElementById("sortingSortMode");
   const sizeOrderField = document.getElementById("sortingSizeOrderField");
   const updateSizeOrderVisibility = () => {
@@ -2815,11 +1459,7 @@ window.addEventListener("DOMContentLoaded", () => {
   };
 
   function activateTab(name) {
-    tabButtons.forEach((btn) => {
-      const isActive = btn.dataset.tab === name;
-      btn.classList.toggle("active", isActive);
-    });
-
+    tabButtons.forEach((btn) => btn.classList.toggle("active", btn.dataset.tab === name));
     Object.entries(tabContents).forEach(([key, el]) => {
       if (!el) return;
       el.classList.toggle("active", key === name);
@@ -2827,31 +1467,21 @@ window.addEventListener("DOMContentLoaded", () => {
   }
 
   if (tabButtons.length) {
-    tabButtons.forEach((btn) => {
-      btn.addEventListener("click", () => activateTab(btn.dataset.tab));
-    });
-    // дефолт — Stitch/Slice
+    tabButtons.forEach((btn) => btn.addEventListener("click", () => activateTab(btn.dataset.tab)));
     activateTab("stitch");
   }
 
   const fileButton = document.getElementById("stitchFileButton");
   const fileInput = document.getElementById("stitchFolderInput");
   const fileLabel = document.getElementById("stitchFileLabel");
-
   if (fileButton && fileInput && fileLabel) {
     fileButton.addEventListener("click", () => fileInput.click());
-
     const updateLabel = () => {
       const files = fileInput.files;
-      if (!files || files.length === 0) {
-        fileLabel.textContent = "No files selected";
-      } else if (files.length === 1) {
-        fileLabel.textContent = files[0].name;
-      } else {
-        fileLabel.textContent = `${files.length} files selected`;
-      }
+      if (!files || files.length === 0) fileLabel.textContent = "No files selected";
+      else if (files.length === 1) fileLabel.textContent = files[0].name;
+      else fileLabel.textContent = `${files.length} files selected`;
     };
-
     fileInput.addEventListener("change", updateLabel);
     updateLabel();
   }
