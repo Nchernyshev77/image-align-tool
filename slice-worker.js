@@ -1,6 +1,7 @@
 // slice-worker.js
-// Image Align Tool_48 huge-image worker
+// Image Align Tool_49 huge-image worker
 // - Uses ImageDecoder in a dedicated worker.
+// - Accepts ArrayBuffer + file metadata from the main thread.
 // - Keeps one decoded frame per huge source.
 // - Returns RGBA tiles to the main thread.
 
@@ -15,10 +16,12 @@ function fail(type, reqId, fileId, error) {
   });
 }
 
-function inferMimeType(file) {
-  const type = file && file.type ? String(file.type).trim() : "";
-  if (type) return type;
-  const name = String((file && file.name) || "").toLowerCase();
+function inferMimeType(input) {
+  const explicitType = input && input.mimeType ? String(input.mimeType).trim() : "";
+  if (explicitType) return explicitType;
+  const fileType = input && input.file && input.file.type ? String(input.file.type).trim() : "";
+  if (fileType) return fileType;
+  const name = String((input && (input.fileName || (input.file && input.file.name))) || "").toLowerCase();
   if (name.endsWith(".png")) return "image/png";
   if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
   if (name.endsWith(".webp")) return "image/webp";
@@ -33,11 +36,11 @@ function getFrameSize(frame) {
   return { width, height };
 }
 
-async function openFile(reqId, fileId, file) {
+async function openFile(reqId, fileId, payload) {
   if (!self.ImageDecoder) {
     throw new Error("ImageDecoder is not available in this browser");
   }
-  const mimeType = inferMimeType(file);
+  const mimeType = inferMimeType(payload);
   if (typeof ImageDecoder.isTypeSupported === "function") {
     try {
       const support = await ImageDecoder.isTypeSupported(mimeType);
@@ -49,7 +52,15 @@ async function openFile(reqId, fileId, file) {
     }
   }
 
-  const buffer = await file.arrayBuffer();
+  let buffer = payload && payload.buffer ? payload.buffer : null;
+  if (!(buffer instanceof ArrayBuffer)) {
+    const file = payload && payload.file ? payload.file : null;
+    if (!file || typeof file.arrayBuffer !== "function") {
+      throw new Error("Huge worker did not receive image data");
+    }
+    buffer = await file.arrayBuffer();
+  }
+
   const decoder = new ImageDecoder({
     type: mimeType,
     data: buffer,
@@ -102,7 +113,7 @@ self.onmessage = async (event) => {
   const msg = event.data || {};
   try {
     if (msg.type === "open") {
-      await openFile(msg.reqId, msg.fileId, msg.file);
+      await openFile(msg.reqId, msg.fileId, msg);
       return;
     }
     if (msg.type === "render") {

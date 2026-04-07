@@ -1,10 +1,10 @@
 // app.js
-// Image Align Tool_48: Sorting + Stitch/Slice
+// Image Align Tool_49: Sorting + Stitch/Slice
 // Base: Image Align Tool_41
-// Changes in _48:
-// - Keep the old stable logic for normal images.
-// - Add a new huge-image mode that slices tiles through slice-worker.js.
-// - Huge-image mode uses 2048 tiles, concurrency 1, PNG tiles, and object URLs.
+// Changes in _49:
+// - Fix huge worker init by sending ArrayBuffer to the worker instead of trying to transfer File.
+// - Add a clearer huge-mode init failure message instead of misreporting it as image-too-large.
+// - Keep the _48 huge-mode path: 2048 tiles, concurrency 1, PNG tiles, and object URLs.
 // - panel.html is unchanged.
 
 const { board } = window.miro;
@@ -30,6 +30,7 @@ const LARGE_IMAGE_DIMENSION_WARNING = 16384;
 const LARGE_IMAGE_WORKER_MIN_DIM = 24000;
 const LARGE_IMAGE_WORKER_MIN_TILES = 36;
 const TOO_LARGE_IMPORT_MESSAGE = "Image is too large for this browser";
+const HUGE_INIT_FAILURE_MESSAGE = "Huge mode init failed";
 const FAILURE_UI_COLOR = "#c62828";
 const HUGE_WORKER_PATH = "./slice-worker.js";
 const HUGE_TILE_MIME = "image/png";
@@ -643,7 +644,17 @@ function createHugeSliceManager() {
     const currentFileId = `huge-${fileId++}`;
     session = { fileId: currentFileId, openPromise: null };
     sessions.set(file, session);
-    session.openPromise = callWorker({ type: "open", fileId: currentFileId, file }, [file])
+    session.openPromise = Promise.resolve()
+      .then(async () => {
+        const buffer = await file.arrayBuffer();
+        return callWorker({
+          type: "open",
+          fileId: currentFileId,
+          fileName: file && file.name ? file.name : "",
+          mimeType: file && file.type ? file.type : "",
+          buffer,
+        }, [buffer]);
+      })
       .then((msg) => ({ fileId: currentFileId, width: msg.width, height: msg.height }))
       .catch((err) => {
         sessions.delete(file);
@@ -951,8 +962,8 @@ async function handleStitchSubmit(event) {
 
     if (!fileInfos.length) {
       if (hugeInitFailures.length > 0) {
-        showFailedProgressState("Image is too large");
-        await notifyWarning(TOO_LARGE_IMPORT_MESSAGE, { failedFiles: hugeInitFailures });
+        showFailedProgressState("Huge mode init failed");
+        await notifyWarning(HUGE_INIT_FAILURE_MESSAGE, { failedFiles: hugeInitFailures });
         return;
       }
       setProgress(0, 0, "Nothing to import.");
@@ -962,7 +973,7 @@ async function handleStitchSubmit(event) {
 
     if (hugeInitFailures.length > 0) {
       await notifyWarning(
-        hugeInitFailures.length === 1 ? TOO_LARGE_IMPORT_MESSAGE : "Some images are too large",
+        hugeInitFailures.length === 1 ? HUGE_INIT_FAILURE_MESSAGE : "Some huge files failed",
         { failedFiles: hugeInitFailures }
       );
     }
