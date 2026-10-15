@@ -1,4 +1,6 @@
 // app.js
+// Test 52: upload unsliced files byte-for-byte through FileReader + Web SDK.
+// The existing large-image slicing path is unchanged for this focused test.
 // Image Align Tool_49: Sorting + Stitch/Slice
 // Base: Image Align Tool_41
 // Changes in _49:
@@ -22,7 +24,7 @@ const MAX_URL_BYTES = 11000000;
 const CREATE_IMAGE_MAX_RETRIES = 5;
 const CREATE_IMAGE_BASE_DELAY_MS = 500;
 
-const UPLOAD_CONCURRENCY_NORMAL = 4;
+const UPLOAD_CONCURRENCY_NORMAL = 1; // Avoid holding several large Base64 strings at once.
 const UPLOAD_CONCURRENCY_HUGE = 1;
 const META_APP_ID = "image-align-tool";
 const MAX_NOTIFICATION_MESSAGE_LENGTH = 80;
@@ -490,6 +492,38 @@ function canvasToDataUrlUnderLimit(canvas) {
   return dataUrl;
 }
 
+function readOriginalDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result !== "string" || !reader.result.startsWith("data:")) {
+        reject(new Error("Cannot read original image"));
+        return;
+      }
+      // No canvas, recompression, resizing, or application size cap here.
+      resolve(reader.result);
+    };
+    reader.onerror = () => reject(reader.error || new Error("Cannot read original image"));
+    reader.onabort = () => reject(new Error("Reading original image was cancelled"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function getUploadErrorDetails(error) {
+  const details = {};
+  for (const key of ["name", "message", "code", "status", "statusCode"]) {
+    if (error && ["string", "number"].includes(typeof error[key])) details[key] = error[key];
+  }
+  if (!details.message) details.message = String(error || "Unknown upload error");
+  // Never include image data or request bodies in the diagnostics.
+  for (const key of Object.keys(details)) {
+    if (typeof details[key] === "string") {
+      details[key] = details[key].replace(/data:[^\s"']+/g, "[image data omitted]").slice(0, 3000);
+    }
+  }
+  return details;
+}
+
 function rgbaBufferToPngBlob(buffer, width, height) {
   return new Promise((resolve, reject) => {
     try {
@@ -710,6 +744,13 @@ async function handleStitchSubmit(event) {
   const progressBarEl = document.getElementById("stitchProgressBar");
   const progressMainEl = document.getElementById("stitchProgressMain");
   const progressEtaEl = document.getElementById("stitchProgressEta");
+  const reportEl = document.getElementById("originalUploadReport");
+  const reportBox = document.getElementById("originalUploadReportBox");
+  const uploadReport = [];
+  const updateUploadReport = () => {
+    if (reportEl) reportEl.value = JSON.stringify({ version: "original-upload-test-52", uploads: uploadReport }, null, 2);
+    if (reportBox) reportBox.hidden = false;
+  };
 
   let progressStageEl = document.getElementById("stitchProgressStage");
   if (!progressStageEl && progressMainEl && progressMainEl.parentNode) {
@@ -830,6 +871,8 @@ async function handleStitchSubmit(event) {
 
     if (stitchButton) stitchButton.disabled = true;
     resetProgressUiState();
+    if (reportBox) reportBox.hidden = true;
+    if (reportEl) reportEl.value = "";
     setProgress(0, 0, "");
     setEtaText(null);
 
@@ -1283,8 +1326,10 @@ async function handleStitchSubmit(event) {
         return;
       }
 
-      const uploadOne = async (url, x, y, title, meta, byteCount, maxRetries) => {
-        const imgWidget = await createImageWithRetry({ url, x, y, title }, maxRetries);
+      const uploadOne = async (url, x, y, title, meta, byteCount, maxRetries, width) => {
+        const params = { url, x, y, title };
+        if (Number.isFinite(width) && width > 0) params.width = width;
+        const imgWidget = await createImageWithRetry(params, maxRetries);
         try {
           await imgWidget.setMetadata(META_APP_ID, meta);
         } catch (e) {
@@ -1297,6 +1342,36 @@ async function handleStitchSubmit(event) {
       };
 
       try {
+        if (job.kind === "full") {
+          const report = {
+            fileName, fileBytes: file.size, width: job.width, height: job.height,
+            mode: "original", status: "reading", payloadCharacters: null,
+          };
+          uploadReport.push(report);
+          updateUploadReport();
+          const startedAt = performance.now();
+          try {
+            const url = await readOriginalDataUrl(file);
+            report.payloadCharacters = url.length;
+            report.status = "uploading";
+            updateUploadReport();
+            const title = `C${String(info.satCode).padStart(2, "0")}/${String(info.briCode).padStart(3, "0")} ${fileName}`;
+            // One attempt: rejection must remain visible, with no lossy/sliced fallback.
+            await uploadOne(url, job.x, job.y, title, {
+              fileName, satCode: info.satCode, briCode: info.briCode, uploadMode: "original",
+            }, file.size, 0, job.width);
+            report.status = "created";
+          } catch (error) {
+            report.status = "failed";
+            report.error = getUploadErrorDetails(error);
+            recordFailedSourceFile(fileName, "original-upload-failed", report.error);
+            markJobSettled(job, "skipped", { reason: "original-upload-failed" });
+          } finally {
+            report.elapsedMs = Math.round(performance.now() - startedAt);
+            updateUploadReport();
+          }
+          return;
+        }
         if (useHugeWorker) {
           const { width, height, buffer } = await hugeManager.renderTile(file, job.sx, job.sy, job.sw, job.sh);
           const blob = await rgbaBufferToPngBlob(buffer, width, height);
@@ -1327,47 +1402,28 @@ async function handleStitchSubmit(event) {
         }
 
         const imgEl = await getDecodedImage(file);
-        if (job.kind === "full") {
-          const titleBase = `C${String(info.satCode).padStart(2, "0")}/${String(info.briCode).padStart(3, "0")} ${fileName}`;
-          const left = job.x - job.width / 2;
-          const top = job.y - job.height / 2;
-          await uploadRegularRegionWithSubslice(job, imgEl, {
-            sx: 0,
-            sy: 0,
-            sw: job.width,
-            sh: job.height,
-            left,
-            top,
-            w: job.width,
-            h: job.height,
-            titleBase,
-            metaBase: { fileName, satCode: info.satCode, briCode: info.briCode },
-            depth: 0,
-          }, uploadOne);
-        } else {
-          const left = job.x - job.sw / 2;
-          const top = job.y - job.sh / 2;
-          await uploadRegularRegionWithSubslice(job, imgEl, {
-            sx: job.sx,
-            sy: job.sy,
-            sw: job.sw,
-            sh: job.sh,
-            left,
-            top,
-            w: job.sw,
-            h: job.sh,
-            titleBase: job.title,
-            metaBase: {
-              fileName,
-              satCode: info.satCode,
-              briCode: info.briCode,
-              tileIndex: job.tileIndex,
-              tilesX: job.tilesX,
-              tilesY: job.tilesY,
-            },
-            depth: 0,
-          }, uploadOne);
-        }
+        const left = job.x - job.sw / 2;
+        const top = job.y - job.sh / 2;
+        await uploadRegularRegionWithSubslice(job, imgEl, {
+          sx: job.sx,
+          sy: job.sy,
+          sw: job.sw,
+          sh: job.sh,
+          left,
+          top,
+          w: job.sw,
+          h: job.sh,
+          titleBase: job.title,
+          metaBase: {
+            fileName,
+            satCode: info.satCode,
+            briCode: info.briCode,
+            tileIndex: job.tileIndex,
+            tilesX: job.tilesX,
+            tilesY: job.tilesY,
+          },
+          depth: 0,
+        }, uploadOne);
       } catch (e) {
         if (useHugeWorker) {
           await markHugeFileFailed(file, new FatalHugeFileError(file, fileName, e), job);
@@ -1497,3 +1553,4 @@ window.addEventListener("DOMContentLoaded", () => {
     updateLabel();
   }
 });
+
