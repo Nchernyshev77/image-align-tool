@@ -25,7 +25,7 @@ const LARGE_IMAGE_WORKER_MIN_TILES = 36;
 const TOO_LARGE_IMPORT_MESSAGE = "Image is too large for this browser";
 const HUGE_INIT_FAILURE_MESSAGE = "Huge mode init failed";
 const FAILURE_UI_COLOR = "#c62828";
-const HUGE_WORKER_PATH = "./slice-worker.js";
+const HUGE_WORKER_PATH = "./slice-worker.js?v=53.1";
 const HUGE_TILE_MIME = "image/png";
 
 function detectMaxSliceDim() {

@@ -42,8 +42,8 @@ async function smallColorTest(space,type) {
     compareRegion(originalManaged,await pixels(part,'default'),c.width,rect);
   }
   // Exercise the huge-image decoder path against the same color-managed source.
-  if(window.ImageDecoder){
-    const worker=new Worker('../slice-worker.js?v=53');let req=0;
+  if(window.createImageBitmap && window.OffscreenCanvas){
+    const worker=new Worker('../slice-worker.js?v=53.1');let req=0;
     const call=(message,transfer=[])=>new Promise((resolve,reject)=>{
       const id=++req;worker.onmessage=e=>{if(e.data.reqId!==id)return;e.data.error?reject(Error(e.data.error)):resolve(e.data);};
       worker.onerror=e=>reject(Error(e.message));worker.postMessage({...message,reqId:id},transfer);
