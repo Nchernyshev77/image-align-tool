@@ -25,7 +25,7 @@ PNG sources retain their original supported color chunks. PNG encoding is lossle
 
 Tests cover the measured payload boundary, exact partition geometry, oversized later parts, ICC preservation, 2/3/4-part selection, full original pass-through, board widths and adjacent coordinates, reverse corners, missing source numbers, partial failures and continuing the next file. SDK calls are mocked.
 
-Open `tests/browser-lossless.html` from the hosted app and click Run. The browser check uses generated sRGB and Display-P3 JPEG/PNG files to compare decoded RGBA and color-managed output before/after 2/3/4-part slicing, including the huge worker. A 4096-square noise PNG tests actual encoded sizes and pixel equality. It does not upload to Miro.
+Open `tests/browser-lossless.html` from the hosted app and click Run. The browser check uses generated sRGB and Display-P3 JPEG/PNG files to compare decoded RGBA and color-managed output before/after 2/3/4-part slicing, including the huge worker. Raw decoded pixels and color metadata must match exactly. Browser color-managed rendering is measured separately: JPEG and PNG decoder/color-conversion paths can round differently even when raw samples and ICC bytes are identical. A 4096-square noise PNG tests actual encoded sizes and pixel equality. It does not upload to Miro.
 
 ## Live Miro check
 

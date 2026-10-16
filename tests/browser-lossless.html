@@ -20,11 +20,14 @@ async function pixels(blob,conversion='none') {
   const ctx=c.getContext('2d',{colorSpace:'srgb',willReadFrequently:true});ctx.drawImage(bitmap,0,0);
   const data=ctx.getImageData(0,0,c.width,c.height).data;bitmap.close();c.width=c.height=1;return data;
 }
-function compareRegion(expected,actual,sourceWidth,rect) {
+function compareRegion(expected,actual,sourceWidth,rect,measureOnly=false) {
+  let maximum=0;
   for(let y=0;y<rect.height;y++) for(let x=0;x<rect.width;x++) for(let ch=0;ch<4;ch++) {
     const i=((rect.y+y)*sourceWidth+rect.x+x)*4+ch,j=(y*rect.width+x)*4+ch;
-    if(expected[i]!==actual[j]) throw Error(`Pixel mismatch (${rect.x+x},${rect.y+y}) channel ${ch}: ${expected[i]} vs ${actual[j]}`);
+    maximum=Math.max(maximum,Math.abs(expected[i]-actual[j]));
+    if(!measureOnly && expected[i]!==actual[j]) throw Error(`Pixel mismatch (${rect.x+x},${rect.y+y}) channel ${ch}: ${expected[i]} vs ${actual[j]}`);
   }
+  return maximum;
 }
 async function smallColorTest(space,type) {
   const c=document.createElement('canvas');c.width=97;c.height=61;
@@ -36,10 +39,13 @@ async function smallColorTest(space,type) {
   }
   const file=await blobOf(c,type),source=await L.openSource(file);
   const originalRaw=await pixels(file),originalManaged=await pixels(file,'default');
+  let displayDifference=0;
   for(const n of [2,3,4])for(const rect of L.partitions(c.width,c.height,n)){
     const part=await L.encodeRegion(source,rect);
     compareRegion(originalRaw,await pixels(part),c.width,rect);
-    compareRegion(originalManaged,await pixels(part,'default'),c.width,rect);
+    displayDifference=Math.max(displayDifference,compareRegion(originalManaged,await pixels(part,'default'),c.width,rect,true));
+    const restoredColors=await L.colorMetadata(part);
+    assert(JSON.stringify(restoredColors.chunks)===JSON.stringify(source.colors.chunks),'Source color metadata changed');
   }
   // Exercise the huge-image decoder path against the same color-managed source.
   if(window.createImageBitmap && window.OffscreenCanvas){
@@ -55,11 +61,14 @@ async function smallColorTest(space,type) {
       const out=document.createElement('canvas');out.width=c.width;out.height=c.height;
       out.getContext('2d',{colorSpace:'srgb'}).putImageData(new ImageData(new Uint8ClampedArray(tile.buffer),c.width,c.height),0,0);
       const restored=await L.preserveColor(await blobOf(out),source.colors.chunks);
-      compareRegion(originalManaged,await pixels(restored,'default'),c.width,{x:0,y:0,width:c.width,height:c.height});
+      const rect={x:0,y:0,width:c.width,height:c.height};
+      compareRegion(originalRaw,await pixels(restored),c.width,rect);
+      displayDifference=Math.max(displayDifference,compareRegion(originalManaged,await pixels(restored,'default'),c.width,rect,true));
     } finally {worker.terminate();}
   }
   source.close();c.width=c.height=1;
-  log(`PASS ${space} ${type}: 2/3/4 parts, identical decoded RGBA and rendered sRGB; ${source.colors.description}`);
+  log(`DISPLAY ${space} ${type}: maximum browser color-conversion difference ${displayDifference}/255`);
+  log(`PASS ${space} ${type}: 2/3/4 parts, identical decoded RGBA and color metadata; ${source.colors.description}`);
 }
 async function largeTest(){
   const c=document.createElement('canvas');c.width=c.height=4096;
