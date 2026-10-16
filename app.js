@@ -718,9 +718,20 @@ async function handleStitchSubmit(event) {
   if(imagesPerRow<1){await notifyError('Rows must be greater than 0');return;}
   const bar=document.getElementById('stitchProgressBar'),status=document.getElementById('stitchProgressMain');
   const scanEl=document.getElementById('stitchScanProgress'),prepareEl=document.getElementById('stitchPrepareProgress'),uploadEl=document.getElementById('stitchUploadProgress');
-  const resultEl=document.getElementById('stitchResult');
+  const resultEl=document.getElementById('stitchResult'),elapsedEl=document.getElementById('stitchElapsed');
+  const startedAt=performance.now();
+  const showElapsed=()=>{
+    const elapsedMs=performance.now()-startedAt,seconds=Math.round(elapsedMs/1000);
+    const hours=Math.floor(seconds/3600),minutes=Math.floor(seconds%3600/60);
+    if(elapsedEl){
+      elapsedEl.textContent=`Total time: ${hours?`${hours}h `:''}${hours||minutes?`${minutes}m `:''}${seconds%60}s`;
+      elapsedEl.hidden=false;
+    }
+    return elapsedMs;
+  };
   if(button)button.disabled=true;
   if(resultEl){resultEl.hidden=true;resultEl.textContent='';}
+  if(elapsedEl){elapsedEl.hidden=true;elapsedEl.textContent='';}
   if(status){status.style.color='';status.textContent='Scanning files…';}
   if(bar){bar.style.width='0%';bar.style.background='';}
   let viewCenterX=0,viewCenterY=0;
@@ -765,7 +776,8 @@ async function handleStitchSubmit(event) {
     };
     const result=await window.ImportEngine.run({files,board,scan:window.FastImageScan.scan,layout,
       createPreparer:()=>window.TilePreparation.create(),onProgress,options:{readDataUrl:readOriginalDataUrl}});
-    window.ImageAlignLastImport={version:56,success:result.success,verified:result.verified,totalParts:result.totalParts,passes:result.passes,
+    const elapsedMs=showElapsed();
+    window.ImageAlignLastImport={version:57,elapsedMs,success:result.success,verified:result.verified,totalParts:result.totalParts,passes:result.passes,
       failures:result.failures,groupErrors:result.groupErrors,boardError:result.boardError,duplicates:result.duplicates};
     if(resultEl){
       resultEl.hidden=false;
@@ -778,6 +790,7 @@ async function handleStitchSubmit(event) {
         resultEl.textContent='Import incomplete after 5 passes.\n'+failures.join('\n');
       }
       resultEl.style.color=result.success?'':FAILURE_UI_COLOR;
+      resultEl.style.textAlign=result.success?'center':'left';
     }
     if(result.success){
       if(status)status.textContent='All tiles uploaded and verified';
@@ -790,9 +803,10 @@ async function handleStitchSubmit(event) {
       await notifyError(`Import incomplete: ${result.failures.length} files; see the list below`);
     }
   }catch(error){
+    showElapsed();
     console.error('Image import failed',error);
     if(status){status.textContent='Import failed';status.style.color=FAILURE_UI_COLOR;}
-    if(resultEl){resultEl.hidden=false;resultEl.textContent=error.message||String(error);resultEl.style.color=FAILURE_UI_COLOR;}
+    if(resultEl){resultEl.hidden=false;resultEl.textContent=error.message||String(error);resultEl.style.color=FAILURE_UI_COLOR;resultEl.style.textAlign='left';}
     await notifyError('Image import failed',error);
   }finally{if(button)button.disabled=false;}
 }
