@@ -1,5 +1,5 @@
 // app.js
-// Test 55: local JPEG coefficient crops, preparation first, five concurrent sources.
+// Test 56: fast scan, two preparation workers, streaming uploads and five-pass verification.
 const { board } = window.miro;
 
 // ---- color / slice settings ----
@@ -710,756 +710,91 @@ function createHugeSliceManager() {
 
 async function handleStitchSubmit(event) {
   event.preventDefault();
-  logCanvasColorSpace("Stitch/Slice");
-
-  const hugeManager = createHugeSliceManager();
-  const jpegManager = window.JpegLossless.create();
-  let staging;
-  let uploadedBytesDone = 0;
-  let uploadRetryEvents = 0;
-  const createImageWallTimesMs = [];
-  let createImageWallTimeSumMs = 0;
-  let createImageWallTimeCount = 0;
-
-  const stitchButton = document.getElementById("stitchButton");
-  const progressBarEl = document.getElementById("stitchProgressBar");
-  const progressMainEl = document.getElementById("stitchProgressMain");
-  const progressEtaEl = document.getElementById("stitchProgressEta");
-  const reportEl = document.getElementById("originalUploadReport");
-  const reportBox = document.getElementById("originalUploadReportBox");
-  const uploadReport = [];
-  const updateUploadReport = () => {
-    if (reportEl) reportEl.value = JSON.stringify({ version: "lossless-jpeg-test-55", urlLimitBytes: MAX_URL_BYTES, uploads: uploadReport }, null, 2);
-    if (reportBox) reportBox.hidden = false;
-  };
-
-  let progressStageEl = document.getElementById("stitchProgressStage");
-  if (!progressStageEl && progressMainEl && progressMainEl.parentNode) {
-    progressStageEl = document.createElement("div");
-    progressStageEl.id = "stitchProgressStage";
-    progressStageEl.style.textAlign = "center";
-    progressStageEl.style.fontWeight = "600";
-    progressStageEl.style.margin = "6px 0 2px";
-    progressStageEl.style.fontSize = "12px";
-    progressStageEl.style.userSelect = "none";
-    progressMainEl.parentNode.insertBefore(progressStageEl, progressMainEl);
-  }
-
-  const STAGES_TOTAL = 2;
-  let stageIndex = 1;
-
-  const resetProgressUiState = () => {
-    if (progressBarEl) {
-      progressBarEl.style.width = "0%";
-      progressBarEl.style.display = "";
-      if (progressBarEl.parentElement) progressBarEl.parentElement.style.display = "";
-    }
-    if (progressStageEl) {
-      progressStageEl.style.display = "";
-      progressStageEl.style.color = "";
-      progressStageEl.style.fontWeight = "600";
-      progressStageEl.textContent = "";
-    }
-    if (progressMainEl) {
-      progressMainEl.style.color = "";
-      progressMainEl.style.fontWeight = "";
-      progressMainEl.textContent = "";
-    }
-    if (progressEtaEl) {
-      progressEtaEl.style.color = "";
-      progressEtaEl.textContent = "";
-    }
-  };
-
-  const showFailedProgressState = (message) => {
-    if (progressBarEl) {
-      progressBarEl.style.width = "0%";
-      progressBarEl.style.display = "none";
-      if (progressBarEl.parentElement) progressBarEl.parentElement.style.display = "none";
-    }
-    if (progressStageEl) {
-      progressStageEl.style.display = "";
-      progressStageEl.style.color = FAILURE_UI_COLOR;
-      progressStageEl.style.fontWeight = "700";
-      progressStageEl.textContent = "Fail";
-    }
-    if (progressMainEl) {
-      progressMainEl.style.color = FAILURE_UI_COLOR;
-      progressMainEl.style.fontWeight = "700";
-      progressMainEl.textContent = message || "Fail";
-    }
-    if (progressEtaEl) {
-      progressEtaEl.style.color = FAILURE_UI_COLOR;
-      progressEtaEl.textContent = "";
-    }
-  };
-
-  const setStage = (idx) => {
-    stageIndex = Math.max(1, Math.min(STAGES_TOTAL, idx));
-    if (progressStageEl) progressStageEl.textContent = `Stage ${stageIndex}/${STAGES_TOTAL}`;
-  };
-
-  const setProgress = (done, total, labelOverride, displayDone, displayTotal) => {
-    if (total > 0 && progressBarEl) {
-      const frac = done / total;
-      progressBarEl.style.width = `${(frac * 100).toFixed(1)}%`;
-    }
-    if (!progressMainEl) return;
-    const label = labelOverride !== undefined ? String(labelOverride) : "Creating";
-    const showDisplayCounts = Number.isFinite(displayTotal) && displayTotal > 0 && Number.isFinite(displayDone);
-    if (total > 0) {
-      const shownDone = showDisplayCounts ? displayDone : done;
-      const shownTotal = showDisplayCounts ? displayTotal : total;
-      progressMainEl.textContent = `${label} ${shownDone} / ${shownTotal}`;
-      return;
-    }
-    progressMainEl.textContent = labelOverride !== undefined ? label : "";
-  };
-
-  const setEtaText = (ms) => {
-    if (!progressEtaEl) return;
-    if (ms == null || !Number.isFinite(ms) || ms < 0) {
-      progressEtaEl.textContent = "";
-      return;
-    }
-    const totalSeconds = Math.round(ms / 1000);
-    const mins = Math.floor(totalSeconds / 60);
-    const secs = totalSeconds % 60;
-    const secsStr = secs.toString().padStart(2, "0");
-    progressEtaEl.textContent = mins ? `${mins}m ${secsStr}s left` : `${secsStr}s left`;
-  };
-
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
+  const form=document.getElementById('stitch-form'),button=document.getElementById('stitchButton');
+  const input=document.getElementById('stitchFolderInput');
+  const files=sortFilesByNameWithNumber(Array.from(input&&input.files||[]));
+  if(!files.length){await notifyError('Select one or more image files');return;}
+  const imagesPerRow=Number(form.stitchImagesPerRow.value)||1,startCorner=form.stitchStartCorner.value,skipMissing=form.stitchSkipMissing.checked;
+  if(imagesPerRow<1){await notifyError('Rows must be greater than 0');return;}
+  const bar=document.getElementById('stitchProgressBar'),status=document.getElementById('stitchProgressMain');
+  const scanEl=document.getElementById('stitchScanProgress'),prepareEl=document.getElementById('stitchPrepareProgress'),uploadEl=document.getElementById('stitchUploadProgress');
+  const resultEl=document.getElementById('stitchResult');
+  if(button)button.disabled=true;
+  if(resultEl){resultEl.hidden=true;resultEl.textContent='';}
+  if(status){status.style.color='';status.textContent='Scanning files…';}
+  if(bar){bar.style.width='0%';bar.style.background='';}
+  let viewCenterX=0,viewCenterY=0;
   try {
-    const form = document.getElementById("stitch-form");
-    if (!form) return;
-
-    const imagesPerRow = Number(form.stitchImagesPerRow.value) || 1;
-    const startCorner = form.stitchStartCorner.value;
-    const skipMissingTiles = form.stitchSkipMissing.checked;
-    const input = document.getElementById("stitchFolderInput");
-    const files = input ? input.files : null;
-
-    if (!files || !files.length) {
-      await notifyError("Select one or more image files");
-      return;
-    }
-    if (imagesPerRow < 1) {
-      await notifyError("Rows must be greater than 0");
-      return;
-    }
-
-    if (stitchButton) stitchButton.disabled = true;
-    resetProgressUiState();
-    if (reportBox) reportBox.hidden = true;
-    if (reportEl) reportEl.value = "";
-    setProgress(0, 0, "");
-    setEtaText(null);
-
-    const filesArray = Array.from(files);
-    setStage(1);
-    const PREP_EXTRA_STEPS = 4;
-    const prepTotalSteps = filesArray.length + PREP_EXTRA_STEPS;
-
-    let viewCenterX = 0;
-    let viewCenterY = 0;
-    try {
-      const viewport = await board.viewport.get();
-      viewCenterX = viewport.x + viewport.width / 2;
-      viewCenterY = viewport.y + viewport.height / 2;
-    } catch (e) {
-      console.warn("Stitch/Slice: could not get viewport, fallback to 0,0", e);
-    }
-
-    const fileInfos = [];
-    let anySliced = false;
-    const hugeInitFailures = [];
-
-    setProgress(0, prepTotalSteps, "Preparing files…", 0, filesArray.length);
-
-    for (let i = 0; i < filesArray.length; i++) {
-      const file = filesArray[i];
-      setProgress(i + 1, prepTotalSteps, "Preparing files…", i + 1, filesArray.length);
-      await sleep(0);
-
-      let imgEl;
-      try {
-        imgEl = await decodeImageFromFile(file);
-      } catch (e) {
-        console.error("Stitch/Slice: browser failed to decode image", file.name, e);
-        await notifyError("Cannot decode image", { fileName: file.name, error: e });
-        continue;
-      }
-
-      const width = imgEl.naturalWidth || imgEl.width;
-      const height = imgEl.naturalHeight || imgEl.height;
-      if (!width || !height) {
-        await notifyError("Invalid image size", { fileName: file.name, width, height });
-        try { imgEl.src = ""; } catch (_) {}
-        continue;
-      }
-
-      if (width > MAX_SLICE_DIM || height > MAX_SLICE_DIM) {
-        console.warn("Stitch/Slice: image exceeds MAX_TEXTURE_SIZE hint", {
-          fileName: file.name,
-          width,
-          height,
-          maxTextureSize: MAX_SLICE_DIM,
-        });
-      }
-
-      let brightness = 0.5;
-      let saturation = 0.0;
-      try {
-        const res = getBrightnessAndSaturationFromImageElement(imgEl);
-        if (res) {
-          brightness = res.brightness;
-          saturation = res.saturation;
-        }
-      } catch (e) {
-        console.warn("Stitch/Slice: brightness/saturation calc failed for", file.name, e);
-      }
-
-      const briCode = Math.max(0, Math.min(999, Math.round((1 - brightness) * 999)));
-      const satCode = Math.max(0, Math.min(SAT_CODE_MAX, Math.round(Math.min(1, saturation * SAT_BOOST) * SAT_CODE_MAX)));
-      const needsSlice = width > SLICE_THRESHOLD_WIDTH || height > SLICE_THRESHOLD_HEIGHT;
-      if (needsSlice) anySliced = true;
-
-      let previewTilesX = 1;
-      let previewTilesY = 1;
-      let previewNumTiles = 1;
-      if (needsSlice) {
-        previewTilesX = Math.ceil(width / SLICE_TILE_SIZE);
-        previewTilesY = Math.ceil(height / SLICE_TILE_SIZE);
-        previewNumTiles = previewTilesX * previewTilesY;
-      }
-
-      const useHugeWorker = needsSlice && (
-        width > LARGE_IMAGE_WORKER_MIN_DIM ||
-        height > LARGE_IMAGE_WORKER_MIN_DIM ||
-        previewNumTiles >= LARGE_IMAGE_WORKER_MIN_TILES
-      );
-      const sliceTileSize = useHugeWorker ? HUGE_SLICE_TILE_SIZE : SLICE_TILE_SIZE;
-      const tilesX = needsSlice ? Math.ceil(width / sliceTileSize) : 1;
-      const tilesY = needsSlice ? Math.ceil(height / sliceTileSize) : 1;
-      const numTiles = tilesX * tilesY;
-
-      if (useHugeWorker) {
-        try {
-          const sessionMeta = await hugeManager.openFile(file);
-          console.log("[Image Align Tool] huge mode init", {
-            fileName: file.name,
-            width,
-            height,
-            workerWidth: sessionMeta.width,
-            workerHeight: sessionMeta.height,
-            tilesX,
-            tilesY,
-            sliceTileSize,
-          });
-        } catch (e) {
-          hugeInitFailures.push({ fileName: file.name, width, height, error: e && e.message ? e.message : String(e) });
-          console.error("[Image Align Tool] huge mode init failed", { fileName: file.name, error: e });
-          try { imgEl.src = ""; } catch (_) {}
-          continue;
-        }
-      }
-
-      try { imgEl.src = ""; } catch (_) {}
-      fileInfos.push({
-        file,
-        width,
-        height,
-        briCode,
-        satCode,
-        needsSlice,
-        useHugeWorker,
-        tilesX,
-        tilesY,
-        numTiles,
-        sliceTileSize,
+    try{const viewport=await board.viewport.get();viewCenterX=viewport.x+viewport.width/2;viewCenterY=viewport.y+viewport.height/2;}catch(error){console.warn('Viewport unavailable',error);}
+    const layout=async sources=>{
+      const fallback=sources.find(s=>s.info)?.info||{width:4096,height:4096};
+      const infos=sources.map(source=>{
+        const info=source.info||fallback,width=info.width,height=info.height;
+        const needsSlice=width>SLICE_THRESHOLD_WIDTH||height>SLICE_THRESHOLD_HEIGHT;
+        const baseTiles=Math.ceil(width/SLICE_TILE_SIZE)*Math.ceil(height/SLICE_TILE_SIZE);
+        const huge=width>LARGE_IMAGE_WORKER_MIN_DIM||height>LARGE_IMAGE_WORKER_MIN_DIM||baseTiles>=LARGE_IMAGE_WORKER_MIN_TILES;
+        return {...info,file:source.file,width,height,needsSlice,sliceTileSize:huge?HUGE_SLICE_TILE_SIZE:SLICE_TILE_SIZE};
       });
-    }
-
-    let prepDone = filesArray.length;
-
-    if (!fileInfos.length) {
-      if (hugeInitFailures.length > 0) {
-        showFailedProgressState("Huge mode init failed");
-        await notifyWarning(HUGE_INIT_FAILURE_MESSAGE, { failedFiles: hugeInitFailures });
-        return;
-      }
-      setProgress(0, 0, "Nothing to import.");
-      setEtaText(null);
-      return;
-    }
-
-    if (hugeInitFailures.length > 0) {
-      await notifyWarning(
-        hugeInitFailures.length === 1 ? HUGE_INIT_FAILURE_MESSAGE : "Some huge files failed",
-        { failedFiles: hugeInitFailures }
-      );
-    }
-
-    prepDone += 1;
-    setProgress(prepDone, prepTotalSteps, "Preparing files… (sorting)", filesArray.length, filesArray.length);
-    await sleep(0);
-
-    const orderedFiles = sortFilesByNameWithNumber(filesArray);
-    prepDone += 1;
-    setProgress(prepDone, prepTotalSteps, "Preparing files… (indexing)", filesArray.length, filesArray.length);
-    await sleep(0);
-
-    const infoByFile = new Map();
-    fileInfos.forEach((info) => infoByFile.set(info.file, info));
-    const orderedInfos = orderedFiles.map((f) => infoByFile.get(f)).filter(Boolean);
-
-    if (!orderedInfos.length) {
-      setProgress(0, 0, "Nothing to import.");
-      return;
-    }
-
-    prepDone += 1;
-    setProgress(prepDone, prepTotalSteps, "Preparing files… (counting tiles)", filesArray.length, filesArray.length);
-    await sleep(0);
-
-    let totalTiles = orderedInfos.reduce((sum, info) => sum + (info.needsSlice ? info.numTiles : 1), 0);
-    if (anySliced && skipMissingTiles) {
-      await notifyInfo("Skip missing tiles ignored");
-    }
-
-    prepDone += 1;
-    setProgress(prepDone, prepTotalSteps, "Preparing files… (layout)", filesArray.length, filesArray.length);
-    await sleep(0);
-
-    let slotCentersByFile = null;
-    let slotCentersArray = null;
-    const hasAnyNumber = orderedInfos.some((info) => extractTrailingNumber(info.file.name || "") !== null);
-    if (!anySliced && skipMissingTiles && hasAnyNumber) {
-      const tileInfos = [];
-      let maxNum = -Infinity;
-      for (const info of orderedInfos) {
-        const num = extractTrailingNumber(info.file.name || "");
-        if (num === null) continue;
-        tileInfos.push({ info, num });
-        if (num > maxNum) maxNum = num;
-      }
-      if (!tileInfos.length) {
-        slotCentersArray = computeVariableSlotCenters(orderedInfos, imagesPerRow, startCorner, viewCenterX, viewCenterY);
-      } else {
-        let current = maxNum;
-        for (const info of orderedInfos) {
-          const already = tileInfos.find((t) => t.info.file === info.file);
-          if (!already) tileInfos.push({ info, num: ++current });
+      let centers,centerMap;
+      if(skipMissing&&!infos.some(info=>info.needsSlice)&&infos.some(info=>extractTrailingNumber(info.file.name||'')!==null)){
+        let next=Math.max(...infos.map(info=>extractTrailingNumber(info.file.name||'')||0));
+        const numbered=infos.map(info=>({info,num:extractTrailingNumber(info.file.name||'')??++next}));
+        centerMap=computeSkipMissingSlotCenters(numbered,imagesPerRow,startCorner,viewCenterX,viewCenterY);
+      }else centers=computeVariableSlotCenters(infos,imagesPerRow,startCorner,viewCenterX,viewCenterY);
+      for(let i=0;i<sources.length;i++){
+        const source=sources[i],info=infos[i],center=centerMap?centerMap.get(source.file):centers[i];
+        if(!source.info){source.jobs=[];continue;}
+        if(!info.needsSlice){source.jobs=[{kind:'full',width:info.width,height:info.height,x:center.x,y:center.y}];continue;}
+        const jobs=[],size=info.sliceTileSize,left=center.x-info.width/2,top=center.y-info.height/2;
+        let index=0;const match=source.name.match(/^(.*?)(\.[^.]*$|$)/),base=match?match[1]:source.name,ext=match?match[2]:'';
+        for(let sy=0;sy<info.height;sy+=size)for(let sx=0;sx<info.width;sx+=size){
+          const sw=Math.min(size,info.width-sx),sh=Math.min(size,info.height-sy);index++;
+          jobs.push({kind:'tile',sx,sy,sw,sh,x:left+sx+sw/2,y:top+sy+sh/2,tileIndex:index,titleName:`${base}_${String(index).padStart(2,'0')}${ext}`});
         }
-        slotCentersByFile = computeSkipMissingSlotCenters(tileInfos, imagesPerRow, startCorner, viewCenterX, viewCenterY);
+        source.jobs=jobs;
       }
-    } else {
-      slotCentersArray = computeVariableSlotCenters(orderedInfos, imagesPerRow, startCorner, viewCenterX, viewCenterY);
+    };
+    const onProgress=state=>{
+      if(scanEl)scanEl.textContent=`1. Scanning: ${state.scanDone} / ${state.totalSources}`;
+      if(prepareEl)prepareEl.textContent=`2. Preparing: ${state.prepareDone} / ${state.totalSources}`;
+      if(uploadEl)uploadEl.textContent=`3. Uploading: ${state.uploaded} / ${state.totalParts||'…'}`;
+      if(status)status.textContent=state.status;
+      if(bar){const scan=state.scanDone/state.totalSources,prepared=state.prepareDone/state.totalSources;
+        const upload=state.totalParts?Math.min(1,state.uploaded/state.totalParts):0;
+        bar.style.width=`${state.phase==='complete'?100:Math.min(97,10*scan+35*prepared+45*upload)}%`;}
+    };
+    const result=await window.ImportEngine.run({files,board,scan:window.FastImageScan.scan,layout,
+      createPreparer:()=>window.TilePreparation.create(),onProgress,options:{readDataUrl:readOriginalDataUrl}});
+    window.ImageAlignLastImport={version:56,success:result.success,verified:result.verified,totalParts:result.totalParts,passes:result.passes,
+      failures:result.failures,groupErrors:result.groupErrors,boardError:result.boardError,duplicates:result.duplicates};
+    if(resultEl){
+      resultEl.hidden=false;
+      if(result.success)resultEl.textContent=`Verified ${result.verified} parts from ${files.length} files.`;
+      else{
+        const failures=result.failures.map(f=>`${f.name}: ${f.total===null?'could not prepare':`${f.missing} of ${f.total} parts missing`} — ${f.error}`);
+        failures.push(...result.groupErrors.map(f=>`${f.name}: grouping failed — ${f.error}`));
+        if(result.boardError)failures.push(`Could not verify board: ${result.boardError}`);
+        if(result.duplicates)failures.push(`Duplicate image references found: ${result.duplicates}`);
+        resultEl.textContent='Import incomplete after 5 passes.\n'+failures.join('\n');
+      }
+      resultEl.style.color=result.success?'':FAILURE_UI_COLOR;
     }
-
-    const allCreatedTiles = [];
-    let createdTiles = 0;
-    let settledTiles = 0;
-    let skippedTiles = 0;
-    const failedHugeFiles = new Map();
-    const failedSourceFiles = new Map();
-
-    const recordFailedSourceFile = (fileName, reason, details) => {
-      const key = fileName || "image";
-      if (!failedSourceFiles.has(key)) {
-        failedSourceFiles.set(key, { fileName: key, reason: reason || "import-failed", details: details || null });
-      }
-      console.warn("[Image Align Tool] source file failed", { fileName: key, reason, details });
-    };
-
-    const markJobSettled = (job, status, details) => {
-      if (job && job.__settled) return;
-      if (job) job.__settled = true;
-      settledTiles += 1;
-      if (status === "skipped") skippedTiles += 1;
-      if (details) {
-        console.log("[Image Align Tool] job settled", {
-          status,
-          title: job && job.title ? job.title : null,
-          fileName: job && job.file ? job.file.name : null,
-          details,
-        });
-      }
-      setProgress(settledTiles, totalTiles, "Uploading to board…");
-    };
-
-    const markHugeFileFailed = async (file, error, job) => {
-      if (!file || failedHugeFiles.has(file)) return;
-      const failedFileName = (job && job.file && job.file.name) || (file && file.name) || "image";
-      const failedMessage = error && error.message ? error.message : String(error || "huge file failed");
-      failedHugeFiles.set(file, { fileName: failedFileName, message: failedMessage });
-      recordFailedSourceFile(failedFileName, "huge-file-failed", failedMessage);
-      console.warn("[Image Align Tool] huge file failed; skipping remaining tiles", { fileName: failedFileName, error });
-      await hugeManager.closeFile(file);
-    };
-
-    setStage(1);
-
-    const createImageWithRetry = async (params, maxRetries = CREATE_IMAGE_MAX_RETRIES) => {
-      let attempt = 0;
-      let lastErr = null;
-      const tStart = performance.now();
-      while (attempt <= maxRetries) {
-        try {
-          const res = await board.createImage(params);
-          const dt = performance.now() - tStart;
-          createImageWallTimesMs.push(dt);
-          createImageWallTimeSumMs += dt;
-          createImageWallTimeCount += 1;
-          return res;
-        } catch (e) {
-          lastErr = e;
-          attempt += 1;
-          uploadRetryEvents += 1;
-          if (attempt > maxRetries) break;
-          const base = CREATE_IMAGE_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-          const jitter = Math.random() * 250;
-          await sleep(base + jitter);
-        }
-      }
-      throw lastErr;
-    };
-
-    const tileJobs = [];
-    const remainingJobsByFile = new Map();
-    const originalNameByFile = new Map();
-
-    const registerJobForFile = (file) => {
-      remainingJobsByFile.set(file, (remainingJobsByFile.get(file) || 0) + 1);
-    };
-
-    const getFileCenter = (info, fileIndex) => {
-      if (slotCentersByFile) return slotCentersByFile.get(info.file) || { x: viewCenterX, y: viewCenterY };
-      if (slotCentersArray) return slotCentersArray[fileIndex] || { x: viewCenterX, y: viewCenterY };
-      return { x: viewCenterX, y: viewCenterY };
-    };
-
-    for (let i = 0; i < orderedInfos.length; i++) {
-      const info = orderedInfos[i];
-      const { file, needsSlice, width, height, tilesX, tilesY, sliceTileSize } = info;
-      const center = getFileCenter(info, i);
-      const originalName = file.name || "image";
-      originalNameByFile.set(file, originalName);
-
-      if (!needsSlice) {
-        registerJobForFile(file);
-        tileJobs.push({ kind: "full", file, info, x: center.x, y: center.y, width, height });
-        continue;
-      }
-
-      const nameMatch = originalName.match(/^(.*?)(\.[^.]*$|$)/);
-      const baseName = nameMatch ? nameMatch[1] : originalName;
-      const originalExt = nameMatch && nameMatch[2] ? nameMatch[2] : "";
-      const colWidths = [];
-      const rowHeights = [];
-      for (let tx = 0; tx < tilesX; tx++) colWidths.push(Math.min(sliceTileSize, width - tx * sliceTileSize));
-      for (let ty = 0; ty < tilesY; ty++) rowHeights.push(Math.min(sliceTileSize, height - ty * sliceTileSize));
-
-      const mosaicW = colWidths.reduce((sum, w) => sum + w, 0);
-      const mosaicH = rowHeights.reduce((sum, h) => sum + h, 0);
-      const mosaicLeft = center.x - mosaicW / 2;
-      const mosaicTop = center.y - mosaicH / 2;
-
-      const colPrefix = [0];
-      for (let tx = 1; tx < tilesX; tx++) colPrefix[tx] = colPrefix[tx - 1] + colWidths[tx - 1];
-      const rowPrefix = [0];
-      for (let ty = 1; ty < tilesY; ty++) rowPrefix[ty] = rowPrefix[ty - 1] + rowHeights[ty - 1];
-
-      let tileIndex = 0;
-      for (let ty = 0; ty < tilesY; ty++) {
-        for (let tx = 0; tx < tilesX; tx++) {
-          tileIndex += 1;
-          const sw = colWidths[tx];
-          const sh = rowHeights[ty];
-          const sx = tx * sliceTileSize;
-          const sy = ty * sliceTileSize;
-          const tileLeft = mosaicLeft + colPrefix[tx];
-          const tileTop = mosaicTop + rowPrefix[ty];
-          const centerX = tileLeft + sw / 2;
-          const centerY = tileTop + sh / 2;
-          const tileSuffix = String(tileIndex).padStart(2, "0");
-          const tileBaseName = `${baseName}_${tileSuffix}`;
-          const tileFullName = originalExt ? `${tileBaseName}${originalExt}` : tileBaseName;
-          const title = `C${String(info.satCode).padStart(2, "0")}/${String(info.briCode).padStart(3, "0")} ${tileFullName}`;
-          registerJobForFile(file);
-          tileJobs.push({
-            kind: "tile",
-            file,
-            info,
-            x: centerX,
-            y: centerY,
-            sx,
-            sy,
-            sw,
-            sh,
-            tileIndex,
-            tilesX,
-            tilesY,
-            title,
-          });
-        }
-      }
+    if(result.success){
+      if(status)status.textContent='All tiles uploaded and verified';
+      await notifyInfo(`Verified ${result.verified} image parts`);
+      const widgets=result.sources.flatMap(s=>s.parts.map(p=>p.widget).filter(Boolean));
+      if(widgets.length)try{await board.viewport.zoomTo(widgets);}catch(error){console.warn('zoomTo failed',error);}
+    }else{
+      if(status){status.textContent='Import incomplete after 5 passes';status.style.color=FAILURE_UI_COLOR;}
+      if(bar)bar.style.background=FAILURE_UI_COLOR;
+      await notifyError(`Import incomplete: ${result.failures.length} files; see the list below`);
     }
-
-    const imageCache = new Map();
-    const getDecodedImage = async (file) => {
-      const cached = imageCache.get(file);
-      if (cached) return cached;
-      const imgPromise = window.LosslessUpload.openSource(file);
-      imageCache.set(file, imgPromise);
-      return imgPromise;
-    };
-
-    const releaseImageIfDone = async (file, useHugeWorker) => {
-      const left = (remainingJobsByFile.get(file) || 0) - 1;
-      if (left <= 0) {
-        remainingJobsByFile.delete(file);
-        if (useHugeWorker) {
-          await hugeManager.closeFile(file);
-        }
-        const cached = imageCache.get(file);
-        if (cached) {
-          cached.then((source) => source.close()).catch(() => {});
-          imageCache.delete(file);
-        }
-        return;
-      }
-      remainingJobsByFile.set(file, left);
-    };
-
-    const preparedJobs = [];
-    const groupErrors = [];
-    let jpegFile = null, jpegMeta = null;
-    const prepareJob = async (job) => {
-      const {file,info} = job, full = job.kind === 'full';
-      const width = full ? job.width : job.sw, height = full ? job.height : job.sh;
-      const fileName = originalNameByFile.get(file) || 'image';
-      const sourceX = full ? 0 : job.sx, sourceY = full ? 0 : job.sy;
-      const report = {fileName,fileBytes:file.size,width,height,sourceX,sourceY,mode:'original',status:'preparing',parts:[],attempts:[]};
-      uploadReport.push(report);updateUploadReport();
-      const startedAt = performance.now();
-      let parts;
-      try {
-        if (info.useHugeWorker && failedHugeFiles.has(file)) throw Error('Huge source preparation failed');
-        const onAttempt = count => {
-          report.attempts.push(count);
-          setProgress(preparedJobs.length,tileJobs.length,`Preparing ${fileName}: ${count} parts…`);
-          updateUploadReport();
-        };
-        if (full && window.LosslessUpload.fits(file.size,file.type || 'application/octet-stream')) {
-          parts = [{x:0,y:0,width,height,blob:file,original:true}];
-        } else {
-          if (/image\/jpe?g/i.test(file.type) || /\.jpe?g$/i.test(fileName)) {
-            if (jpegFile !== file) {
-              await jpegManager.close();
-              jpegFile = file;jpegMeta = await jpegManager.open(file);
-            }
-            const safeBounds = (jpegMeta.safeX || (sourceX===0 && width===jpegMeta.width)) &&
-              (jpegMeta.safeY || (sourceY===0 && height===jpegMeta.height));
-            if (jpegMeta.eligible && safeBounds && jpegMeta.width===info.width && jpegMeta.height===info.height) {
-              report.mode = 'lossless-jpeg';
-              parts = await window.LosslessUpload.planParts(width,height,rect => jpegManager.crop({
-                ...rect,x:sourceX+rect.x,y:sourceY+rect.y,
-              }),{firstCount:full?2:1,onAttempt,mime:'image/jpeg',alignment:jpegMeta});
-              report.colorHandling = 'Original JPEG coefficients and ICC preserved; no resizing or recompression';
-            } else report.jpegFallback = jpegMeta.reason || 'Subsampled crop edges or oriented dimensions require PNG';
-          }
-          if (!parts) {
-            report.mode = 'lossless-png';
-            if (info.useHugeWorker) {
-              const rendered = await hugeManager.renderTile(file,sourceX,sourceY,width,height);
-              const png = await rgbaBufferToPngBlob(rendered.buffer,width,height);
-              const blob = await window.LosslessUpload.preserveColor(png,rendered.colors.chunks);
-              if (!window.LosslessUpload.fits(blob.size,'image/png')) throw Error('Huge-mode PNG exceeds upload limit');
-              parts = [{x:0,y:0,width,height,blob}];report.colorHandling = rendered.colors.description;
-            } else {
-              const source = await getDecodedImage(file);
-              if (source.image.width!==info.width || source.image.height!==info.height) throw Error('Decoded dimensions differ; refusing to resize');
-              report.colorHandling = source.colors.description;
-              parts = await window.LosslessUpload.planParts(width,height,rect => window.LosslessUpload.encodeRegion(source,{
-                ...rect,x:sourceX+rect.x,y:sourceY+rect.y,
-              }),{firstCount:full?2:1,onAttempt});
-            }
-          }
-        }
-        const count = parts.length;
-        const descriptors = [];
-        for (let i=0;i<count;i++) {
-          const part = parts[i];
-          const descriptor = {x:part.x,y:part.y,width:part.width,height:part.height,size:part.blob.size,mime:part.blob.type,original:!!part.original};
-          if (part.original) descriptor.file = file;
-          else descriptor.key = await staging.put(part.blob);
-          part.blob = null;descriptors.push(descriptor);
-        }
-        totalTiles += count-1;
-        report.partCount = count;report.status = 'prepared';
-        preparedJobs.push({job,report,parts:descriptors,width,height,fileName,completed:0,error:null,widgets:[]});
-      } catch(error) {
-        report.status = 'failed';report.error = getUploadErrorDetails(error);
-        settledTiles++;skippedTiles++;job.__settled = true;
-        recordFailedSourceFile(fileName,'preparation-failed',report.error);
-        if(info.useHugeWorker) await markHugeFileFailed(file,error,job);
-      } finally {
-        report.preparationMs = Math.round(performance.now()-startedAt);
-        await releaseImageIfDone(file,!!info.useHugeWorker);
-        if (!remainingJobsByFile.has(file) && jpegFile===file) {
-          await jpegManager.close();jpegFile=null;jpegMeta=null;
-        }
-        updateUploadReport();
-      }
-    };
-
-    // Stage 1 includes the exact candidate-size checks and native-resolution cuts.
-    // Prepared blobs are staged on this computer, not retained as batch Base64.
-    staging = await window.UploadStaging.create();
-    setStage(1);
-    for (let i=0;i<tileJobs.length;i++) {
-      setProgress(i,tileJobs.length,`Preparing tiles ${i+1} / ${tileJobs.length}…`);
-      await prepareJob(tileJobs[i]);
-      await sleep(0);
-    }
-
-    const sourceGroups = new Map();
-    for (const prepared of preparedJobs) {
-      const file=prepared.job.file;
-      if (!sourceGroups.has(file)) sourceGroups.set(file,[]);
-      sourceGroups.get(file).push(prepared);
-    }
-    const uploadPreparedPart = async (prepared,part,index) => {
-      const {job,report,width,height,fileName}=prepared;
-      if (prepared.error) {
-        if(part.key)await staging.remove(part.key);
-        return;
-      }
-      const detail={part:index+1,x:part.x,y:part.y,width:part.width,height:part.height,fileBytes:part.size,status:'reading'};
-      report.parts.push(detail);report.status='uploading';updateUploadReport();
-      const startedAt=performance.now();
-      try {
-        const blob=part.original?part.file:await staging.get(part.key);
-        const readingAt=performance.now(),url=await readOriginalDataUrl(blob);
-        detail.dataUrlMs=Math.round(performance.now()-readingAt);detail.payloadCharacters=url.length;
-        if(url.length+2>MAX_URL_BYTES)throw new DataUrlTooLargeError('Upload URL exceeds Miro limit',url.length+2,MAX_URL_BYTES);
-        if(report.mode==='original')report.payloadCharacters=url.length;
-        if(prepared.error){detail.status='skipped';return;}
-        detail.status='uploading';const uploadingAt=performance.now();
-        const title=job.kind==='full'?`C${String(job.info.satCode).padStart(2,'0')}/${String(job.info.briCode).padStart(3,'0')} ${fileName}`:job.title;
-        const widget=await createImageWithRetry({url,
-          x:job.x-width/2+part.x+part.width/2,y:job.y-height/2+part.y+part.height/2,width:part.width,
-          title:report.mode==='original'?title:`${title} [${report.mode==='lossless-jpeg'?'JPEG':'PNG'} ${index+1}/${prepared.parts.length}]`,
-        },0);
-        detail.createImageMs=Math.round(performance.now()-uploadingAt);detail.status='created';
-        prepared.widgets.push(widget);allCreatedTiles.push(widget);prepared.completed++;
-        createdTiles++;settledTiles++;uploadedBytesDone+=part.size;
-        try {await widget.setMetadata(META_APP_ID,{fileName,satCode:job.info.satCode,briCode:job.info.briCode,
-          uploadMode:report.mode,sourceWidth:job.info.width,sourceHeight:job.info.height,
-          sourceX:report.sourceX+part.x,sourceY:report.sourceY+part.y,partIndex:index+1,partCount:prepared.parts.length,tileIndex:job.tileIndex||1});}
-        catch(error){console.warn('setMetadata failed',error);}
-      } catch(error) {
-        prepared.error=prepared.error||error;detail.status='failed';detail.error=getUploadErrorDetails(error);
-      } finally {
-        if(part.key)try{await staging.remove(part.key);}catch(error){console.warn('Staged part cleanup failed',error);}
-        detail.elapsedMs=Math.round(performance.now()-startedAt);updateUploadReport();
-        setProgress(settledTiles,totalTiles,'Uploading to board…');
-      }
-    };
-    const uploadSource = async (jobs) => {
-      const startedAt=performance.now();
-      // All 2/4/8 pieces of a tile can run together. Bound larger-source regions
-      // to eight requests per active source to avoid batch-wide Base64 allocation.
-      const queue=window.LosslessUpload.createUploadQueue(PART_CONCURRENCY_PER_SOURCE),done=[];
-      for(const prepared of jobs)for(let i=0;i<prepared.parts.length;i++) {
-        const admission=await queue.enqueue(()=>uploadPreparedPart(prepared,prepared.parts[i],i));done.push(admission.done);
-      }
-      await queue.drain();await Promise.all(done);
-      const widgets=jobs.flatMap(p=>p.widgets);
-      let group;
-      if(widgets.length>1) {
-        try {const result=await board.group({items:widgets});group={status:'created',id:result.id,itemCount:widgets.length};}
-        catch(error){group={status:'failed',error:getUploadErrorDetails(error),itemCount:widgets.length};groupErrors.push({fileName:jobs[0].fileName,error:group.error});}
-      }
-      for(const prepared of jobs) {
-        const {report,job}=prepared;
-        if(prepared.error) {
-          report.status=prepared.completed?'partial':'failed';report.error=getUploadErrorDetails(prepared.error);report.createdParts=prepared.completed;
-          const remaining=prepared.parts.length-prepared.completed;settledTiles+=remaining;skippedTiles+=remaining;
-          recordFailedSourceFile(prepared.fileName,'upload-failed',report.error);
-        }else report.status='created';
-        if(group)report.group=group;
-        report.parts.sort((a,b)=>a.part-b.part);report.uploadMs=Math.round(performance.now()-startedAt);
-        job.__settled=true;
-      }
-      updateUploadReport();setProgress(settledTiles,totalTiles,'Uploading to board…');
-    };
-    setStage(2);
-    setProgress(settledTiles,totalTiles,'Uploading to board…');
-    const sourceQueue=window.LosslessUpload.createUploadQueue(UPLOAD_CONCURRENCY),sourceDone=[];
-    for(const jobs of sourceGroups.values()) {
-      const admission=await sourceQueue.enqueue(()=>uploadSource(jobs));sourceDone.push(admission.done);
-    }
-    await sourceQueue.drain();await Promise.all(sourceDone);
-
-
-    setProgress(totalTiles, totalTiles, "Uploading to board…");
-    setEtaText(null);
-
-    if (allCreatedTiles.length) {
-      try {
-        await board.viewport.zoomTo(allCreatedTiles);
-      } catch (e) {
-        console.warn("zoomTo failed in Stitch/Slice:", e);
-      }
-    }
-
-    const totalMB = uploadedBytesDone / 1_000_000;
-    const avgMBPerTile = createdTiles ? totalMB / createdTiles : 0;
-    const avgCreateMs = createImageWallTimeCount ? Math.round(createImageWallTimeSumMs / createImageWallTimeCount) : null;
-    console.groupCollapsed("[Image Align Tool] Import stats");
-    console.log("Files (sources):", fileInfos.length);
-    console.log("Tiles:", { total: totalTiles, created: createdTiles, settled: settledTiles, skipped: skippedTiles });
-    console.log("Upload:", { totalMB: Math.round(totalMB * 10) / 10, avgMBPerTile: Math.round(avgMBPerTile * 100) / 100, retries: uploadRetryEvents, avgCreateMs });
-    if (failedSourceFiles.size) console.table(Array.from(failedSourceFiles.values()));
-    console.groupEnd();
-
-    const failedFileCount = failedSourceFiles.size;
-    const skippedCount = skippedTiles;
-    if (createdTiles <= 0 && failedFileCount > 0) {
-      await notifyError(`Failed to import ${failedFileCount} file${failedFileCount === 1 ? "" : "s"}`, {
-        failedFiles: Array.from(failedSourceFiles.values()),
-        totalTiles,
-        skippedCount,
-      });
-    } else if (failedFileCount > 0) {
-      await notifyWarning(`Failed to import ${failedFileCount} file${failedFileCount === 1 ? "" : "s"}`, {
-        failedFiles: Array.from(failedSourceFiles.values()),
-        totalTiles,
-        skippedCount,
-      });
-    } else if (skippedCount > 0) {
-      await notifyWarning("Import completed with skipped tiles", { importedSources: fileInfos.length, totalTiles, skippedCount });
-    } else if (groupErrors.length) {
-      await notifyWarning('Imported images; some groups could not be created',{groups:groupErrors});
-    } else {
-      await notifyInfo(`Imported ${fileInfos.length} image${fileInfos.length === 1 ? "" : "s"}`, { importedSources: fileInfos.length, totalTiles });
-    }
-  } catch (err) {
-    console.error(err);
-    showFailedProgressState("Import failed");
-    await notifyError("Image import failed", err);
-  } finally {
-    jpegManager.dispose();
-    if(staging)try{await staging.dispose();}catch(error){console.warn('Temporary staging cleanup failed',error);}
-    try {
-      await hugeManager.disposeAll();
-    } catch (_) {}
-    if (stitchButton) stitchButton.disabled = false;
-  }
+  }catch(error){
+    console.error('Image import failed',error);
+    if(status){status.textContent='Import failed';status.style.color=FAILURE_UI_COLOR;}
+    if(resultEl){resultEl.hidden=false;resultEl.textContent=error.message||String(error);resultEl.style.color=FAILURE_UI_COLOR;}
+    await notifyError('Image import failed',error);
+  }finally{if(button)button.disabled=false;}
 }
 
 window.addEventListener("DOMContentLoaded", () => {

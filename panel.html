@@ -5,10 +5,12 @@
   <title>Image Align Tool – panel</title>
 
   <script src="https://miro.com/app/static/sdk/v2/miro.js"></script>
-  <script src="lossless-upload.js?v=55" defer></script>
+  <script src="lossless-upload.js?v=56" defer></script>
   <script src="jpeg-lossless.js?v=55" defer></script>
-  <script src="upload-staging.js?v=55" defer></script>
-  <script src="app.js?v=lossless-jpeg-test-55" defer></script>
+  <script src="fast-image-scan.js?v=56" defer></script>
+  <script src="tile-preparation.js?v=56" defer></script>
+  <script src="import-engine.js?v=56" defer></script>
+  <script src="app.js?v=verified-stream-test-56" defer></script>
 
   <style>
     :root {
@@ -209,12 +211,7 @@
     }
   </style>
 </head>
-<body>
-  <div style="font-size:12px; margin-bottom:10px; color:#374151;">
-    <strong>Lossless JPEG tiles · 55</strong><br>
-    Original files when they fit; lossless parts: 2, 4, 8…<br>
-    Prepare first. Upload 5 source tiles at once. Group split parts.
-  </div>
+<body data-version="56">
   <div class="tabs">
     <button class="tab-btn" data-tab="sorting">Sorting</button>
     <button class="tab-btn active" data-tab="stitch">Stitch/Slice</button>
@@ -373,12 +370,10 @@
         <div id="stitchProgressBar" class="progress-fill"></div>
       </div>
       <div id="stitchProgressMain" class="progress-text-main"></div>
-      <div id="stitchProgressEta" class="progress-text-eta"></div>
-      <details id="originalUploadReportBox" hidden open style="margin-top:12px;">
-        <summary>Upload diagnostics</summary>
-        <textarea id="originalUploadReport" readonly aria-label="Upload diagnostics"
-          style="box-sizing:border-box;width:100%;height:220px;margin-top:6px;font-size:11px;"></textarea>
-      </details>
+      <div id="stitchScanProgress" class="progress-text-eta"></div>
+      <div id="stitchPrepareProgress" class="progress-text-eta"></div>
+      <div id="stitchUploadProgress" class="progress-text-eta"></div>
+      <div id="stitchResult" role="status" hidden style="white-space:pre-wrap;max-height:200px;overflow:auto;font-size:12px;margin-top:10px;"></div>
     </form>
   </div>
 </body>

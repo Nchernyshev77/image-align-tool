@@ -1,42 +1,43 @@
-# Lossless JPEG tiles — test 55
+# Verified streaming import — version 56
 
-Branch: `test/original-upload-52`. Main is unchanged. Pages stays on the test branch.
+Test branch: `test/original-upload-52`. Main and the Pages source branch are unchanged.
 
-## Behavior
+## Interface
 
-- Miro's measured URL property cap is 30,000,000 bytes, including JSON string quotes. The app measures Base64 plus MIME prefix before every SDK call. JPEG originals up to 22,499,979 bytes fit that formula.
-- Fitting original tiles pass through byte-for-byte.
-- Oversized tiles try 2, 4, 8, 16… parts (up to 256), with exact integer coordinates. Binary splits choose the longer permitted axis: a square becomes halves, a 2×2 layout, then 4×2. JPEG split positions also respect its MCU boundaries. Odd dimensions remain intact.
-- JPEG crops use vendored libjpeg-turbo WebAssembly in a dedicated local worker. The only invoked C path is `process_jpeg(..., downscale=1, ...)`. It preserves the original coefficients and ICC profile. Output dimensions and ICC bytes are checked on every crop. No remote image server or CDN codec is used.
-- JPEG chroma interpolation can change seam pixels when cutting along a subsampled axis. The app only cuts on axes with full chroma sampling. 4:4:4 can split either way; 4:2:2 can split horizontally into full-width strips. 4:2:0 and rotated EXIF sources use PNG to preserve seam pixels. Existing large-image base regions also fall back if their boundaries would cut an unsafe axis.
-- PNG fallback likewise tries powers of two, preserving original supported RGB color metadata. It has the existing precision restrictions (no splitting 16-bit/HDR/APNG/CMYK; alpha premultiplication may round semitransparent pixels). Fitting originals are unaffected.
+The header/version explanations and Upload diagnostics panel are removed. Progress has three counters (Scanning, Preparing, Uploading), a short status, and an ordinary persistent error list. 100% is reserved for verified completion. Internal test/debug summary is available in `window.ImageAlignLastImport`; no image bytes or JSON diagnostics are placed in the UI.
 
-## Two stages
+## Large batches
 
-Stage 1 reads dimensions, lays out sources, determines exact candidate counts, cuts and measures each candidate. Only a complete fitting layout is accepted. Selected output blobs are placed in a temporary device-local IndexedDB database. They are not encoded again for upload and are not kept as batch-wide Base64 strings. Original pass-through Files need no storage copy. Preparation/storage failures skip that source region with a visible diagnostic; other sources continue.
+JPEG/PNG scanning reads dimensions/EXIF from file headers, rather than decoding every full image. Four header reads can overlap. Unsupported formats fall back to a browser decode. Unreadable files are checked up to five times and remain in the final error list.
 
-Stage 2 runs **five original source files** at a time. The 2/4/8 pieces inside each source upload concurrently and share its source slot. For example, four originals plus one four-part source produce eight concurrent requests; five four-part sources produce twenty. Larger files with many regions are limited to eight requests per active source. Base64 is read only after acquiring a part slot. The source slot remains occupied until all requests and grouping finish.
+Two preparation workers run off the main thread. They compute thumbnail tone codes, select lossless JPEG crops or PNG fallback, cut and measure actual encoded sizes. The PNG encoder uses a native-resolution OffscreenCanvas. JPEGs already known to need PNG do not incur a second full-file read just to rediscover their chroma sampling. Powers-of-two plans (2,4,8…) and original pass-through behavior remain.
 
-Successful pieces of each source are grouped with `miro.board.group({items})` if at least two exist. Partial failures leave successful pieces visible/grouped; started requests finish, queued parts of the failed region stop, and other sources continue. No automatic SDK retry creates duplicates. Group failure is reported separately without reuploading images. All requests settle before final progress and the button re-enables. Staged blobs are deleted after each request and the temporary database is deleted at completion.
+Preparation and upload overlap after scanning/layout. At most five source files are uploading and two further sources are being prepared/awaiting admission. Parts of a source upload concurrently (up to eight). Selected blobs are reused, then released after each upload attempt; no complete-batch IndexedDB staging and no all-batch Base64 cache. A retry regenerates only affected sources from the still-selected local Files. Prepared region metadata must not retain a reference to the worker's blob array.
 
-## Diagnostics
+## Completeness and automatic recovery
 
-Version: `lossless-jpeg-test-55`. Per source region: `mode`, `attempts`, `partCount`, optional `jpegFallback`, `preparationMs` (including local staging), `uploadMs`, `parts`, `group`. Per part: native coordinates/dimensions, byte count, Base64 characters, `dataUrlMs`, successful `createImageMs`, and request/metadata `elapsedMs`. Concurrent times overlap.
+One initial upload plus at most four recovery passes: five total passes. Each pass reads the board image list and checks every expected part. Source/preparation failures also retry within that budget. A second fresh board read immediately before retransmission catches images appearing during the retry delay. A failed board read does not cause blind retransmission.
 
-## Checks
+An import-specific part marker is provided atomically as the image `alt` during createImage. The marker is unique to this run and source/region/part, not to a filename. It allows reconciliation when Miro created an image but the create reply was lost. Known item IDs are also checked. Repeated names and pre-existing same-name images are not mistaken for this run. The marker fits the 140-character alt limit; display titles keep the normal filename and part labels.
 
-`node --test tests/*.test.cjs`, syntax checks on app/helper/worker files.
+An upload taking more than two minutes becomes uncertain. It is never sent again while its original SDK promise remains pending. New source dispatch pauses if this would exceed the concurrency/memory bounds; verification can still find a completed image. A late or failed read cannot become a false success. The SDK has no transactional idempotency key: a remote creation delayed beyond both a settled error and repeated board snapshots cannot be made exactly-once by a browser app. Duplicate markers are detected and reported, without deleting board content automatically.
 
-Tests execute the actual handler against controlled SDK responses. They cover 2/4/8 JPEG and PNG selection, no SDK calls in Stage 1, exact positions/coverage, original pass-through, five source slots, eight/twenty parallel requests, waiting for grouping before slot reuse, partial uploads, grouping errors, local storage quota failure, cleanup, reverse grid corners and missing source numbers. Production worker tests run the vendored WASM and check ICC, native dimensions and MCU guards.
+Successfully verified parts are grouped by source. Lost grouping replies are reconciled through groupId. Group errors are reported and retried. Requests are bounded and all settled requests are reconciled before final success. Grouping waits for a complete source until the last pass; on final partial failure, available pieces can remain grouped.
 
-`tests/browser-lossless.html`: click Run. It exercises real browser workers and IndexedDB, compares every decoded pixel and rendered sRGB pixel for lossless JPEG crops (sRGB/Display-P3 and JPEG 4:4:4/4:2:2), checks 4:2:0/EXIF guards, compares PNG samples/metadata, and measures actual 4096×4096 PNG part sizes. JPEG fixtures are synthetic. No test images upload to Miro. SDK grouping/concurrency tests use mocks; actual Miro behavior needs user verification.
+After five unsuccessful passes, the app shows an error and lists filenames/missing part counts; initial header failures cannot disappear from totals. Closing the app/browser stops the run; cross-session resume is not implemented.
 
-## Deployment and rollback
+## Miro rate limits
 
-Reopen the Miro app and verify **Lossless JPEG tiles · 55**. Upload one oversized tile first, then a mixed batch. Inspect `mode`/`jpegFallback`, group selection, seams, completion and errors.
+https://developers.miro.com/docs/websdk-reference-rate-limiting
 
-GitHub Settings > Pages: Source `Deploy from a branch`, branch `test/original-upload-52`, folder `/ (root)`. To revert, select `main`, keep root, Save, wait for deployment and reopen the app. No merge to main is required.
+Documented Web SDK limits are 100,000 credits/minute and 1,000,000/hour. Creating an image costs 500; metadata/group calls cost 50 and board.get costs 500. A shared gate reserves 95,000/minute and 950,000/hour, waiting for credits. Observed rate-limit errors also pause dispatch before another attempt. The five source slots still permit parallel requests, but cannot bypass Miro's service limits. Creating 1024 parts alone consumes 512,000 credits; workers cannot remove that network-side lower bound.
 
-Removed obsolete branch recovery references:
-- `backup/main-before-image-align-tool-51-20260609`: `ac272f733fe2b4c736475f5359eec310459ae685`
-- `feature/image-align-tool-51-lossless-upload`: `0d01b02c3ed591839d184362a4c3c2a7fefcd33a`
+## Quality and rollback
+
+The vendored JPEG coefficient transform, MCU alignment, full-chroma seam guards, ICC preservation, PNG precision restrictions, native resolution, reversed corners and missing source slots remain covered. No upload uses JPEG quality re-encoding or pixel resizing.
+
+Run `node --test tests/*.test.cjs` and syntax checks. New tests cover a 256-source/1024-part mock batch, two preparation lanes, bounded lookahead, overlap, lost/late replies, silently dropped images, five-pass failure, board-read failure, failed preparation, pending timeout, grouping response loss, request budgeting, header-only scanning, and persistent UI errors.
+
+`tests/browser-lossless.html` exercises two real background preparation workers, nested JPEG WASM, PNG fallback, actual automatic recovery against a local fake SDK, exact raw pixels and ICC, and a 57.7MB 4096-square PNG in a worker. No synthetic images are sent to Miro. Real large-batch Miro performance must be checked by the user.
+
+Pages remains `test/original-upload-52`, `/ (root)`. To revert: Settings > Pages > main > root > Save, wait for deployment, reopen the Miro app. Do not merge the experiment into main.

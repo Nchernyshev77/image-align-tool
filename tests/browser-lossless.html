@@ -1,14 +1,16 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>Lossless JPEG browser checks · 55</title>
+<title>Streaming import browser checks · 56</title>
 <style>body{font:16px system-ui;margin:32px;max-width:1000px}pre{white-space:pre-wrap;padding:16px;background:#f3f4f6}button{padding:10px 16px}</style>
-<h1>Lossless JPEG browser checks · 55</h1>
+<h1>Streaming import browser checks · 56</h1>
 <p>Local synthetic images only. No Miro uploads or network requests for images.</p>
 <button id="run">Run pixel and color checks</button>
 <pre id="result">Ready</pre>
-<script src="../lossless-upload.js?v=55"></script>
+<script src="../lossless-upload.js?v=56"></script>
 <script src="../jpeg-lossless.js?v=55"></script>
-<script src="../upload-staging.js?v=55"></script>
+<script src="../fast-image-scan.js?v=56"></script>
+<script src="../tile-preparation.js?v=56"></script>
+<script src="../import-engine.js?v=56"></script>
 <script>
 const L=window.LosslessUpload;
 const result=document.getElementById('result');
@@ -86,15 +88,6 @@ async function smallColorTest(space,type) {
   log(`DISPLAY ${space} ${type}: maximum browser color-conversion difference ${displayDifference}/255`);
   log(`PASS ${space} ${type}: 2/4/8 PNG parts, identical decoded RGBA and color metadata; ${source.colors.description}`);
 }
-async function stagingTest(){
-  const store=await UploadStaging.create();
-  try{const blob=new Blob([new Uint8Array([1,2,3,255])],{type:'image/jpeg'}),key=await store.put(blob);
-    const restored=await store.get(key);assert(restored.type===blob.type,'Staged MIME changed');
-    assert(JSON.stringify([...new Uint8Array(await restored.arrayBuffer())])==='[1,2,3,255]','Staged bytes changed');
-    await store.remove(key);
-  }finally{await store.dispose();}
-  log('PASS temporary IndexedDB staging: bytes and MIME preserved, cleanup completed');
-}
 async function fixtureTest(){
  const fixtures=await (await fetch('./jpeg-fixtures.json')).json();
  for(const [name,base64] of Object.entries(fixtures)){
@@ -107,22 +100,45 @@ async function fixtureTest(){
   log(`PASS JPEG ${name}: 2/4/8 lossless parts, identical pixels including all seams`);
  }
 }
+async function preparationAndRecoveryTest(){
+ const fixtures=await(await fetch('./jpeg-fixtures.json')).json(),files=['444','420'].map((type,i)=>new File([Uint8Array.from(atob(fixtures[type]),c=>c.charCodeAt(0))],`Tile_${i+1}.jpg`,{type:'image/jpeg'}));
+ const clients=[TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=56'}),TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=56'})];
+ try{
+  await Promise.all(files.map(async(file,i)=>{
+   const info=await FastImageScan.scan(file),expected=await pixels(file);
+   const prepared=await clients[i].prepare(file,info,[{kind:'tile',sx:0,sy:0,sw:info.width,sh:info.height}]);
+   const part=prepared.regions[0].parts[0];
+   assert(prepared.regions[0].mode===(i===0?'lossless-jpeg':'lossless-png'),'Wrong worker output format');
+   compareRegion(expected,await pixels(part.blob),info.width,part);
+  }));log('PASS two background preparation workers: JPEG and PNG fallback keep every pixel identical');
+ }finally{clients.forEach(c=>c.dispose());}
+ const images=new Map();let calls=0,groups=0;
+ const board={async createImage(params){calls++;if(calls===1)throw Error('Synthetic upload error');
+   const item={...params,id:String(calls),setMetadata:async()=>{}};images.set(item.id,item);
+   if(calls===2)throw Error('Synthetic lost reply');return item;},
+  get:async()=>[...images.values()],group:async({items})=>{groups++;items.forEach(i=>i.groupId='g'+groups);return {id:'g'+groups};}};
+ const imported=await ImportEngine.run({files,board,scan:FastImageScan.scan,createPreparer:()=>TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=56'}),
+  layout:async sources=>{for(const s of sources)s.jobs=L.dyadicRegions(s.info.width,s.info.height,4).map(r=>({kind:'tile',sx:r.x,sy:r.y,sw:r.width,sh:r.height,x:r.x+r.width/2,y:r.y+r.height/2}));},
+  options:{rateLimit:false,retryDelayMs:0,readDataUrl:blob=>new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=()=>reject(r.error);r.readAsDataURL(blob);})}});
+ assert(imported.success,'Recovery did not finish');assert(imported.verified===8&&calls===9&&images.size===8&&groups===2,'Missing-part recovery or duplicate protection failed');
+ log('PASS streaming import: eight parts verified, failed part reloaded, lost reply recovered without duplicate, two source groups');
+}
 async function largeTest(){
-  const c=document.createElement('canvas');c.width=c.height=4096;
-  const ctx=c.getContext('2d',{colorSpace:'srgb'}),data=ctx.createImageData(c.width,c.height);
-  let seed=123456789;
-  for(let i=0;i<data.data.length;i+=4){seed^=seed<<13;seed^=seed>>>17;seed^=seed<<5;data.data[i]=seed&255;data.data[i+1]=(seed>>>8)&255;data.data[i+2]=(seed>>>16)&255;data.data[i+3]=255;}
-  ctx.putImageData(data,0,0);
-  const file=await blobOf(c),source=await L.openSource(file),attempts=[];
-  log(`4096×4096 source PNG: ${file.size} bytes; checking candidate layouts…`);
-  const parts=await L.planParts(4096,4096,r=>L.encodeRegion(source,r),{onAttempt:n=>attempts.push(n)});
-  for(const part of parts){assert(L.fits(part.blob.size,'image/png'),'Oversized PNG selected');compareRegion(data.data,await pixels(part.blob),4096,part);}
-  log(`PASS 4096×4096: tried ${attempts.join(' → ')}, selected ${parts.length}, sizes ${parts.map(p=>p.blob.size).join(', ')} bytes; all pixels identical`);
-  source.close();c.width=c.height=1;
+ const c=document.createElement('canvas');c.width=c.height=4096;
+ const ctx=c.getContext('2d',{colorSpace:'srgb'}),data=ctx.createImageData(c.width,c.height);
+ let seed=123456789;
+ for(let i=0;i<data.data.length;i+=4){seed^=seed<<13;seed^=seed>>>17;seed^=seed<<5;data.data[i]=seed&255;data.data[i+1]=(seed>>>8)&255;data.data[i+2]=(seed>>>16)&255;data.data[i+3]=255;}
+ ctx.putImageData(data,0,0);const file=await blobOf(c),client=TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=56'});
+ log(`4096×4096 source PNG: ${file.size} bytes; checking worker candidate layouts…`);
+ try{
+  const info=await FastImageScan.scan(file),prepared=await client.prepare(file,info,[{kind:'full',width:4096,height:4096}]),region=prepared.regions[0];
+  for(const p of region.parts){assert(L.fits(p.blob.size,'image/png'),'Worker selected oversized PNG');compareRegion(data.data,await pixels(p.blob),4096,p);}
+  log(`PASS 4096×4096 in background worker: tried ${region.attempts.join(' → ')}, selected ${region.parts.length}; all pixels identical`);
+ }finally{client.dispose();c.width=c.height=1;}
 }
 document.getElementById('run').onclick=async()=>{
   document.getElementById('run').disabled=true;lines.length=0;log('Running…');
-  try{await stagingTest();await fixtureTest();for(const space of ['srgb','display-p3'])for(const type of ['image/jpeg','image/png'])await smallColorTest(space,type);await largeTest();log('ALL CHECKS PASSED');}
+  try{await preparationAndRecoveryTest();await fixtureTest();for(const space of ['srgb','display-p3'])for(const type of ['image/jpeg','image/png'])await smallColorTest(space,type);await largeTest();log('ALL CHECKS PASSED');}
   catch(e){log('FAILED: '+e.message);console.error(e);}
   finally{document.getElementById('run').disabled=false;}
 };

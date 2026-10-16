@@ -204,7 +204,7 @@
   }
 
   async function encodeRegion(source, rect) {
-    const canvas = document.createElement('canvas');
+    const canvas = typeof document==='undefined' ? new OffscreenCanvas(rect.width,rect.height) : document.createElement('canvas');
     canvas.width = rect.width;
     canvas.height = rect.height;
     try {
@@ -212,7 +212,7 @@
       if (!ctx) throw new Error('PNG canvas is not available');
       ctx.imageSmoothingEnabled = false;
       ctx.drawImage(source.image, rect.x, rect.y, rect.width, rect.height, 0, 0, rect.width, rect.height);
-      const blob = await new Promise((resolve, reject) => canvas.toBlob(
+      const blob = canvas.convertToBlob ? await canvas.convertToBlob({type:PNG_MIME}) : await new Promise((resolve, reject) => canvas.toBlob(
         result => result ? resolve(result) : reject(new Error('PNG encoding failed')), PNG_MIME
       ));
       return await preserveColor(blob, source.colors.chunks);
