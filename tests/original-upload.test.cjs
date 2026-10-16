@@ -17,15 +17,17 @@ function setup(files, rejectUpload = false, options = {}) {
   el('stitchFolderInput').files = files;
   const calls = [];
   const encodes = [];
+  const groups=[],messages=[],staged=new Map();let nextKey=0,disposed=false;
   let sourceCloses = 0;
   const board = {
     viewport: { get: async () => ({ x: 0, y: 0, width: 1000, height: 1000 }), zoomTo: async () => {} },
-    notifications: { showError: async () => {}, showWarning: async () => {}, showInfo: async () => {} },
+    notifications: { showError: async x => messages.push(x), showWarning: async x => messages.push(x), showInfo: async x => messages.push(x) },
+    group: async ({items}) => { groups.push(items);if(options.groupError)throw Error('Group failed');if(options.onGroup)await options.onGroup(items);return {id:'group-'+groups.length}; },
     createImage: async params => {
-      calls.push(params);
-      if (options.onCreate) await options.onCreate(params, calls.length);
-      if (rejectUpload === true || rejectUpload === calls.length) throw Object.assign(new Error('Maximum upload size exceeded'), { code: 'invalidParameters', status: 400 });
-      return { setMetadata: async () => {} };
+      calls.push(params);const number=calls.length;
+      if (options.onCreate) await options.onCreate(params, number);
+      if (rejectUpload === true || rejectUpload === number) throw Object.assign(new Error('Maximum upload size exceeded'), { code: 'invalidParameters', status: 400 });
+      return { id:String(number),setMetadata: async () => {} };
     },
   };
   const context = vm.createContext({
@@ -67,6 +69,16 @@ function setup(files, rejectUpload = false, options = {}) {
     console: { log() {}, warn() {}, error() {}, groupCollapsed() {}, groupEnd() {}, table() {} },
   });
   vm.runInContext(fs.readFileSync(require('node:path').join(__dirname, '../lossless-upload.js'), 'utf8'), context);
+  context.window.JpegLossless={create:()=>({
+    async open(file){return {width:file.width,height:file.height,eligible:!!options.jpeg,safeX:true,safeY:true,mcuX:8,mcuY:8,reason:'Test PNG fallback'};},
+    async crop(rect){encodes.push({...rect,jpeg:true});const size=options.pngSize?options.pngSize(rect):100;return {size,type:'image/jpeg',bytes:Buffer.alloc(100,0x5a)};},
+    async close(){},dispose(){},
+  })};
+  context.window.UploadStaging={create:async()=>({
+    async put(blob){if(options.stageError)throw Error('Storage full');const key=++nextKey;staged.set(key,blob);return key;},
+    async get(key){assert.ok(staged.has(key),'Missing staged part');return staged.get(key);},
+    async remove(key){staged.delete(key);},async dispose(){staged.clear();disposed=true;},
+  })};
   const helpers = context.window.LosslessUpload;
   helpers.openSource = async file => ({
     file,
@@ -81,7 +93,7 @@ function setup(files, rejectUpload = false, options = {}) {
     return { size, type: 'image/png', bytes: Buffer.alloc(Math.min(size, 100), 0x7f) };
   };
   vm.runInContext(source, context);
-  return { calls, el, encodes, get sourceCloses() { return sourceCloses; }, run: () => context.handleStitchSubmit({ preventDefault() {} }) };
+  return { calls, el, encodes, groups,messages,staged,get disposed(){return disposed;}, get sourceCloses() { return sourceCloses; }, run: () => context.handleStitchSubmit({ preventDefault() {} }) };
 }
 
 function fixture(size = 20_000_000, name = 'Tile_1.jpg') {
@@ -127,146 +139,87 @@ test('file read failure is reported and the next file can still upload', async (
   assert.deepEqual(report.uploads.map(x => x.status), ['failed', 'created']);
 });
 
-for (const targetParts of [2, 3, 4]) {
-  test(`oversized JPG chooses ${targetParts} PNG strips before uploading; positions preserve the original slot`, async () => {
-    const app = setup([fixture(28_000_000), fixture(100, 'Tile_2.jpg')], false, {
-      pngSize: rect => rect.width > Math.ceil(4096 / targetParts) ? 23_000_000 : 100,
-    });
-    await app.run();
-    assert.equal(app.calls.length, targetParts + 1);
-    const report = JSON.parse(app.el('originalUploadReport').value).uploads[0];
-    assert.equal(report.mode, 'lossless-png');
-    assert.deepEqual(report.attempts, Array.from({ length: targetParts - 1 }, (_, i) => i + 2));
-    assert.equal(report.partCount, targetParts);
-    assert.equal(report.status, 'created');
-    const parts = app.calls.slice(0, -1);
-    assert.equal(parts.reduce((sum, p) => sum + p.width, 0), 4096);
-    for (let i = 0; i < parts.length; i++) {
-      assert.ok(parts[i].url.startsWith('data:image/png;base64,'));
-      assert.equal(parts[i].y, app.calls.at(-1).y);
-      if (i) assert.equal(parts[i].x - parts[i].width / 2, parts[i-1].x + parts[i-1].width / 2);
-    }
-    assert.equal(parts.at(-1).x + parts.at(-1).width / 2, app.calls.at(-1).x - 2048);
-    assert.equal(app.sourceCloses, 1);
-    assert.equal(app.el('stitchProgressMain').textContent, `Uploading to board… ${targetParts + 1} / ${targetParts + 1}`);
-  });
+
+const oversized=(name='Tile_1.jpg')=>({...fixture(100,name),size:28_000_000});
+const sizeFor=n=>r=>r.width*r.height>4096*4096/n?23_000_000:100;
+for(const jpeg of [false,true])for(const target of [2,4,8]){
+ test(`${jpeg?'JPEG coefficient':'PNG fallback'} uses ${target} parts, prepared first, native pixels and one source group`,async()=>{
+  let app;app=setup([oversized(),fixture(100,'Tile_2.jpg')],false,{jpeg,pngSize:sizeFor(target),onEncode:()=>{assert.equal(app.calls.length,0);assert.equal(app.el('stitchProgressStage').textContent,'Stage 1/2');}});
+  await app.run();
+  const reports=JSON.parse(app.el('originalUploadReport').value).uploads;
+  assert.equal(reports[0].mode,jpeg?'lossless-jpeg':'lossless-png');
+  assert.deepEqual(reports[0].attempts,Array.from({length:Math.log2(target)},(_,i)=>2**(i+1)));
+  assert.equal(reports[0].partCount,target);assert.equal(reports[0].status,'created');
+  const parts=app.calls.filter(p=>p.title.includes('Tile_1.jpg')),original=app.calls.find(p=>p.title.endsWith('Tile_2.jpg'));
+  assert.equal(parts.length,target);
+  const rects=reports[0].parts;
+  assert.equal(rects.reduce((sum,p)=>sum+p.width*p.height,0),4096*4096);
+  for(let i=0;i<rects.length;i++)for(let j=i+1;j<rects.length;j++)assert.ok(rects[i].x+rects[i].width<=rects[j].x||rects[j].x+rects[j].width<=rects[i].x||rects[i].y+rects[i].height<=rects[j].y||rects[j].y+rects[j].height<=rects[i].y,'Parts overlap');
+  const left=original.x-2048-4096,top=original.y-2048;
+  for(const p of rects){const call=parts[p.part-1];assert.equal(call.x,left+p.x+p.width/2);assert.equal(call.y,top+p.y+p.height/2);assert.equal(call.width,p.width);assert.ok(call.url.startsWith(`data:image/${jpeg?'jpeg':'png'};base64,`));}
+  assert.equal(app.groups.length,1);assert.equal(app.groups[0].length,target);assert.equal(reports[0].group.status,'created');
+  assert.equal(app.disposed,true);assert.equal(app.staged.size,0);
+  assert.equal(app.sourceCloses,jpeg?0:1);
+  assert.equal(app.el('stitchProgressMain').textContent,`Uploading to board… ${target+1} / ${target+1}`);
+ });
 }
 
-test('split failure is partial, lets already-started pieces finish, and continues the next file without retries', async () => {
-  const app = setup([fixture(28_000_000), fixture(100, 'Tile_2.jpg')], 2, {
-    pngSize: rect => rect.width > 1366 ? 23_000_000 : 100,
-  });
-  await app.run();
-  assert.equal(app.calls.length, 4);
-  const report = JSON.parse(app.el('originalUploadReport').value).uploads;
-  assert.equal(report[0].status, 'partial');
-  assert.equal(report[0].createdParts, 2);
-  assert.deepEqual(report[0].parts.map(p => p.status), ['created', 'failed', 'created']);
-  assert.equal(report[1].status, 'created');
-  assert.equal(app.el('stitchButton').disabled, false);
-  assert.equal(app.sourceCloses, 1);
+test('partial concurrent failure keeps successful parts grouped, drains started requests and continues the next file',async()=>{
+ const app=setup([oversized(),fixture(100,'Tile_2.jpg')],2,{pngSize:sizeFor(4)});await app.run();
+ const reports=JSON.parse(app.el('originalUploadReport').value).uploads;
+ assert.equal(reports[0].status,'partial');assert.equal(reports[0].createdParts,3);
+ assert.equal(reports[1].status,'created');assert.equal(app.calls.length,5);
+ assert.equal(app.groups[0].length,3);assert.equal(app.el('stitchButton').disabled,false);
 });
 
-test('bottom-right corner reverses source slots, never reverses pixels within a tile', async () => {
-  const app = setup([fixture(28_000_000), fixture(100, 'Tile_2.jpg')]);
-  app.el('stitch-form').stitchStartCorner.value = 'bottom-right';
-  await app.run();
-  assert.ok(app.calls[0].x < app.calls[1].x);
-  assert.equal(app.calls[0].x - 1024, app.calls[2].x + 2048);
+test('group failure is reported without retrying successful image uploads',async()=>{
+ const app=setup([oversized()],false,{groupError:true});await app.run();
+ const report=JSON.parse(app.el('originalUploadReport').value).uploads[0];
+ assert.equal(report.status,'created');assert.equal(report.group.status,'failed');assert.equal(app.calls.length,2);
+ assert.ok(app.messages.some(x=>String(x).includes('groups')));assert.equal(app.disposed,true);
 });
 
-test('missing numbered tiles retain a whole slot even when the next tile splits', async () => {
-  const app = setup([fixture(100), fixture(28_000_000, 'Tile_3.jpg')]);
-  app.el('stitch-form').stitchSkipMissing.checked = true;
-  app.el('stitch-form').stitchImagesPerRow.value = '4';
-  await app.run();
-  assert.equal(app.calls[1].x - 1024 - (app.calls[0].x - 2048), 8192);
+test('storage quota failure creates no partial source and lets a small original upload',async()=>{
+ const app=setup([oversized(),fixture(100,'Tile_2.jpg')],false,{stageError:true});await app.run();
+ const reports=JSON.parse(app.el('originalUploadReport').value).uploads;
+ assert.equal(reports[0].status,'failed');assert.equal(reports[1].status,'created');assert.equal(app.calls.length,1);assert.equal(app.disposed,true);
 });
 
-test('large-image base tiles use PNG without JPEG recompression or board scaling', async () => {
-  const file = { ...fixture(100), width: 9000, height: 4096 };
-  const app = setup([file]);
-  await app.run();
-  assert.equal(app.calls.length, 3);
-  assert.deepEqual(app.calls.map(p => p.width), [4096, 4096, 808]);
-  assert.ok(app.calls.every(p => p.url.startsWith('data:image/png;base64,')));
-  assert.deepEqual(app.encodes.map(p => p.x), [0, 4096, 8192]);
-  assert.equal(app.sourceCloses, 1);
+test('bottom-right corner reverses source slots, never reverses pixels within a tile',async()=>{
+ const app=setup([oversized(),fixture(100,'Tile_2.jpg')]);app.el('stitch-form').stitchStartCorner.value='bottom-right';await app.run();
+ const parts=app.calls.filter(p=>p.title.includes('Tile_1.jpg')),other=app.calls.find(p=>p.title.endsWith('Tile_2.jpg'));
+ assert.ok(parts[0].x<parts[1].x);assert.equal(parts[0].x-1024,other.x+2048);
 });
 
-
-const deferred = () => {
-  let resolve, reject;
-  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
-  return { promise, resolve, reject };
-};
-async function until(predicate) {
-  const deadline = Date.now() + 2000;
-  while (!predicate()) {
-    assert.ok(Date.now() < deadline, 'Pipeline did not reach expected state');
-    await new Promise(resolve => setImmediate(resolve));
-  }
-}
-
-test('global queue admits four uploads and Base64 reads, then refills freed slots; waits for the last response', async () => {
-  const gates = Array.from({length:8}, deferred);
-  let active = 0, maximum = 0, reads = 0;
-  const app = setup(Array.from({length:8}, (_,i) => fixture(100, `Tile_${i+1}.jpg`)), false, {
-    onRead: () => reads++,
-    onCreate: async (_, n) => { active++; maximum=Math.max(maximum,active); await gates[n-1].promise; active--; },
-  });
-  const running = app.run();
-  await until(() => app.calls.length === 4);
-  assert.equal(reads,4);
-  assert.equal(app.el('stitchButton').disabled,true);
-  gates[2].resolve();
-  await until(() => app.calls.length === 5);
-  assert.equal(reads,5);
-  for (const gate of gates.slice(0,7)) gate.resolve();
-  await until(() => app.calls.length === 8);
-  assert.equal(app.el('stitchButton').disabled,true);
-  gates[7].resolve();await running;
-  assert.equal(maximum,4);
-  assert.equal(app.el('stitchButton').disabled,false);
-  assert.equal(app.el('stitchProgressMain').textContent,'Uploading to board… 8 / 8');
-  const reports=JSON.parse(app.el('originalUploadReport').value).uploads;
-  assert.ok(reports.every(r => r.status==='created' && r.preparationMs>=0 && r.queueWaitMs>=0 && r.parts[0].createImageMs>=0));
+test('missing tile numbers preserve whole source slots',async()=>{
+ const app=setup([fixture(100),oversized('Tile_3.jpg')]);app.el('stitch-form').stitchSkipMissing.checked=true;app.el('stitch-form').stitchImagesPerRow.value='4';await app.run();
+ assert.equal(app.calls[1].x-1024-(app.calls[0].x-2048),8192);
 });
 
-test('prepares one next PNG plan during four blocked uploads, without encoding it again or reading Base64 early', async () => {
-  const gate=deferred();let reads=0;
-  const files=Array.from({length:3},(_,i)=>({...fixture(100,`Tile_${i+1}.jpg`),size:28_000_000}));
-  const app=setup(files,false,{
-    pngSize:r=>r.width>1024?23_000_000:100,
-    onRead:()=>reads++,onCreate:()=>gate.promise,
-  });
-  const running=app.run();
-  await until(()=>app.encodes.length===12); // Six encodes per plan: failed 2, failed 3, four successful strips.
-  assert.equal(app.calls.length,4);
-  assert.equal(reads,4);
-  assert.equal(app.sourceCloses,1);
-  gate.resolve();await running;
-  assert.equal(app.calls.length,12);
-  assert.equal(app.encodes.length,18); // Each successful PNG is reused for upload.
-  assert.equal(app.sourceCloses,3);
+test('all large-image regions are prepared before any upload and grouped as one original source',async()=>{
+ let app;app=setup([{...fixture(100),width:9000,height:4096}],false,{onEncode:()=>assert.equal(app.calls.length,0)});await app.run();
+ assert.deepEqual(app.calls.map(p=>p.width),[4096,4096,808]);assert.deepEqual(app.encodes.map(p=>p.x),[0,4096,8192]);
+ assert.equal(app.groups.length,1);assert.equal(app.groups[0].length,3);assert.equal(app.sourceCloses,1);
 });
 
-test('a failed concurrent request skips unstarted parts, drains other requests, and continues the next source', async () => {
-  const gates=Array.from({length:4},deferred);
-  const app=setup([{...fixture(100),size:28_000_000},fixture(100,'Tile_2.jpg')],false,{
-    pngSize:r=>r.width>512?23_000_000:100,
-    onCreate:(_,n)=>n<=4?gates[n-1].promise:Promise.resolve(),
-  });
-  const running=app.run();await until(()=>app.calls.length===4);
-  gates[1].reject(new Error('Network failure'));
-  await until(()=>app.calls.length===5); // The next source can use the free slot.
-  assert.equal(app.el('stitchButton').disabled,true);
-  for(const gate of gates)gate.resolve();await running;
-  assert.equal(app.calls.length,5);
-  const reports=JSON.parse(app.el('originalUploadReport').value).uploads;
-  assert.equal(reports[0].partCount,8);
-  assert.equal(reports[0].createdParts,3);
-  assert.equal(reports[0].status,'partial');
-  assert.equal(reports[1].status,'created');
-  assert.equal(app.el('stitchProgressMain').textContent,'Uploading to board… 9 / 9');
+const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};};
+async function until(predicate){const deadline=Date.now()+3000;while(!predicate()){assert.ok(Date.now()<deadline,'Expected queue state not reached');await new Promise(r=>setImmediate(r));}}
+
+test('five source slots permit one four-part tile plus four originals: eight parallel uploads, sixth source waits',async()=>{
+ const gates=Array.from({length:6},deferred);let active=0,maximum=0,reads=0;
+ const files=[oversized(),...Array.from({length:5},(_,i)=>fixture(100,`Tile_${i+2}.jpg`))];
+ const app=setup(files,false,{pngSize:sizeFor(4),onRead:()=>reads++,onCreate:async p=>{const i=Number(p.title.match(/Tile_(\d+)/)[1])-1;active++;maximum=Math.max(maximum,active);await gates[i].promise;active--;}});
+ const running=app.run();await until(()=>app.calls.length===8);
+ assert.equal(reads,8);assert.ok(app.calls.every(p=>!p.title.includes('Tile_6.jpg')));assert.equal(app.el('stitchButton').disabled,true);
+ gates[1].resolve();await until(()=>app.calls.length===9);assert.ok(app.calls.some(p=>p.title.includes('Tile_6.jpg')));
+ for(const g of gates)g.resolve();await running;
+ assert.equal(maximum,8);assert.equal(app.groups.length,1);assert.equal(app.groups[0].length,4);assert.equal(app.el('stitchButton').disabled,false);
+});
+
+test('five four-part sources run twenty uploads and wait for grouping before releasing source slots',async()=>{
+ const uploadGate=deferred(),groupGate=deferred();let reads=0;
+ const app=setup(Array.from({length:6},(_,i)=>oversized(`Tile_${i+1}.jpg`)),false,{pngSize:sizeFor(4),onRead:()=>reads++,onCreate:()=>uploadGate.promise,onGroup:()=>groupGate.promise});
+ const running=app.run();await until(()=>app.calls.length===20);assert.equal(reads,20);assert.equal(app.groups.length,0);assert.equal(app.sourceCloses,6);
+ uploadGate.resolve();await until(()=>app.groups.length===5);assert.equal(app.calls.length,20);assert.equal(app.el('stitchButton').disabled,true);
+ groupGate.resolve();await running;assert.equal(app.calls.length,24);assert.equal(app.groups.length,6);assert.equal(app.disposed,true);
 });

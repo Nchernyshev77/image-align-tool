@@ -23,24 +23,38 @@
     });
   }
 
-  async function planParts(width, height, encode, { firstCount = 2, onAttempt = () => {} } = {}) {
-    // Four always suffice for ordinary 4096 x 4096 8-bit PNGs; larger regions
-    // may need more. Never trade image quality for fewer parts.
-    const maximum = Math.min(Math.max(width, height), 256);
-    for (let count = firstCount; count <= maximum; count++) {
-      onAttempt(count);
-      const parts = [];
-      for (const rect of partitions(width, height, count)) {
-        const blob = await encode(rect);
-        if (!blob || blob.type !== PNG_MIME) throw new Error('PNG encoding failed');
-        if (!fits(blob.size, PNG_MIME)) break;
-        parts.push({ ...rect, blob });
+  function dyadicRegions(width,height,count,{mcuX=1,mcuY=1,safeX=true,safeY=true}={}) {
+    if(![width,height,count,mcuX,mcuY].every(Number.isSafeInteger)||width<1||height<1||count<1||(count&(count-1)))throw Error('Invalid binary partition');
+    let rects=[{x:0,y:0,width,height}];
+    while(rects.length<count){
+      const next=[];
+      for(const r of rects){
+        const xCut=Math.floor((r.x+r.width/2)/mcuX)*mcuX;
+        const yCut=Math.floor((r.y+r.height/2)/mcuY)*mcuY;
+        const xOk=safeX&&xCut>r.x&&xCut<r.x+r.width,yOk=safeY&&yCut>r.y&&yCut<r.y+r.height;
+        const axis=xOk&&(!yOk||r.width>=r.height)?'x':yOk?'y':null;
+        if(!axis)throw Error('No further lossless block-aligned split is possible');
+        if(axis==='x')next.push({...r,width:xCut-r.x},{...r,x:xCut,width:r.x+r.width-xCut});
+        else next.push({...r,height:yCut-r.y},{...r,y:yCut,height:r.y+r.height-yCut});
       }
-      if (parts.length === count) return parts;
-      // Release rejected blobs before evaluating the next complete layout.
-      parts.length = 0;
+      rects=next;
     }
-    throw new Error('Image cannot fit the upload limit without more than 256 parts');
+    return rects;
+  }
+
+  async function planParts(width,height,encode,{firstCount=2,onAttempt=()=>{},mime=PNG_MIME,alignment={}}={}) {
+    for(let count=firstCount;count<=256;count*=2){
+      onAttempt(count);const parts=[];
+      for(const rect of dyadicRegions(width,height,count,alignment)){
+        const blob=await encode(rect);
+        if(!blob||blob.type!==mime)throw Error('Image encoding failed');
+        if(!fits(blob.size,mime))break;
+        parts.push({...rect,blob});
+      }
+      if(parts.length===count)return parts;
+      parts.length=0;
+    }
+    throw Error('Image cannot fit the upload limit within 256 parts');
   }
 
   // One producer, bounded admission: Base64 is made only after a slot opens.
@@ -207,6 +221,6 @@
     }
   }
 
-  root.LosslessUpload = { URL_LIMIT, PNG_MIME, payloadBytes, fits, partitions, planParts, createUploadQueue,
+  root.LosslessUpload = { URL_LIMIT, PNG_MIME, payloadBytes, fits, partitions, dyadicRegions, planParts, createUploadQueue,
     openSource, encodeRegion, colorMetadata, preserveColor, pngChunks, chunk, jpegProfile };
 })(typeof window !== 'undefined' ? window : globalThis);

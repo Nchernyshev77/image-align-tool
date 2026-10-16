@@ -5,8 +5,10 @@
   <title>Image Align Tool – panel</title>
 
   <script src="https://miro.com/app/static/sdk/v2/miro.js"></script>
-  <script src="lossless-upload.js?v=54" defer></script>
-  <script src="app.js?v=lossless-pipeline-test-54" defer></script>
+  <script src="lossless-upload.js?v=55" defer></script>
+  <script src="jpeg-lossless.js?v=55" defer></script>
+  <script src="upload-staging.js?v=55" defer></script>
+  <script src="app.js?v=lossless-jpeg-test-55" defer></script>
 
   <style>
     :root {
@@ -209,9 +211,9 @@
 </head>
 <body>
   <div style="font-size:12px; margin-bottom:10px; color:#374151;">
-    <strong>Lossless PNG pipeline · 54</strong><br>
-    Original files when they fit; otherwise PNG parts: 2, 3, 4…<br>
-    Original resolution. Up to 4 parallel uploads.
+    <strong>Lossless JPEG tiles · 55</strong><br>
+    Original files when they fit; lossless parts: 2, 4, 8…<br>
+    Prepare first. Upload 5 source tiles at once. Group split parts.
   </div>
   <div class="tabs">
     <button class="tab-btn" data-tab="sorting">Sorting</button>

@@ -1,42 +1,42 @@
-# Lossless PNG pipeline — test 54
+# Lossless JPEG tiles — test 55
 
-Branch: `test/original-upload-52`. Main remains at `ac272f733fe2b4c736475f5359eec310459ae685`.
+Branch: `test/original-upload-52`. Main is unchanged. Pages stays on the test branch.
 
-## Upload behavior
+## Behavior
 
-The live test established a 30,000,000-byte limit on the SDK `url` property, including JSON quotes. Base64 contributes `4 * ceil(fileBytes / 3)` bytes, plus the data URL prefix and two quotes. For `image/jpeg`, the largest original fitting that formula is 22,499,979 bytes.
+- Miro's measured URL property cap is 30,000,000 bytes, including JSON string quotes. The app measures Base64 plus MIME prefix before every SDK call. JPEG originals up to 22,499,979 bytes fit that formula.
+- Fitting original tiles pass through byte-for-byte.
+- Oversized tiles try 2, 4, 8, 16… parts (up to 256), with exact integer coordinates. Binary splits choose the longer permitted axis: a square becomes halves, a 2×2 layout, then 4×2. JPEG split positions also respect its MCU boundaries. Odd dimensions remain intact.
+- JPEG crops use vendored libjpeg-turbo WebAssembly in a dedicated local worker. The only invoked C path is `process_jpeg(..., downscale=1, ...)`. It preserves the original coefficients and ICC profile. Output dimensions and ICC bytes are checked on every crop. No remote image server or CDN codec is used.
+- JPEG chroma interpolation can change seam pixels when cutting along a subsampled axis. The app only cuts on axes with full chroma sampling. 4:4:4 can split either way; 4:2:2 can split horizontally into full-width strips. 4:2:0 and rotated EXIF sources use PNG to preserve seam pixels. Existing large-image base regions also fall back if their boundaries would cut an unsafe axis.
+- PNG fallback likewise tries powers of two, preserving original supported RGB color metadata. It has the existing precision restrictions (no splitting 16-bit/HDR/APNG/CMYK; alpha premultiplication may round semitransparent pixels). Fitting originals are unaffected.
 
-- Original tiles fitting that limit are passed through byte-for-byte.
-- Oversized tiles are decoded once at native resolution. Try 2 strips, then 3, then 4, and further counts if necessary for a larger region (maximum 256). Use the longer axis; square tiles split left-to-right.
-- Every candidate PNG is measured, including its color metadata, before any part of that layout uploads. An oversized part rejects the entire candidate layout.
-- Pixel boundaries use integer coordinates. A 4096-wide tile split three ways has widths 1365, 1365, 1366. No resizing or smoothing. Parts exactly occupy the original tile's slot, including reversed grid corners and missing numbered slots.
-- Ordinary large-image regions now use PNG too, replacing the old JPEG quality 0.8 encoding. Huge mode retains 2048-pixel base regions and now sends measured Base64 PNGs instead of browser-local blob URLs.
-- One producer prepares source regions in order while a shared queue runs up to four uploads across all files and parts. A slot is reserved before reading Base64. At most one next region is being prepared/held waiting for admission; the complete batch is never pre-encoded. Successful candidate PNG blobs are reused, never encoded a second time for upload. Decoded sources close after their last region has been prepared/admitted, without waiting for network completion.
-- No automatic SDK retries. On partial failure, already-running requests finish, unstarted parts of that region stop, and the next source/region continues. All outstanding requests settle before the button re-enables and final statistics appear. This avoids duplicate objects after ambiguous failures.
-- Diagnostics include `preparationMs`, `queueWaitMs`, per-part `dataUrlMs`, `createImageMs` (successful SDK calls) and `elapsedMs` (SDK plus metadata). Per-source `elapsedMs` is wall time including preparation and queue waits. Concurrent timings overlap and should not be added to infer total batch time.
+## Two stages
 
-## Color and precision
+Stage 1 reads dimensions, lays out sources, determines exact candidate counts, cuts and measures each candidate. Only a complete fitting layout is accepted. Selected output blobs are placed in a temporary device-local IndexedDB database. They are not encoded again for upload and are not kept as batch-wide Base64 strings. Original pass-through Files need no storage copy. Preparation/storage failures skip that source region with a visible diagnostic; other sources continue.
 
-JPEG decoding uses `createImageBitmap` with `colorSpaceConversion: none`. The original RGB ICC profile, when present, is reassembled from APP2 segments, compressed into a PNG iCCP chunk, and attached unchanged. Conflicting canvas-generated color tags are removed. Untagged JPEGs are treated as sRGB. EXIF orientation is baked into the decoded pixels; it is not copied to the PNG. The huge worker uses the same ImageBitmap decoder and a tile-sized OffscreenCanvas, without applying the source profile, and reattaches the profile after encoding. This avoids the one-level RGB rounding differences observed with ImageDecoder / VideoFrame.copyTo.
+Stage 2 runs **five original source files** at a time. The 2/4/8 pieces inside each source upload concurrently and share its source slot. For example, four originals plus one four-part source produce eight concurrent requests; five four-part sources produce twenty. Larger files with many regions are limited to eight requests per active source. Base64 is read only after acquiring a part slot. The source slot remains occupied until all requests and grouping finish.
 
-PNG sources retain their original supported color chunks. PNG encoding is lossless for the decoded opaque 8-bit RGB pixels; it cannot restore information already lost when creating a JPEG. Canvas handling of semitransparent pixels can introduce premultiplication rounding. CMYK/non-RGB ICC, HDR, 16-bit PNG and animated PNG splitting explicitly fail instead of silently lowering precision or converting profiles. Originals under the limit are not affected by these splitting restrictions. Miro's own image processing/previews remain outside this app's control.
+Successful pieces of each source are grouped with `miro.board.group({items})` if at least two exist. Partial failures leave successful pieces visible/grouped; started requests finish, queued parts of the failed region stop, and other sources continue. No automatic SDK retry creates duplicates. Group failure is reported separately without reuploading images. All requests settle before final progress and the button re-enables. Staged blobs are deleted after each request and the temporary database is deleted at completion.
 
-## Validation
+## Diagnostics
 
-`node --check app.js`, `node --check lossless-upload.js`, `node --check slice-worker.js`, `node --test tests/*.test.cjs`.
+Version: `lossless-jpeg-test-55`. Per source region: `mode`, `attempts`, `partCount`, optional `jpegFallback`, `preparationMs` (including local staging), `uploadMs`, `parts`, `group`. Per part: native coordinates/dimensions, byte count, Base64 characters, `dataUrlMs`, successful `createImageMs`, and request/metadata `elapsedMs`. Concurrent times overlap.
 
-Tests cover the measured payload boundary, exact partition geometry, oversized later parts, ICC preservation, 2/3/4-part selection, full original pass-through, board widths and adjacent coordinates, reverse corners, missing source numbers, partial failures and continuing the next file. SDK calls are mocked. Controlled deferred responses also verify the global four-request limit, Base64 admission, preparation/upload overlap, one-region lookahead, out-of-order completion, failure draining and continuing the next file.
+## Checks
 
-Open `tests/browser-lossless.html` from the hosted app and click Run. The browser check uses generated sRGB and Display-P3 JPEG/PNG files to compare decoded RGBA and color-managed output before/after 2/3/4-part slicing, including the huge worker. Raw decoded pixels and color metadata must match exactly. Browser color-managed rendering is measured separately: JPEG and PNG decoder/color-conversion paths can round differently even when raw samples and ICC bytes are identical. A 4096-square noise PNG tests actual encoded sizes and pixel equality. It does not upload to Miro.
+`node --test tests/*.test.cjs`, syntax checks on app/helper/worker files.
 
-## Live Miro check
+Tests execute the actual handler against controlled SDK responses. They cover 2/4/8 JPEG and PNG selection, no SDK calls in Stage 1, exact positions/coverage, original pass-through, five source slots, eight/twenty parallel requests, waiting for grouping before slot reuse, partial uploads, grouping errors, local storage quota failure, cleanup, reverse grid corners and missing source numbers. Production worker tests run the vendored WASM and check ICC, native dimensions and MCU guards.
 
-Reopen the app and verify **Lossless PNG pipeline · 54**. Select an oversized 4096-square JPG; start with one file. Check Upload diagnostics for `lossless-png`, candidate `attempts`, chosen `partCount`, dimensions and individual part status. Compare seams and color at full zoom. Then check a mixed batch of small originals and oversized tiles.
+`tests/browser-lossless.html`: click Run. It exercises real browser workers and IndexedDB, compares every decoded pixel and rendered sRGB pixel for lossless JPEG crops (sRGB/Display-P3 and JPEG 4:4:4/4:2:2), checks 4:2:0/EXIF guards, compares PNG samples/metadata, and measures actual 4096×4096 PNG part sizes. JPEG fixtures are synthetic. No test images upload to Miro. SDK grouping/concurrency tests use mocks; actual Miro behavior needs user verification.
 
 ## Deployment and rollback
 
-GitHub Settings > Pages: Source `Deploy from a branch`, branch `test/original-upload-52`, folder `/ (root)`. The app URL remains unchanged. To revert, select `main`, keep `/ (root)`, Save and wait for deployment; reopen the Miro app. Do not merge into main to deploy this experiment.
+Reopen the Miro app and verify **Lossless JPEG tiles · 55**. Upload one oversized tile first, then a mixed batch. Inspect `mode`/`jpegFallback`, group selection, seams, completion and errors.
 
-The two obsolete branches were removed after test 52. Recoverable commit references:
+GitHub Settings > Pages: Source `Deploy from a branch`, branch `test/original-upload-52`, folder `/ (root)`. To revert, select `main`, keep root, Save, wait for deployment and reopen the app. No merge to main is required.
+
+Removed obsolete branch recovery references:
 - `backup/main-before-image-align-tool-51-20260609`: `ac272f733fe2b4c736475f5359eec310459ae685`
 - `feature/image-align-tool-51-lossless-upload`: `0d01b02c3ed591839d184362a4c3c2a7fefcd33a`

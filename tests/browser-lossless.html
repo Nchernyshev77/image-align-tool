@@ -1,12 +1,14 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>Lossless PNG browser checks · 54</title>
+<title>Lossless JPEG browser checks · 55</title>
 <style>body{font:16px system-ui;margin:32px;max-width:1000px}pre{white-space:pre-wrap;padding:16px;background:#f3f4f6}button{padding:10px 16px}</style>
-<h1>Lossless PNG browser checks · 54</h1>
+<h1>Lossless JPEG browser checks · 55</h1>
 <p>Local synthetic images only. No Miro uploads or network requests for images.</p>
 <button id="run">Run pixel and color checks</button>
 <pre id="result">Ready</pre>
-<script src="../lossless-upload.js?v=54"></script>
+<script src="../lossless-upload.js?v=55"></script>
+<script src="../jpeg-lossless.js?v=55"></script>
+<script src="../upload-staging.js?v=55"></script>
 <script>
 const L=window.LosslessUpload;
 const result=document.getElementById('result');
@@ -40,12 +42,26 @@ async function smallColorTest(space,type) {
   const file=await blobOf(c,type),source=await L.openSource(file);
   const originalRaw=await pixels(file),originalManaged=await pixels(file,'default');
   let displayDifference=0;
-  for(const n of [2,3,4])for(const rect of L.partitions(c.width,c.height,n)){
+  for(const n of [2,4,8])for(const rect of L.dyadicRegions(c.width,c.height,n)){
     const part=await L.encodeRegion(source,rect);
     compareRegion(originalRaw,await pixels(part),c.width,rect);
     displayDifference=Math.max(displayDifference,compareRegion(originalManaged,await pixels(part,'default'),c.width,rect,true));
     const restoredColors=await L.colorMetadata(part);
     assert(JSON.stringify(restoredColors.chunks)===JSON.stringify(source.colors.chunks),'Source color metadata changed');
+  }
+  if(type==='image/jpeg'){
+    const client=JpegLossless.create({workerUrl:'../jpeg-lossless-worker.js?v=55'});
+    try{
+      const meta=await client.open(file);
+      if(meta.eligible){
+        for(const count of [2,4,8])for(const rect of L.dyadicRegions(c.width,c.height,count,meta)){
+          const jpeg=await client.crop(rect);
+          compareRegion(originalRaw,await pixels(jpeg),c.width,rect);
+          compareRegion(originalManaged,await pixels(jpeg,'default'),c.width,rect);
+        }
+        log(`PASS ${space} lossless JPEG WASM: 2/4/8 parts, every raw/rendered pixel identical, ICC preserved`);
+      }else log(`PASS ${space} JPEG guard: ${meta.reason}`);
+    }finally{client.dispose();}
   }
   // Exercise the huge-image decoder path against the same color-managed source.
   if(window.createImageBitmap && window.OffscreenCanvas){
@@ -68,7 +84,28 @@ async function smallColorTest(space,type) {
   }
   source.close();c.width=c.height=1;
   log(`DISPLAY ${space} ${type}: maximum browser color-conversion difference ${displayDifference}/255`);
-  log(`PASS ${space} ${type}: 2/3/4 parts, identical decoded RGBA and color metadata; ${source.colors.description}`);
+  log(`PASS ${space} ${type}: 2/4/8 PNG parts, identical decoded RGBA and color metadata; ${source.colors.description}`);
+}
+async function stagingTest(){
+  const store=await UploadStaging.create();
+  try{const blob=new Blob([new Uint8Array([1,2,3,255])],{type:'image/jpeg'}),key=await store.put(blob);
+    const restored=await store.get(key);assert(restored.type===blob.type,'Staged MIME changed');
+    assert(JSON.stringify([...new Uint8Array(await restored.arrayBuffer())])==='[1,2,3,255]','Staged bytes changed');
+    await store.remove(key);
+  }finally{await store.dispose();}
+  log('PASS temporary IndexedDB staging: bytes and MIME preserved, cleanup completed');
+}
+async function fixtureTest(){
+ const fixtures=await (await fetch('./jpeg-fixtures.json')).json();
+ for(const [name,base64] of Object.entries(fixtures)){
+  const bytes=Uint8Array.from(atob(base64),c=>c.charCodeAt(0)),file=new Blob([bytes],{type:'image/jpeg'}),meta=JpegLossless.info(bytes);
+  if(name==='420'||name==='orientation6'){assert(!meta.eligible,'Unsafe JPEG was allowed');log(`PASS ${name}: guarded PNG fallback`);continue;}
+  const source=await pixels(file),managed=await pixels(file,'default'),client=JpegLossless.create({workerUrl:'../jpeg-lossless-worker.js?v=55'});
+  try{await client.open(file);for(const n of [2,4,8])for(const rect of L.dyadicRegions(meta.width,meta.height,n,meta)){
+    const part=await client.crop(rect);compareRegion(source,await pixels(part),meta.width,rect);compareRegion(managed,await pixels(part,'default'),meta.width,rect);
+  }}finally{client.dispose();}
+  log(`PASS JPEG ${name}: 2/4/8 lossless parts, identical pixels including all seams`);
+ }
 }
 async function largeTest(){
   const c=document.createElement('canvas');c.width=c.height=4096;
@@ -85,7 +122,7 @@ async function largeTest(){
 }
 document.getElementById('run').onclick=async()=>{
   document.getElementById('run').disabled=true;lines.length=0;log('Running…');
-  try{for(const space of ['srgb','display-p3'])for(const type of ['image/jpeg','image/png'])await smallColorTest(space,type);await largeTest();log('ALL CHECKS PASSED');}
+  try{await stagingTest();await fixtureTest();for(const space of ['srgb','display-p3'])for(const type of ['image/jpeg','image/png'])await smallColorTest(space,type);await largeTest();log('ALL CHECKS PASSED');}
   catch(e){log('FAILED: '+e.message);console.error(e);}
   finally{document.getElementById('run').disabled=false;}
 };

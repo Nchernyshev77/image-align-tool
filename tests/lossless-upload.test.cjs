@@ -30,9 +30,9 @@ test('integer strips cover every pixel exactly once, including odd dimensions an
 
 test('all candidate PNGs are checked; a later oversized part rejects the whole layout', async () => {
   const attempts=[];
-  const parts=await L.planParts(4096,4096,async r=>({type:'image/png',size:r.width===2048&&r.x>0?23_000_000:100}),{onAttempt:n=>attempts.push(n)});
-  assert.deepEqual(attempts,[2,3]);
-  assert.equal(parts.length,3);
+  const parts=await L.planParts(4096,4096,async r=>({type:'image/png',size:r.width===2048&&r.height===4096&&r.x>0?23_000_000:100}),{onAttempt:n=>attempts.push(n)});
+  assert.deepEqual(attempts,[2,4]);
+  assert.equal(parts.length,4);
 });
 
 const marker=(type,data)=>Buffer.concat([Buffer.from([255,type,(data.length+2)>>8,(data.length+2)&255]),data]);
@@ -60,4 +60,16 @@ test('JPEG ICC segments survive PNG iCCP compression byte-for-byte, without conf
 test('unsupported CMYK profiles fail instead of being silently relabelled as RGB',async()=> {
   const profile=Buffer.alloc(128);profile.write('CMYK',16);
   await assert.rejects(()=>L.colorMetadata(fakeJpeg(profile)),/cannot be preserved/);
+});
+
+
+test('binary partitions cover odd dimensions exactly and obey MCU boundaries and safe axes',()=>{
+ for(const n of [2,4,8])for(const [w,h] of [[4096,4096],[4097,2051]]){
+  const rects=L.dyadicRegions(w,h,n,{mcuX:8,mcuY:8});assert.equal(rects.length,n);
+  assert.equal(rects.reduce((s,r)=>s+r.width*r.height,0),w*h);
+  for(const r of rects){assert.equal(r.x%8,0);assert.equal(r.y%8,0);}
+ }
+ const rects=L.dyadicRegions(4096,4096,8,{mcuX:16,mcuY:8,safeX:false,safeY:true});
+ assert.ok(rects.every(r=>r.x===0&&r.width===4096));
+ assert.throws(()=>L.dyadicRegions(4096,4096,3),/binary/);
 });
