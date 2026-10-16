@@ -1,35 +1,40 @@
-# Original upload test 52
+# Lossless PNG slices — test 53
 
-Branch: `test/original-upload-52`, based on `main` at `ac272f733fe2b4c736475f5359eec310459ae685`.
+Branch: `test/original-upload-52`. Main remains at `ac272f733fe2b4c736475f5359eec310459ae685`.
 
-Unsliced images (including 4096 x 4096 JPG tiles) are sent as the original file via FileReader and the Miro Web SDK. There is no canvas re-encoding, application payload cap, downscaling, automatic subdivision, or retry for this path. Image width on the board is set explicitly to preserve grid spacing. Files upload one at a time to bound memory use.
+## Upload behavior
 
-Large-image slicing retains the existing implementation, including JPEG quality 0.8 for regular slices and PNG for Huge mode. This branch tests original uploads only; it does not claim to solve all large-image paths.
+The live test established a 30,000,000-byte limit on the SDK `url` property, including JSON quotes. Base64 contributes `4 * ceil(fileBytes / 3)` bytes, plus the data URL prefix and two quotes. For `image/jpeg`, the largest original fitting that formula is 22,499,979 bytes.
 
-## Deploy and revert
+- Original tiles fitting that limit are passed through byte-for-byte.
+- Oversized tiles are decoded once at native resolution. Try 2 strips, then 3, then 4, and further counts if necessary for a larger region (maximum 256). Use the longer axis; square tiles split left-to-right.
+- Every candidate PNG is measured, including its color metadata, before any part of that layout uploads. An oversized part rejects the entire candidate layout.
+- Pixel boundaries use integer coordinates. A 4096-wide tile split three ways has widths 1365, 1365, 1366. No resizing or smoothing. Parts exactly occupy the original tile's slot, including reversed grid corners and missing numbered slots.
+- Ordinary large-image regions now use PNG too, replacing the old JPEG quality 0.8 encoding. Huge mode retains 2048-pixel base regions and now sends measured Base64 PNGs instead of browser-local blob URLs.
+- Uploads are sequential, without automatic SDK retries. On a partial upload failure, existing pieces remain visible and the report says `partial`; remaining pieces of that region stop and the next source/region continues. This avoids creating duplicates after ambiguous failures.
 
-In this repository's Settings > Pages, keep Source set to Deploy from a branch, choose `test/original-upload-52`, folder `/ (root)`, and Save. Wait for the Pages deployment to succeed, then reopen the Miro app. Its panel must display **Original upload test · 52**. The hosted URL remains the same, so the Miro application URL does not need to change.
+## Color and precision
 
-To restore the previous application, choose `main` and `/ (root)` in the same Pages settings and Save. Wait for deployment and reopen the app; the test label should disappear. Do not merge the test into main to deploy it.
+JPEG decoding uses `createImageBitmap` with `colorSpaceConversion: none`. The original RGB ICC profile, when present, is reassembled from APP2 segments, compressed into a PNG iCCP chunk, and attached unchanged. Conflicting canvas-generated color tags are removed. Untagged JPEGs are treated as sRGB. EXIF orientation is baked into the decoded pixels; it is not copied to the PNG. The huge worker likewise decodes without applying the source profile and reattaches the profile after encoding.
 
-## Live check
+PNG sources retain their original supported color chunks. PNG encoding is lossless for the decoded opaque 8-bit RGB pixels; it cannot restore information already lost when creating a JPEG. Canvas handling of semitransparent pixels can introduce premultiplication rounding. CMYK/non-RGB ICC, HDR, 16-bit PNG and animated PNG splitting explicitly fail instead of silently lowering precision or converting profiles. Originals under the limit are not affected by these splitting restrictions. Miro's own image processing/previews remain outside this app's control.
 
-1. Select one original JPG tile (about 28 MB, 4096 x 4096) in the Miro app and run Stitch / Slice.
-2. Inspect Upload diagnostics. It reports the source byte count, pixel dimensions, Base64 length, elapsed time, and success or the SDK error. It does not include image bytes or request bodies.
-3. If it fails, copy the diagnostics. The app will not compress, resize, subdivide, or manually re-upload that file.
-4. If it succeeds, confirm that there is one image item and inspect its quality. SDK acceptance does not alone prove that Miro's display previews match the original file.
+## Validation
 
-## Local checks
+`node --check app.js`, `node --check lossless-upload.js`, `node --check slice-worker.js`, `node --test tests/*.test.cjs`.
 
-Run `node --test tests/original-upload.test.cjs`.
+Tests cover the measured payload boundary, exact partition geometry, oversized later parts, ICC preservation, 2/3/4-part selection, full original pass-through, board widths and adjacent coordinates, reverse corners, missing source numbers, partial failures and continuing the next file. SDK calls are mocked.
 
-The tests exercise the actual import handler with a fake SDK: a 28,000,000-byte payload is preserved byte-for-byte, 4096-pixel spacing is retained, rejection causes no fallback or repeated upload, and a file read failure does not stop the next file. These checks do not establish the real Miro server limit.
+Open `tests/browser-lossless.html` from the hosted app and click Run. The browser check uses generated sRGB and Display-P3 JPEG/PNG files to compare decoded RGBA and color-managed output before/after 2/3/4-part slicing, including the huge worker. A 4096-square noise PNG tests actual encoded sizes and pixel equality. It does not upload to Miro.
 
-## Requested old branch removal
+## Live Miro check
 
-Before this test, the two non-main branches were:
+Reopen the app and verify **Lossless PNG slices · 53**. Select an oversized 4096-square JPG; start with one file. Check Upload diagnostics for `lossless-png`, candidate `attempts`, chosen `partCount`, dimensions and individual part status. Compare seams and color at full zoom. Then check a mixed batch of small originals and oversized tiles.
 
-- `backup/main-before-image-align-tool-51-20260609` at `ac272f733fe2b4c736475f5359eec310459ae685`
-- `feature/image-align-tool-51-lossless-upload` at `0d01b02c3ed591839d184362a4c3c2a7fefcd33a`
+## Deployment and rollback
 
-These commit references are recorded for traceability; this document does not assert that the branches have been deleted or that Pages has been switched.
+GitHub Settings > Pages: Source `Deploy from a branch`, branch `test/original-upload-52`, folder `/ (root)`. The app URL remains unchanged. To revert, select `main`, keep `/ (root)`, Save and wait for deployment; reopen the Miro app. Do not merge into main to deploy this experiment.
+
+The two obsolete branches were removed after test 52. Recoverable commit references:
+- `backup/main-before-image-align-tool-51-20260609`: `ac272f733fe2b4c736475f5359eec310459ae685`
+- `feature/image-align-tool-51-lossless-upload`: `0d01b02c3ed591839d184362a4c3c2a7fefcd33a`

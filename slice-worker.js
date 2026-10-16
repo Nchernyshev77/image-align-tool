@@ -66,7 +66,7 @@ async function openFile(reqId, fileId, payload) {
     data: buffer,
     transfer: [buffer],
     premultiplyAlpha: "none",
-    colorSpaceConversion: "default",
+    colorSpaceConversion: "none",
   });
 
   const decoded = await decoder.decode({ frameIndex: 0, completeFramesOnly: true });
@@ -132,3 +132,4 @@ self.onmessage = async (event) => {
     else fail("worker-error", msg.reqId, msg.fileId, e);
   }
 };
+

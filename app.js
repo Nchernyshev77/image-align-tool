@@ -1,14 +1,5 @@
 // app.js
-// Test 52: upload unsliced files byte-for-byte through FileReader + Web SDK.
-// The existing large-image slicing path is unchanged for this focused test.
-// Image Align Tool_49: Sorting + Stitch/Slice
-// Base: Image Align Tool_41
-// Changes in _49:
-// - Fix huge worker init by sending ArrayBuffer to the worker instead of trying to transfer File.
-// - Add a clearer huge-mode init failure message instead of misreporting it as image-too-large.
-// - Keep the _48 huge-mode path: 2048 tiles, concurrency 1, PNG tiles, and object URLs.
-// - panel.html is unchanged.
-
+// Test 53: originals when they fit; adaptive lossless PNG parts otherwise.
 const { board } = window.miro;
 
 // ---- color / slice settings ----
@@ -20,7 +11,7 @@ const HUGE_SLICE_TILE_SIZE = 2048;
 const SLICE_THRESHOLD_WIDTH = 8192;
 const SLICE_THRESHOLD_HEIGHT = 4096;
 let MAX_SLICE_DIM = 16384;
-const MAX_URL_BYTES = 11000000;
+const MAX_URL_BYTES = window.LosslessUpload.URL_LIMIT;
 const CREATE_IMAGE_MAX_RETRIES = 5;
 const CREATE_IMAGE_BASE_DELAY_MS = 500;
 
@@ -479,19 +470,6 @@ function sortFilesByNameWithNumber(files) {
   return arr.map((m) => m.file);
 }
 
-function canvasToDataUrlUnderLimit(canvas) {
-  const q = 0.8;
-  const dataUrl = canvas.toDataURL("image/jpeg", q);
-  if (dataUrl.length > MAX_URL_BYTES) {
-    throw new DataUrlTooLargeError(
-      `dataURL too large at q=${q} (len=${dataUrl.length}, cap=${MAX_URL_BYTES})`,
-      dataUrl.length,
-      MAX_URL_BYTES
-    );
-  }
-  return dataUrl;
-}
-
 function readOriginalDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -500,7 +478,7 @@ function readOriginalDataUrl(file) {
         reject(new Error("Cannot read original image"));
         return;
       }
-      // No canvas, recompression, resizing, or application size cap here.
+      // Preserve the original bytes; callers check the measured Miro URL limit.
       resolve(reader.result);
     };
     reader.onerror = () => reject(reader.error || new Error("Cannot read original image"));
@@ -530,7 +508,7 @@ function rgbaBufferToPngBlob(buffer, width, height) {
       const canvas = document.createElement("canvas");
       canvas.width = width;
       canvas.height = height;
-      const ctx = get2dContextSrgb(canvas);
+      const ctx = canvas.getContext("2d", { colorSpace: "srgb", alpha: true });
       ctx.imageSmoothingEnabled = false;
       ctx.putImageData(new ImageData(new Uint8ClampedArray(buffer), width, height), 0, 0);
       canvas.toBlob((blob) => {
@@ -680,6 +658,7 @@ function createHugeSliceManager() {
     sessions.set(file, session);
     session.openPromise = Promise.resolve()
       .then(async () => {
+        session.colors = await window.LosslessUpload.colorMetadata(file);
         const buffer = await file.arrayBuffer();
         return callWorker({
           type: "open",
@@ -689,7 +668,7 @@ function createHugeSliceManager() {
           buffer,
         }, [buffer]);
       })
-      .then((msg) => ({ fileId: currentFileId, width: msg.width, height: msg.height }))
+      .then((msg) => ({ fileId: currentFileId, width: msg.width, height: msg.height, colors: session.colors }))
       .catch((err) => {
         sessions.delete(file);
         throw err;
@@ -702,7 +681,7 @@ function createHugeSliceManager() {
     if (!session || !session.openPromise) throw new Error("Huge file session is not open");
     await session.openPromise;
     const msg = await callWorker({ type: "render", fileId: session.fileId, sx, sy, sw, sh });
-    return { width: msg.width, height: msg.height, buffer: msg.buffer };
+    return { width: msg.width, height: msg.height, buffer: msg.buffer, colors: session.colors };
   }
 
   async function closeFile(file) {
@@ -748,7 +727,7 @@ async function handleStitchSubmit(event) {
   const reportBox = document.getElementById("originalUploadReportBox");
   const uploadReport = [];
   const updateUploadReport = () => {
-    if (reportEl) reportEl.value = JSON.stringify({ version: "original-upload-test-52", uploads: uploadReport }, null, 2);
+    if (reportEl) reportEl.value = JSON.stringify({ version: "lossless-slices-test-53", urlLimitBytes: MAX_URL_BYTES, uploads: uploadReport }, null, 2);
     if (reportBox) reportBox.hidden = false;
   };
 
@@ -1245,7 +1224,7 @@ async function handleStitchSubmit(event) {
     const getDecodedImage = async (file) => {
       const cached = imageCache.get(file);
       if (cached) return cached;
-      const imgPromise = decodeImageFromFile(file);
+      const imgPromise = window.LosslessUpload.openSource(file);
       imageCache.set(file, imgPromise);
       return imgPromise;
     };
@@ -1259,7 +1238,7 @@ async function handleStitchSubmit(event) {
         }
         const cached = imageCache.get(file);
         if (cached) {
-          cached.then((imgEl) => { try { imgEl.src = ""; } catch (_) {} }).catch(() => {});
+          cached.then((source) => source.close()).catch(() => {});
           imageCache.delete(file);
         }
         return;
@@ -1267,174 +1246,133 @@ async function handleStitchSubmit(event) {
       remainingJobsByFile.set(file, left);
     };
 
-    const uploadRegularRegionWithSubslice = async (job, imgEl, region, uploadOne) => {
-      const canvas = document.createElement("canvas");
-      canvas.width = region.w;
-      canvas.height = region.h;
-      const ctx = get2dContextSrgb(canvas);
-      ctx.imageSmoothingEnabled = false;
-      ctx.clearRect(0, 0, region.w, region.h);
-      ctx.drawImage(imgEl, region.sx, region.sy, region.sw, region.sh, 0, 0, region.w, region.h);
-      try {
-        const url = canvasToDataUrlUnderLimit(canvas);
-        await uploadOne(url, region.left + region.w / 2, region.top + region.h / 2, region.titleBase, region.metaBase, url.length);
-      } catch (e) {
-        if (!(e && e.name === "DataUrlTooLargeError")) throw e;
-        const minSub = 512;
-        if (region.w <= minSub || region.h <= minSub) throw e;
-        const w2 = Math.ceil(region.w / 2);
-        const h2 = Math.ceil(region.h / 2);
-        const wR = region.w - w2;
-        const hB = region.h - h2;
-        const sw2 = Math.ceil(region.sw / 2);
-        const sh2 = Math.ceil(region.sh / 2);
-        const swR = region.sw - sw2;
-        const shB = region.sh - sh2;
-        totalTiles += 3;
-        setProgress(settledTiles, totalTiles, "Uploading to board…");
-        const nextDepth = (region.depth || 0) + 1;
-        const base = region.titleBase;
-        const mkMeta = (subRow, subCol) => ({
-          ...region.metaBase,
-          subSlice: true,
-          subDepth: nextDepth,
-          subRow,
-          subCol,
-          subW: region.w,
-          subH: region.h,
-        });
-        const parts = [
-          { sx: region.sx, sy: region.sy, sw: sw2, sh: sh2, left: region.left, top: region.top, w: w2, h: h2, titleBase: `${base} s${nextDepth}a`, metaBase: mkMeta(0, 0), depth: nextDepth },
-          { sx: region.sx + sw2, sy: region.sy, sw: swR, sh: sh2, left: region.left + w2, top: region.top, w: wR, h: h2, titleBase: `${base} s${nextDepth}b`, metaBase: mkMeta(0, 1), depth: nextDepth },
-          { sx: region.sx, sy: region.sy + sh2, sw: sw2, sh: shB, left: region.left, top: region.top + h2, w: w2, h: hB, titleBase: `${base} s${nextDepth}c`, metaBase: mkMeta(1, 0), depth: nextDepth },
-          { sx: region.sx + sw2, sy: region.sy + sh2, sw: swR, sh: shB, left: region.left + w2, top: region.top + h2, w: wR, h: hB, titleBase: `${base} s${nextDepth}d`, metaBase: mkMeta(1, 1), depth: nextDepth },
-        ];
-        for (const part of parts) {
-          await uploadRegularRegionWithSubslice(job, imgEl, part, uploadOne);
-        }
-      }
-    };
-
     const processOneJob = async (job) => {
       if (job.__settled) return;
       const { file, info } = job;
       const fileName = originalNameByFile.get(file) || "image";
-      const useHugeWorker = !!(info && info.useHugeWorker);
+      const useHugeWorker = !!info.useHugeWorker;
       if (useHugeWorker && failedHugeFiles.has(file)) {
         markJobSettled(job, "skipped", { reason: "file-already-failed" });
         await releaseImageIfDone(file, useHugeWorker);
         return;
       }
-
-      const uploadOne = async (url, x, y, title, meta, byteCount, maxRetries, width) => {
-        const params = { url, x, y, title };
-        if (Number.isFinite(width) && width > 0) params.width = width;
-        const imgWidget = await createImageWithRetry(params, maxRetries);
-        try {
-          await imgWidget.setMetadata(META_APP_ID, meta);
-        } catch (e) {
-          console.warn("setMetadata failed:", e);
-        }
-        allCreatedTiles.push(imgWidget);
-        uploadedBytesDone += byteCount || 0;
-        createdTiles += 1;
-        markJobSettled(job, "created");
+      const full = job.kind === "full";
+      const width = full ? job.width : job.sw;
+      const height = full ? job.height : job.sh;
+      const title = full
+        ? `C${String(info.satCode).padStart(2, "0")}/${String(info.briCode).padStart(3, "0")} ${fileName}`
+        : job.title;
+      const report = {
+        fileName, fileBytes: file.size, width, height,
+        sourceX: full ? 0 : job.sx, sourceY: full ? 0 : job.sy,
+        mode: "original", status: "preparing", parts: [], attempts: [],
       };
-
+      uploadReport.push(report);
+      updateUploadReport();
+      const startedAt = performance.now();
+      let plannedParts = 1;
+      let completedParts = 0;
+      const uploadPart = async (url, rect, partIndex, partCount, byteCount) => {
+        // Base64 is ASCII; Miro counts the two JSON string quotes as well.
+        if (url.length + 2 > MAX_URL_BYTES) throw new DataUrlTooLargeError("Upload URL exceeds Miro limit", url.length + 2, MAX_URL_BYTES);
+        const part = {
+          part: partIndex + 1, x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+          fileBytes: byteCount, payloadCharacters: url.length, status: "uploading",
+        };
+        report.parts.push(part);
+        report.status = "uploading";
+        updateUploadReport();
+        try {
+          const widget = await createImageWithRetry({
+            url, x: job.x - width / 2 + rect.x + rect.width / 2,
+            y: job.y - height / 2 + rect.y + rect.height / 2,
+            width: rect.width,
+            title: report.mode === "original" ? title : `${title} [PNG ${partIndex + 1}/${partCount}]`,
+          }, 0); // No duplicate objects after ambiguous network failures.
+          allCreatedTiles.push(widget);
+          createdTiles++;
+          completedParts++;
+          settledTiles++;
+          uploadedBytesDone += byteCount;
+          part.status = "created";
+          try {
+            await widget.setMetadata(META_APP_ID, {
+              fileName, satCode: info.satCode, briCode: info.briCode,
+              uploadMode: report.mode, sourceWidth: info.width, sourceHeight: info.height,
+              sourceX: report.sourceX + rect.x, sourceY: report.sourceY + rect.y,
+              partIndex: partIndex + 1, partCount, tileIndex: job.tileIndex || 1,
+            });
+          } catch (e) { console.warn("setMetadata failed:", e); }
+          setProgress(settledTiles, totalTiles, "Uploading to board…");
+        } catch (error) {
+          part.status = "failed";
+          part.error = getUploadErrorDetails(error);
+          throw error;
+        } finally { updateUploadReport(); }
+      };
       try {
-        if (job.kind === "full") {
-          const report = {
-            fileName, fileBytes: file.size, width: job.width, height: job.height,
-            mode: "original", status: "reading", payloadCharacters: null,
-          };
-          uploadReport.push(report);
-          updateUploadReport();
-          const startedAt = performance.now();
-          try {
-            const url = await readOriginalDataUrl(file);
-            report.payloadCharacters = url.length;
-            report.status = "uploading";
-            updateUploadReport();
-            const title = `C${String(info.satCode).padStart(2, "0")}/${String(info.briCode).padStart(3, "0")} ${fileName}`;
-            // One attempt: rejection must remain visible, with no lossy/sliced fallback.
-            await uploadOne(url, job.x, job.y, title, {
-              fileName, satCode: info.satCode, briCode: info.briCode, uploadMode: "original",
-            }, file.size, 0, job.width);
-            report.status = "created";
-          } catch (error) {
-            report.status = "failed";
-            report.error = getUploadErrorDetails(error);
-            recordFailedSourceFile(fileName, "original-upload-failed", report.error);
-            markJobSettled(job, "skipped", { reason: "original-upload-failed" });
-          } finally {
-            report.elapsedMs = Math.round(performance.now() - startedAt);
-            updateUploadReport();
+        if (full && window.LosslessUpload.fits(file.size, file.type || "application/octet-stream")) {
+          const url = await readOriginalDataUrl(file);
+          report.payloadCharacters = url.length;
+          await uploadPart(url, { x: 0, y: 0, width, height }, 0, 1, file.size);
+        } else {
+          report.mode = "lossless-png";
+          let parts;
+          if (useHugeWorker) {
+            const rendered = await hugeManager.renderTile(file, job.sx, job.sy, width, height);
+            const png = await rgbaBufferToPngBlob(rendered.buffer, width, height);
+            const blob = await window.LosslessUpload.preserveColor(png, rendered.colors.chunks);
+            report.colorHandling = rendered.colors.description;
+            if (!window.LosslessUpload.fits(blob.size, "image/png")) throw new Error("Huge-mode PNG exceeds the upload limit");
+            parts = [{ x: 0, y: 0, width, height, blob }];
+          } else {
+            const source = await getDecodedImage(file);
+            if (source.image.width !== info.width || source.image.height !== info.height) {
+              throw new Error("Decoded dimensions differ; refusing to resize the source");
+            }
+            report.colorHandling = source.colors.description;
+            parts = await window.LosslessUpload.planParts(width, height, rect =>
+              window.LosslessUpload.encodeRegion(source, {
+                ...rect, x: rect.x + report.sourceX, y: rect.y + report.sourceY,
+              }), {
+                // An oversized original starts at halves. Existing large-image
+                // base regions first try one PNG, then 2, 3, 4... strips.
+                firstCount: full ? 2 : 1,
+                onAttempt: count => {
+                  report.attempts.push(count);
+                  setProgress(settledTiles, totalTiles, `Preparing PNG: ${count} part(s)…`);
+                  updateUploadReport();
+                },
+              });
           }
-          return;
-        }
-        if (useHugeWorker) {
-          const { width, height, buffer } = await hugeManager.renderTile(file, job.sx, job.sy, job.sw, job.sh);
-          const blob = await rgbaBufferToPngBlob(buffer, width, height);
-          const url = URL.createObjectURL(blob);
-          try {
-            await uploadOne(
-              url,
-              job.x,
-              job.y,
-              job.title,
-              {
-                fileName,
-                satCode: info.satCode,
-                briCode: info.briCode,
-                tileIndex: job.tileIndex,
-                tilesX: job.tilesX,
-                tilesY: job.tilesY,
-                hugeMode: true,
-                tileMime: HUGE_TILE_MIME,
-              },
-              blob.size,
-              1
-            );
-          } finally {
-            URL.revokeObjectURL(url);
+          plannedParts = parts.length;
+          totalTiles += plannedParts - 1;
+          report.partCount = plannedParts;
+          for (let i = 0; i < parts.length; i++) {
+            const part = parts[i];
+            const size = part.blob.size;
+            const url = await readOriginalDataUrl(part.blob);
+            part.blob = null; // Release PNG bytes once its Base64 payload exists.
+            await uploadPart(url, part, i, plannedParts, size);
           }
-          return;
         }
-
-        const imgEl = await getDecodedImage(file);
-        const left = job.x - job.sw / 2;
-        const top = job.y - job.sh / 2;
-        await uploadRegularRegionWithSubslice(job, imgEl, {
-          sx: job.sx,
-          sy: job.sy,
-          sw: job.sw,
-          sh: job.sh,
-          left,
-          top,
-          w: job.sw,
-          h: job.sh,
-          titleBase: job.title,
-          metaBase: {
-            fileName,
-            satCode: info.satCode,
-            briCode: info.briCode,
-            tileIndex: job.tileIndex,
-            tilesX: job.tilesX,
-            tilesY: job.tilesY,
-          },
-          depth: 0,
-        }, uploadOne);
-      } catch (e) {
-        if (useHugeWorker) {
-          await markHugeFileFailed(file, new FatalHugeFileError(file, fileName, e), job);
-          markJobSettled(job, "skipped", { reason: "huge-file-failed" });
-          return;
-        }
-        throw e;
+        report.status = "created";
+      } catch (error) {
+        report.status = completedParts ? "partial" : "failed";
+        report.error = getUploadErrorDetails(error);
+        report.createdParts = completedParts;
+        // Leave successfully created parts visible; no silent retry/duplicate.
+        const remaining = plannedParts - completedParts;
+        settledTiles += remaining;
+        skippedTiles += remaining;
+        recordFailedSourceFile(fileName, "upload-failed", report.error);
+        if (useHugeWorker) await markHugeFileFailed(file, error, job);
+        setProgress(settledTiles, totalTiles, "Uploading to board…");
       } finally {
-        if (job.__settled || failedHugeFiles.has(file)) {
-          await releaseImageIfDone(file, useHugeWorker);
-        }
+        job.__settled = true;
+        report.elapsedMs = Math.round(performance.now() - startedAt);
+        updateUploadReport();
+        await releaseImageIfDone(file, useHugeWorker);
       }
     };
 

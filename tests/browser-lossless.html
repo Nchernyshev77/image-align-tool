@@ -1,0 +1,83 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lossless PNG browser checks · 53</title>
+<style>body{font:16px system-ui;margin:32px;max-width:1000px}pre{white-space:pre-wrap;padding:16px;background:#f3f4f6}button{padding:10px 16px}</style>
+<h1>Lossless PNG browser checks · 53</h1>
+<p>Local synthetic images only. No Miro uploads or network requests for images.</p>
+<button id="run">Run pixel and color checks</button>
+<pre id="result">Ready</pre>
+<script src="../lossless-upload.js?v=53"></script>
+<script>
+const L=window.LosslessUpload;
+const result=document.getElementById('result');
+const lines=[];
+const log=s=>{lines.push(s);result.textContent=lines.join('\n');};
+const assert=(ok,message)=>{if(!ok)throw Error(message);};
+const blobOf=(canvas,type='image/png')=>new Promise((resolve,reject)=>canvas.toBlob(b=>b?resolve(b):reject(Error('Encode failed')),type,1));
+async function pixels(blob,conversion='none') {
+  const bitmap=await createImageBitmap(blob,{colorSpaceConversion:conversion,premultiplyAlpha:'none'});
+  const c=document.createElement('canvas');c.width=bitmap.width;c.height=bitmap.height;
+  const ctx=c.getContext('2d',{colorSpace:'srgb',willReadFrequently:true});ctx.drawImage(bitmap,0,0);
+  const data=ctx.getImageData(0,0,c.width,c.height).data;bitmap.close();c.width=c.height=1;return data;
+}
+function compareRegion(expected,actual,sourceWidth,rect) {
+  for(let y=0;y<rect.height;y++) for(let x=0;x<rect.width;x++) for(let ch=0;ch<4;ch++) {
+    const i=((rect.y+y)*sourceWidth+rect.x+x)*4+ch,j=(y*rect.width+x)*4+ch;
+    if(expected[i]!==actual[j]) throw Error(`Pixel mismatch (${rect.x+x},${rect.y+y}) channel ${ch}: ${expected[i]} vs ${actual[j]}`);
+  }
+}
+async function smallColorTest(space,type) {
+  const c=document.createElement('canvas');c.width=97;c.height=61;
+  const ctx=c.getContext('2d',{colorSpace:space});
+  assert(ctx.getContextAttributes().colorSpace===space,'Requested color space unsupported');
+  for(let y=0;y<c.height;y++)for(let x=0;x<c.width;x++){
+    ctx.fillStyle=space==='display-p3'?`color(display-p3 ${x/96} ${y/60} ${((x+y)%17)/16})`:`rgb(${x*13%256} ${y*23%256} ${(x+y)*37%256})`;
+    ctx.fillRect(x,y,1,1);
+  }
+  const file=await blobOf(c,type),source=await L.openSource(file);
+  const originalRaw=await pixels(file),originalManaged=await pixels(file,'default');
+  for(const n of [2,3,4])for(const rect of L.partitions(c.width,c.height,n)){
+    const part=await L.encodeRegion(source,rect);
+    compareRegion(originalRaw,await pixels(part),c.width,rect);
+    compareRegion(originalManaged,await pixels(part,'default'),c.width,rect);
+  }
+  // Exercise the huge-image decoder path against the same color-managed source.
+  if(window.ImageDecoder){
+    const worker=new Worker('../slice-worker.js?v=53');let req=0;
+    const call=(message,transfer=[])=>new Promise((resolve,reject)=>{
+      const id=++req;worker.onmessage=e=>{if(e.data.reqId!==id)return;e.data.error?reject(Error(e.data.error)):resolve(e.data);};
+      worker.onerror=e=>reject(Error(e.message));worker.postMessage({...message,reqId:id},transfer);
+    });
+    try {
+      const buffer=await file.arrayBuffer();
+      await call({type:'open',fileId:'test',mimeType:type,buffer},[buffer]);
+      const tile=await call({type:'render',fileId:'test',sx:0,sy:0,sw:c.width,sh:c.height});
+      const out=document.createElement('canvas');out.width=c.width;out.height=c.height;
+      out.getContext('2d',{colorSpace:'srgb'}).putImageData(new ImageData(new Uint8ClampedArray(tile.buffer),c.width,c.height),0,0);
+      const restored=await L.preserveColor(await blobOf(out),source.colors.chunks);
+      compareRegion(originalManaged,await pixels(restored,'default'),c.width,{x:0,y:0,width:c.width,height:c.height});
+    } finally {worker.terminate();}
+  }
+  source.close();c.width=c.height=1;
+  log(`PASS ${space} ${type}: 2/3/4 parts, identical decoded RGBA and rendered sRGB; ${source.colors.description}`);
+}
+async function largeTest(){
+  const c=document.createElement('canvas');c.width=c.height=4096;
+  const ctx=c.getContext('2d',{colorSpace:'srgb'}),data=ctx.createImageData(c.width,c.height);
+  let seed=123456789;
+  for(let i=0;i<data.data.length;i+=4){seed^=seed<<13;seed^=seed>>>17;seed^=seed<<5;data.data[i]=seed&255;data.data[i+1]=(seed>>>8)&255;data.data[i+2]=(seed>>>16)&255;data.data[i+3]=255;}
+  ctx.putImageData(data,0,0);
+  const file=await blobOf(c),source=await L.openSource(file),attempts=[];
+  log(`4096×4096 source PNG: ${file.size} bytes; checking candidate layouts…`);
+  const parts=await L.planParts(4096,4096,r=>L.encodeRegion(source,r),{onAttempt:n=>attempts.push(n)});
+  for(const part of parts){assert(L.fits(part.blob.size,'image/png'),'Oversized PNG selected');compareRegion(data.data,await pixels(part.blob),4096,part);}
+  log(`PASS 4096×4096: tried ${attempts.join(' → ')}, selected ${parts.length}, sizes ${parts.map(p=>p.blob.size).join(', ')} bytes; all pixels identical`);
+  source.close();c.width=c.height=1;
+}
+document.getElementById('run').onclick=async()=>{
+  document.getElementById('run').disabled=true;lines.length=0;log('Running…');
+  try{for(const space of ['srgb','display-p3'])for(const type of ['image/jpeg','image/png'])await smallColorTest(space,type);await largeTest();log('ALL CHECKS PASSED');}
+  catch(e){log('FAILED: '+e.message);console.error(e);}
+  finally{document.getElementById('run').disabled=false;}
+};
+</script>
