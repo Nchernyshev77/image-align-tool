@@ -43,6 +43,23 @@
     throw new Error('Image cannot fit the upload limit without more than 256 parts');
   }
 
+  // One producer, bounded admission: Base64 is made only after a slot opens.
+  // A rejected upload releases its slot, and does not stall other sources.
+  function createUploadQueue(limit = 4) {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('Invalid upload concurrency');
+    const active = new Set();
+    return {
+      async enqueue(task) {
+        while (active.size >= limit) await Promise.race(active);
+        const done = Promise.resolve().then(task);
+        const settled = done.then(() => {}, () => {}).finally(() => active.delete(settled));
+        active.add(settled);
+        return { done };
+      },
+      async drain() { while (active.size) await Promise.all(active); },
+    };
+  }
+
   function pngChunks(bytes) {
     if (bytes.length < 8 || ascii(bytes.subarray(1, 4)) !== 'PNG') throw new Error('Invalid PNG');
     const chunks = [];
@@ -190,6 +207,6 @@
     }
   }
 
-  root.LosslessUpload = { URL_LIMIT, PNG_MIME, payloadBytes, fits, partitions, planParts,
+  root.LosslessUpload = { URL_LIMIT, PNG_MIME, payloadBytes, fits, partitions, planParts, createUploadQueue,
     openSource, encodeRegion, colorMetadata, preserveColor, pngChunks, chunk, jpegProfile };
 })(typeof window !== 'undefined' ? window : globalThis);

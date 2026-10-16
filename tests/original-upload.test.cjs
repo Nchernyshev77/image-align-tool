@@ -23,6 +23,7 @@ function setup(files, rejectUpload = false, options = {}) {
     notifications: { showError: async () => {}, showWarning: async () => {}, showInfo: async () => {} },
     createImage: async params => {
       calls.push(params);
+      if (options.onCreate) await options.onCreate(params, calls.length);
       if (rejectUpload === true || rejectUpload === calls.length) throw Object.assign(new Error('Maximum upload size exceeded'), { code: 'invalidParameters', status: 400 });
       return { setMetadata: async () => {} };
     },
@@ -53,6 +54,7 @@ function setup(files, rejectUpload = false, options = {}) {
     URL: { createObjectURL: file => file, revokeObjectURL() {} },
     FileReader: class {
       readAsDataURL(file) {
+        if (options.onRead) options.onRead(file);
         queueMicrotask(() => {
           if (file.readError) { this.error = new Error('Read failed'); this.onerror(); return; }
           this.result = `data:${file.type};base64,${file.bytes.toString('base64')}`;
@@ -67,12 +69,14 @@ function setup(files, rejectUpload = false, options = {}) {
   vm.runInContext(fs.readFileSync(require('node:path').join(__dirname, '../lossless-upload.js'), 'utf8'), context);
   const helpers = context.window.LosslessUpload;
   helpers.openSource = async file => ({
+    file,
     image: { width: file.width, height: file.height },
     colors: { description: 'test RGB profile', chunks: [] },
     close: () => sourceCloses++,
   });
   helpers.encodeRegion = async (source, rect) => {
     encodes.push({ ...rect });
+    if (options.onEncode) await options.onEncode(source, rect);
     const size = options.pngSize ? options.pngSize(rect) : 100;
     return { size, type: 'image/png', bytes: Buffer.alloc(Math.min(size, 100), 0x7f) };
   };
@@ -148,16 +152,16 @@ for (const targetParts of [2, 3, 4]) {
   });
 }
 
-test('split failure is partial, stops the remaining pieces, continues the next file without retries', async () => {
+test('split failure is partial, lets already-started pieces finish, and continues the next file without retries', async () => {
   const app = setup([fixture(28_000_000), fixture(100, 'Tile_2.jpg')], 2, {
     pngSize: rect => rect.width > 1366 ? 23_000_000 : 100,
   });
   await app.run();
-  assert.equal(app.calls.length, 3);
+  assert.equal(app.calls.length, 4);
   const report = JSON.parse(app.el('originalUploadReport').value).uploads;
   assert.equal(report[0].status, 'partial');
-  assert.equal(report[0].createdParts, 1);
-  assert.deepEqual(report[0].parts.map(p => p.status), ['created', 'failed']);
+  assert.equal(report[0].createdParts, 2);
+  assert.deepEqual(report[0].parts.map(p => p.status), ['created', 'failed', 'created']);
   assert.equal(report[1].status, 'created');
   assert.equal(app.el('stitchButton').disabled, false);
   assert.equal(app.sourceCloses, 1);
@@ -188,4 +192,81 @@ test('large-image base tiles use PNG without JPEG recompression or board scaling
   assert.ok(app.calls.every(p => p.url.startsWith('data:image/png;base64,')));
   assert.deepEqual(app.encodes.map(p => p.x), [0, 4096, 8192]);
   assert.equal(app.sourceCloses, 1);
+});
+
+
+const deferred = () => {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+};
+async function until(predicate) {
+  const deadline = Date.now() + 2000;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, 'Pipeline did not reach expected state');
+    await new Promise(resolve => setImmediate(resolve));
+  }
+}
+
+test('global queue admits four uploads and Base64 reads, then refills freed slots; waits for the last response', async () => {
+  const gates = Array.from({length:8}, deferred);
+  let active = 0, maximum = 0, reads = 0;
+  const app = setup(Array.from({length:8}, (_,i) => fixture(100, `Tile_${i+1}.jpg`)), false, {
+    onRead: () => reads++,
+    onCreate: async (_, n) => { active++; maximum=Math.max(maximum,active); await gates[n-1].promise; active--; },
+  });
+  const running = app.run();
+  await until(() => app.calls.length === 4);
+  assert.equal(reads,4);
+  assert.equal(app.el('stitchButton').disabled,true);
+  gates[2].resolve();
+  await until(() => app.calls.length === 5);
+  assert.equal(reads,5);
+  for (const gate of gates.slice(0,7)) gate.resolve();
+  await until(() => app.calls.length === 8);
+  assert.equal(app.el('stitchButton').disabled,true);
+  gates[7].resolve();await running;
+  assert.equal(maximum,4);
+  assert.equal(app.el('stitchButton').disabled,false);
+  assert.equal(app.el('stitchProgressMain').textContent,'Uploading to board… 8 / 8');
+  const reports=JSON.parse(app.el('originalUploadReport').value).uploads;
+  assert.ok(reports.every(r => r.status==='created' && r.preparationMs>=0 && r.queueWaitMs>=0 && r.parts[0].createImageMs>=0));
+});
+
+test('prepares one next PNG plan during four blocked uploads, without encoding it again or reading Base64 early', async () => {
+  const gate=deferred();let reads=0;
+  const files=Array.from({length:3},(_,i)=>({...fixture(100,`Tile_${i+1}.jpg`),size:28_000_000}));
+  const app=setup(files,false,{
+    pngSize:r=>r.width>1024?23_000_000:100,
+    onRead:()=>reads++,onCreate:()=>gate.promise,
+  });
+  const running=app.run();
+  await until(()=>app.encodes.length===12); // Six encodes per plan: failed 2, failed 3, four successful strips.
+  assert.equal(app.calls.length,4);
+  assert.equal(reads,4);
+  assert.equal(app.sourceCloses,1);
+  gate.resolve();await running;
+  assert.equal(app.calls.length,12);
+  assert.equal(app.encodes.length,18); // Each successful PNG is reused for upload.
+  assert.equal(app.sourceCloses,3);
+});
+
+test('a failed concurrent request skips unstarted parts, drains other requests, and continues the next source', async () => {
+  const gates=Array.from({length:4},deferred);
+  const app=setup([{...fixture(100),size:28_000_000},fixture(100,'Tile_2.jpg')],false,{
+    pngSize:r=>r.width>512?23_000_000:100,
+    onCreate:(_,n)=>n<=4?gates[n-1].promise:Promise.resolve(),
+  });
+  const running=app.run();await until(()=>app.calls.length===4);
+  gates[1].reject(new Error('Network failure'));
+  await until(()=>app.calls.length===5); // The next source can use the free slot.
+  assert.equal(app.el('stitchButton').disabled,true);
+  for(const gate of gates)gate.resolve();await running;
+  assert.equal(app.calls.length,5);
+  const reports=JSON.parse(app.el('originalUploadReport').value).uploads;
+  assert.equal(reports[0].partCount,8);
+  assert.equal(reports[0].createdParts,3);
+  assert.equal(reports[0].status,'partial');
+  assert.equal(reports[1].status,'created');
+  assert.equal(app.el('stitchProgressMain').textContent,'Uploading to board… 9 / 9');
 });

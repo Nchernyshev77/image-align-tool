@@ -1,4 +1,4 @@
-# Lossless PNG slices — test 53
+# Lossless PNG pipeline — test 54
 
 Branch: `test/original-upload-52`. Main remains at `ac272f733fe2b4c736475f5359eec310459ae685`.
 
@@ -11,7 +11,9 @@ The live test established a 30,000,000-byte limit on the SDK `url` property, inc
 - Every candidate PNG is measured, including its color metadata, before any part of that layout uploads. An oversized part rejects the entire candidate layout.
 - Pixel boundaries use integer coordinates. A 4096-wide tile split three ways has widths 1365, 1365, 1366. No resizing or smoothing. Parts exactly occupy the original tile's slot, including reversed grid corners and missing numbered slots.
 - Ordinary large-image regions now use PNG too, replacing the old JPEG quality 0.8 encoding. Huge mode retains 2048-pixel base regions and now sends measured Base64 PNGs instead of browser-local blob URLs.
-- Uploads are sequential, without automatic SDK retries. On a partial upload failure, existing pieces remain visible and the report says `partial`; remaining pieces of that region stop and the next source/region continues. This avoids creating duplicates after ambiguous failures.
+- One producer prepares source regions in order while a shared queue runs up to four uploads across all files and parts. A slot is reserved before reading Base64. At most one next region is being prepared/held waiting for admission; the complete batch is never pre-encoded. Successful candidate PNG blobs are reused, never encoded a second time for upload. Decoded sources close after their last region has been prepared/admitted, without waiting for network completion.
+- No automatic SDK retries. On partial failure, already-running requests finish, unstarted parts of that region stop, and the next source/region continues. All outstanding requests settle before the button re-enables and final statistics appear. This avoids duplicate objects after ambiguous failures.
+- Diagnostics include `preparationMs`, `queueWaitMs`, per-part `dataUrlMs`, `createImageMs` (successful SDK calls) and `elapsedMs` (SDK plus metadata). Per-source `elapsedMs` is wall time including preparation and queue waits. Concurrent timings overlap and should not be added to infer total batch time.
 
 ## Color and precision
 
@@ -23,13 +25,13 @@ PNG sources retain their original supported color chunks. PNG encoding is lossle
 
 `node --check app.js`, `node --check lossless-upload.js`, `node --check slice-worker.js`, `node --test tests/*.test.cjs`.
 
-Tests cover the measured payload boundary, exact partition geometry, oversized later parts, ICC preservation, 2/3/4-part selection, full original pass-through, board widths and adjacent coordinates, reverse corners, missing source numbers, partial failures and continuing the next file. SDK calls are mocked.
+Tests cover the measured payload boundary, exact partition geometry, oversized later parts, ICC preservation, 2/3/4-part selection, full original pass-through, board widths and adjacent coordinates, reverse corners, missing source numbers, partial failures and continuing the next file. SDK calls are mocked. Controlled deferred responses also verify the global four-request limit, Base64 admission, preparation/upload overlap, one-region lookahead, out-of-order completion, failure draining and continuing the next file.
 
 Open `tests/browser-lossless.html` from the hosted app and click Run. The browser check uses generated sRGB and Display-P3 JPEG/PNG files to compare decoded RGBA and color-managed output before/after 2/3/4-part slicing, including the huge worker. Raw decoded pixels and color metadata must match exactly. Browser color-managed rendering is measured separately: JPEG and PNG decoder/color-conversion paths can round differently even when raw samples and ICC bytes are identical. A 4096-square noise PNG tests actual encoded sizes and pixel equality. It does not upload to Miro.
 
 ## Live Miro check
 
-Reopen the app and verify **Lossless PNG slices · 53**. Select an oversized 4096-square JPG; start with one file. Check Upload diagnostics for `lossless-png`, candidate `attempts`, chosen `partCount`, dimensions and individual part status. Compare seams and color at full zoom. Then check a mixed batch of small originals and oversized tiles.
+Reopen the app and verify **Lossless PNG pipeline · 54**. Select an oversized 4096-square JPG; start with one file. Check Upload diagnostics for `lossless-png`, candidate `attempts`, chosen `partCount`, dimensions and individual part status. Compare seams and color at full zoom. Then check a mixed batch of small originals and oversized tiles.
 
 ## Deployment and rollback
 

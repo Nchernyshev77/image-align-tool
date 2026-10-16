@@ -1,5 +1,5 @@
 // app.js
-// Test 53: originals when they fit; adaptive lossless PNG parts otherwise.
+// Test 54: originals when they fit; adaptive lossless PNG parts otherwise.
 const { board } = window.miro;
 
 // ---- color / slice settings ----
@@ -15,8 +15,7 @@ const MAX_URL_BYTES = window.LosslessUpload.URL_LIMIT;
 const CREATE_IMAGE_MAX_RETRIES = 5;
 const CREATE_IMAGE_BASE_DELAY_MS = 500;
 
-const UPLOAD_CONCURRENCY_NORMAL = 1; // Avoid holding several large Base64 strings at once.
-const UPLOAD_CONCURRENCY_HUGE = 1;
+const UPLOAD_CONCURRENCY = 4; // Shared by all parts and source files.
 const META_APP_ID = "image-align-tool";
 const MAX_NOTIFICATION_MESSAGE_LENGTH = 80;
 const LARGE_IMAGE_DIMENSION_WARNING = 16384;
@@ -727,7 +726,7 @@ async function handleStitchSubmit(event) {
   const reportBox = document.getElementById("originalUploadReportBox");
   const uploadReport = [];
   const updateUploadReport = () => {
-    if (reportEl) reportEl.value = JSON.stringify({ version: "lossless-slices-test-53", urlLimitBytes: MAX_URL_BYTES, uploads: uploadReport }, null, 2);
+    if (reportEl) reportEl.value = JSON.stringify({ version: "lossless-pipeline-test-54", urlLimitBytes: MAX_URL_BYTES, uploads: uploadReport }, null, 2);
     if (reportBox) reportBox.hidden = false;
   };
 
@@ -1126,19 +1125,6 @@ async function handleStitchSubmit(event) {
       throw lastErr;
     };
 
-    const runWithConcurrency = async (items, workerFn, concurrency) => {
-      let cursor = 0;
-      const runners = new Array(concurrency).fill(0).map(async () => {
-        while (true) {
-          const i = cursor;
-          cursor += 1;
-          if (i >= items.length) break;
-          await workerFn(items[i], i);
-        }
-      });
-      await Promise.all(runners);
-    };
-
     const tileJobs = [];
     const remainingJobsByFile = new Map();
     const originalNameByFile = new Map();
@@ -1246,6 +1232,9 @@ async function handleStitchSubmit(event) {
       remainingJobsByFile.set(file, left);
     };
 
+    const uploadQueue = window.LosslessUpload.createUploadQueue(UPLOAD_CONCURRENCY);
+    const jobCompletions = [];
+
     const processOneJob = async (job) => {
       if (job.__settled) return;
       const { file, info } = job;
@@ -1272,16 +1261,20 @@ async function handleStitchSubmit(event) {
       const startedAt = performance.now();
       let plannedParts = 1;
       let completedParts = 0;
-      const uploadPart = async (url, rect, partIndex, partCount, byteCount) => {
+      let firstError = null;
+      const uploads = [];
+      report.queueWaitMs = 0;
+      const uploadPart = async (url, rect, partIndex, partCount, byteCount, dataUrlMs) => {
         // Base64 is ASCII; Miro counts the two JSON string quotes as well.
         if (url.length + 2 > MAX_URL_BYTES) throw new DataUrlTooLargeError("Upload URL exceeds Miro limit", url.length + 2, MAX_URL_BYTES);
         const part = {
           part: partIndex + 1, x: rect.x, y: rect.y, width: rect.width, height: rect.height,
-          fileBytes: byteCount, payloadCharacters: url.length, status: "uploading",
+          fileBytes: byteCount, payloadCharacters: url.length, status: "uploading", dataUrlMs,
         };
         report.parts.push(part);
         report.status = "uploading";
         updateUploadReport();
+        const uploadStartedAt = performance.now();
         try {
           const widget = await createImageWithRetry({
             url, x: job.x - width / 2 + rect.x + rect.width / 2,
@@ -1289,6 +1282,7 @@ async function handleStitchSubmit(event) {
             width: rect.width,
             title: report.mode === "original" ? title : `${title} [PNG ${partIndex + 1}/${partCount}]`,
           }, 0); // No duplicate objects after ambiguous network failures.
+          part.createImageMs = Math.round(performance.now() - uploadStartedAt);
           allCreatedTiles.push(widget);
           createdTiles++;
           completedParts++;
@@ -1308,16 +1302,17 @@ async function handleStitchSubmit(event) {
           part.status = "failed";
           part.error = getUploadErrorDetails(error);
           throw error;
-        } finally { updateUploadReport(); }
+        } finally {
+          part.elapsedMs = Math.round(performance.now() - uploadStartedAt);
+          updateUploadReport();
+        }
       };
       try {
+        let parts;
         if (full && window.LosslessUpload.fits(file.size, file.type || "application/octet-stream")) {
-          const url = await readOriginalDataUrl(file);
-          report.payloadCharacters = url.length;
-          await uploadPart(url, { x: 0, y: 0, width, height }, 0, 1, file.size);
+          parts = [{ x: 0, y: 0, width, height, blob: file }];
         } else {
           report.mode = "lossless-png";
-          let parts;
           if (useHugeWorker) {
             const rendered = await hugeManager.renderTile(file, job.sx, job.sy, width, height);
             const png = await rgbaBufferToPngBlob(rendered.buffer, width, height);
@@ -1345,46 +1340,68 @@ async function handleStitchSubmit(event) {
                 },
               });
           }
-          plannedParts = parts.length;
-          totalTiles += plannedParts - 1;
-          report.partCount = plannedParts;
-          for (let i = 0; i < parts.length; i++) {
-            const part = parts[i];
-            const size = part.blob.size;
-            const url = await readOriginalDataUrl(part.blob);
-            part.blob = null; // Release PNG bytes once its Base64 payload exists.
-            await uploadPart(url, part, i, plannedParts, size);
-          }
         }
-        report.status = "created";
-      } catch (error) {
-        report.status = completedParts ? "partial" : "failed";
-        report.error = getUploadErrorDetails(error);
-        report.createdParts = completedParts;
-        // Leave successfully created parts visible; no silent retry/duplicate.
-        const remaining = plannedParts - completedParts;
-        settledTiles += remaining;
-        skippedTiles += remaining;
-        recordFailedSourceFile(fileName, "upload-failed", report.error);
-        if (useHugeWorker) await markHugeFileFailed(file, error, job);
-        setProgress(settledTiles, totalTiles, "Uploading to board…");
-      } finally {
-        job.__settled = true;
-        report.elapsedMs = Math.round(performance.now() - startedAt);
+        report.preparationMs = Math.round(performance.now() - startedAt);
+        plannedParts = parts.length;
+        totalTiles += plannedParts - 1;
+        report.partCount = plannedParts;
+        report.status = "queued";
         updateUploadReport();
+        for (let i = 0; i < parts.length; i++) {
+          const part = parts[i];
+          const waitingAt = performance.now();
+          const { done } = await uploadQueue.enqueue(async () => {
+            // Already-running requests must finish; do not retry or duplicate them.
+            // Stop parts not yet started after a failure in this source region.
+            if (firstError) { part.blob = null; return; }
+            try {
+              const blob = part.blob;
+              const size = blob.size;
+              part.blob = null;
+              const dataUrlStartedAt = performance.now();
+              const url = await readOriginalDataUrl(blob);
+              const dataUrlMs = Math.round(performance.now() - dataUrlStartedAt);
+              if (report.mode === "original") report.payloadCharacters = url.length;
+              // Another request can fail while FileReader is working.
+              if (!firstError) await uploadPart(url, part, i, plannedParts, size, dataUrlMs);
+            } catch (error) { firstError = firstError || error; }
+          });
+          report.queueWaitMs += performance.now() - waitingAt;
+          uploads.push(done);
+        }
+      } catch (error) {
+        firstError = firstError || error;
+        report.preparationMs = Math.round(performance.now() - startedAt);
+        if (useHugeWorker) await markHugeFileFailed(file, error, job);
+      } finally {
+        // No decoding is needed during network upload. Release source pixels
+        // before preparing the next file; only encoded parts stay in flight.
         await releaseImageIfDone(file, useHugeWorker);
+        jobCompletions.push(Promise.all(uploads).then(() => {
+          if (firstError) {
+            report.status = completedParts ? "partial" : "failed";
+            report.error = getUploadErrorDetails(firstError);
+            report.createdParts = completedParts;
+            const remaining = plannedParts - completedParts;
+            settledTiles += remaining;
+            skippedTiles += remaining;
+            recordFailedSourceFile(fileName, "upload-failed", report.error);
+          } else report.status = "created";
+          report.parts.sort((a, b) => a.part - b.part);
+          report.queueWaitMs = Math.round(report.queueWaitMs);
+          report.elapsedMs = Math.round(performance.now() - startedAt);
+          job.__settled = true;
+          updateUploadReport();
+          setProgress(settledTiles, totalTiles, "Uploading to board…");
+        }));
       }
     };
 
-    const regularTileJobs = tileJobs.filter((job) => !(job.info && job.info.useHugeWorker));
-    const hugeTileJobs = tileJobs.filter((job) => !!(job.info && job.info.useHugeWorker));
-
-    if (regularTileJobs.length) {
-      await runWithConcurrency(regularTileJobs, async (job) => processOneJob(job), UPLOAD_CONCURRENCY_NORMAL);
-    }
-    if (hugeTileJobs.length) {
-      await runWithConcurrency(hugeTileJobs, async (job) => processOneJob(job), UPLOAD_CONCURRENCY_HUGE);
-    }
+    // Prepare a single source region ahead while up to four parts are uploading.
+    // Admission backpressure prevents retaining PNG/Base64 for the whole batch.
+    for (const job of tileJobs) await processOneJob(job);
+    await uploadQueue.drain();
+    await Promise.all(jobCompletions);
 
     setProgress(totalTiles, totalTiles, "Uploading to board…");
     setEtaText(null);
