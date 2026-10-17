@@ -1,16 +1,17 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>Streaming import browser checks · 60</title>
+<title>Streaming import browser checks · 61</title>
 <style>body{font:16px system-ui;margin:32px;max-width:1000px}pre{white-space:pre-wrap;padding:16px;background:#f3f4f6}button{padding:10px 16px}</style>
-<h1>Streaming import browser checks · 60</h1>
+<h1>Streaming import browser checks · 61</h1>
 <p>Local synthetic images only. No Miro uploads or network requests for images.</p>
 <button id="run">Run pixel and color checks</button>
 <pre id="result">Ready</pre>
-<script src="../lossless-upload.js?v=60"></script>
-<script src="../jpeg-lossless.js?v=60"></script>
+<script src="../lossless-upload.js?v=61"></script>
+<script src="../jpeg-lossless.js?v=61"></script>
 <script src="../fast-image-scan.js?v=56"></script>
-<script src="../tile-preparation.js?v=60"></script>
-<script src="../import-engine.js?v=60"></script>
+<script src="../tile-preparation.js?v=61"></script>
+<script src="../import-engine.js?v=61"></script>
+<script src="./large-jpeg-fixture.js?v=61"></script>
 <script>
 const L=window.LosslessUpload;
 const result=document.getElementById('result');
@@ -67,7 +68,7 @@ async function smallColorTest(space,type) {
     assert(JSON.stringify(restoredColors.chunks)===JSON.stringify(source.colors.chunks),'Source color metadata changed');
   }
   if(type==='image/jpeg'){
-    const client=JpegLossless.create({workerUrl:'../jpeg-lossless-worker.js?v=60'});
+    const client=JpegLossless.create({workerUrl:'../jpeg-lossless-worker.js?v=61'});
     try{
       const meta=await client.open(file);
       if(meta.eligible){
@@ -110,7 +111,7 @@ async function fixtureTest(){
   const bytes=Uint8Array.from(atob(base64),c=>c.charCodeAt(0)),file=new Blob([bytes],{type:'image/jpeg'}),meta=JpegLossless.info(bytes);
   if(name==='orientation6'){assert(!meta.eligible,'Unsupported EXIF transform was allowed');log('PASS EXIF rotation: explicit unsupported-crop error, never PNG conversion');continue;}
   assert(meta.eligible,`JPEG ${name} coefficient cropping disabled`);let maxDifference=0,changedPixels=0;
-  const source=await pixels(file),managed=await pixels(file,'default'),client=JpegLossless.create({workerUrl:'../jpeg-lossless-worker.js?v=60'});
+  const source=await pixels(file),managed=await pixels(file,'default'),client=JpegLossless.create({workerUrl:'../jpeg-lossless-worker.js?v=61'});
   try{await client.open(file);for(const n of [2,4,8])for(const rect of L.dyadicRegions(meta.width,meta.height,n,JpegLossless.cropAlignment(meta))){
     const part=await client.crop(rect);assert(part.type==='image/jpeg','JPEG converted to another format');
     const raw=compareJpegRegion(source,await pixels(part),meta.width,rect,meta);compareJpegRegion(managed,await pixels(part,'default'),meta.width,rect,meta);
@@ -121,7 +122,7 @@ async function fixtureTest(){
 }
 async function preparationAndRecoveryTest(){
  const fixtures=await(await fetch('./jpeg-fixtures.json')).json(),files=['444','420'].map((type,i)=>new File([Uint8Array.from(atob(fixtures[type]),c=>c.charCodeAt(0))],`Tile_${i+1}.jpg`,{type:'image/jpeg'}));
- const clients=[TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=60'}),TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=60'})];
+ const clients=[TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=61'}),TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=61'})];
  try{
   await Promise.all(files.map(async(file,i)=>{
    const info=await FastImageScan.scan(file),expected=await pixels(file);
@@ -141,7 +142,7 @@ async function preparationAndRecoveryTest(){
    const item={...params,id:String(calls),setMetadata:async()=>{}};images.set(item.id,item);
    if(calls===2)throw Error('Synthetic lost reply');return item;},
   get:async()=>[...images.values()],group:async({items})=>{groups++;items.forEach(i=>i.groupId='g'+groups);return {id:'g'+groups};}};
- const imported=await ImportEngine.run({files,board,scan:FastImageScan.scan,createPreparer:()=>TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=60'}),
+ const imported=await ImportEngine.run({files,board,scan:FastImageScan.scan,createPreparer:()=>TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=61'}),
   layout:async sources=>{for(const s of sources)s.jobs=L.dyadicRegions(s.info.width,s.info.height,4).map(r=>({kind:'tile',sx:r.x,sy:r.y,sw:r.width,sh:r.height,x:r.x+r.width/2,y:r.y+r.height/2}));},
   options:{rateLimit:false,retryDelayMs:0,readDataUrl:blob=>new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=()=>reject(r.error);r.readAsDataURL(blob);})}});
  assert(imported.success,'Recovery did not finish');assert(imported.verified===8&&calls===9&&images.size===8&&groups===2,'Missing-part recovery or duplicate protection failed');
@@ -159,7 +160,7 @@ async function immediateGroupTest(){
   },get:async()=>[...images.values()],group:async({items})=>{
    groups++;items.forEach(i=>i.groupId='g'+groups);if(groups===1)firstGroup();return {id:'g'+groups};
   }};
- const run=ImportEngine.run({files,board,scan:FastImageScan.scan,createPreparer:()=>TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=60'}),
+ const run=ImportEngine.run({files,board,scan:FastImageScan.scan,createPreparer:()=>TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=61'}),
   layout:async sources=>{for(const s of sources)s.jobs=L.dyadicRegions(s.info.width,s.info.height,4).map(r=>({kind:'tile',sx:r.x,sy:r.y,sw:r.width,sh:r.height,x:r.x+r.width/2,y:r.y+r.height/2}));},
   options:{workers:2,rateLimit:false,retryDelayMs:0,readDataUrl:blob=>new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=()=>reject(r.error);r.readAsDataURL(blob);})}});
  try{
@@ -177,7 +178,7 @@ async function largeTest(){
  const ctx=c.getContext('2d',{colorSpace:'srgb'}),data=ctx.createImageData(c.width,c.height);
  let seed=123456789;
  for(let i=0;i<data.data.length;i+=4){seed^=seed<<13;seed^=seed>>>17;seed^=seed<<5;data.data[i]=seed&255;data.data[i+1]=(seed>>>8)&255;data.data[i+2]=(seed>>>16)&255;data.data[i+3]=255;}
- ctx.putImageData(data,0,0);const file=await blobOf(c),client=TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=60'});
+ ctx.putImageData(data,0,0);const file=await blobOf(c),client=TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=61'});
  log(`4096×4096 source PNG: ${file.size} bytes; checking worker candidate layouts…`);
  try{
   const info=await FastImageScan.scan(file),prepared=await client.prepare(file,info,[{kind:'full',width:4096,height:4096}]),region=prepared.regions[0];
@@ -185,9 +186,35 @@ async function largeTest(){
   log(`PASS 4096×4096 in background worker: tried ${region.attempts.join(' → ')}, selected ${region.parts.length}; all pixels identical`);
  }finally{client.dispose();c.width=c.height=1;}
 }
+async function largeDimensionsTest(){
+ for(const [width,height,count] of [[16384,16384,8],[32768,4096,4]]){
+  const file=new File([LargeJpegFixture.jpeg(width,height)],`Large_${width}x${height}.jpg`,{type:'image/jpeg'}),info=await FastImageScan.scan(file);
+  const client=TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=61'}),started=performance.now();
+  log(`Checking native JPEG ${width}×${height}; coefficient buffer ${Math.round(info.jpeg.coefficientBytes/1024**2)} MiB…`);
+  try{
+   const prepared=await client.prepare(file,info,[{kind:'full',width,height}]),region=prepared.regions[0];
+   assert(region.mode==='lossless-jpeg'&&region.parts.length===count,'Large image used a different cutting path');
+   let area=0;
+   for(const p of region.parts){
+    assert(p.blob.type==='image/jpeg'&&L.fits(p.blob.size,'image/jpeg')&&L.dimensionsFit(p.width,p.height),'Large JPEG part exceeds limits');
+    const decoded=await pixels(p.blob);assert(decoded.length===p.width*p.height*4,'Large crop dimensions changed');
+    for(let i=0;i<decoded.length;i+=4096)assert(decoded[i]===128&&decoded[i+1]===128&&decoded[i+2]===128&&decoded[i+3]===255,'Large crop pixels changed');
+    area+=p.width*p.height;
+   }
+   assert(area===width*height,'Large image pixels were dropped');
+   log(`PASS native JPEG ${width}×${height}: ${count} JPEG parts, full resolution, ${Math.round(performance.now()-started)} ms`);
+  }finally{client.dispose();}
+ }
+ const file=new File([LargeJpegFixture.jpeg(32768,32768)],'Square_32K.jpg',{type:'image/jpeg'}),info=await FastImageScan.scan(file);
+ const client=TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=61'});let refused=false;
+ try{await client.prepare(file,info,[{kind:'full',width:info.width,height:info.height}]);}catch(e){refused=/2 GiB/.test(e.message);}
+ finally{client.dispose();}
+ assert(refused,'Square 32K image did not fail before oversized workspace allocation');
+ log('PASS square 32768×32768: clear 2 GiB workspace error before thumbnail decoding, no resize or PNG conversion');
+}
 document.getElementById('run').onclick=async()=>{
   document.getElementById('run').disabled=true;lines.length=0;log('Running…');
-  try{await immediateGroupTest();await preparationAndRecoveryTest();await fixtureTest();for(const space of ['srgb','display-p3'])for(const type of ['image/jpeg','image/png'])await smallColorTest(space,type);await largeTest();log('ALL CHECKS PASSED');}
+  try{await immediateGroupTest();await preparationAndRecoveryTest();await fixtureTest();for(const space of ['srgb','display-p3'])for(const type of ['image/jpeg','image/png'])await smallColorTest(space,type);await largeDimensionsTest();await largeTest();log('ALL CHECKS PASSED');}
   catch(e){log('FAILED: '+e.message);console.error(e);}
   finally{document.getElementById('run').disabled=false;}
 };

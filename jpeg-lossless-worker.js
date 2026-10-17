@@ -1,5 +1,5 @@
 'use strict';
-importScripts('./lossless-upload.js?v=60','./jpeg-lossless.js?v=60');
+importScripts('./lossless-upload.js?v=61','./jpeg-lossless.js?v=61');
 let runtime,inputPtr=0,inputSize=0,sourceInfo,profile;
 function load(){
   if(runtime)return runtime;
@@ -16,6 +16,7 @@ self.onmessage=async e=>{
   if(msg.type==='open'){
     await close();const bytes=new Uint8Array(msg.buffer);sourceInfo=JpegLossless.info(bytes);
     if(!sourceInfo.eligible)throw Error(sourceInfo.reason);
+    JpegLossless.assertWorkspace(sourceInfo,bytes.length);
     profile=LosslessUpload.jpegProfile(bytes);const m=await load();inputSize=bytes.length;inputPtr=m._malloc(inputSize);
     if(!inputPtr)throw Error('Not enough memory for JPEG source');m.HEAPU8.set(bytes,inputPtr);
     self.postMessage({req:msg.req});return;

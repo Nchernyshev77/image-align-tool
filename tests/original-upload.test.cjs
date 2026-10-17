@@ -73,3 +73,9 @@ test('18MB image above pixel limits uses two legal parts instead of silently upl
  assert.equal(app.result.success,true);assert.equal(app.calls.length,2);assert.equal(app.groups[0].length,2);
  for(const call of app.calls)assert.equal(call.width,8192);
 });
+
+test('32K-wide source uses the same full-image binary planner, with no forced 2048 grid',async()=>{
+ const app=setup([{...fixture('Tile_1.jpg',18000000),width:32768,height:4096}],{parts:4});await app.run();
+ assert.equal(app.result.success,true);assert.equal(app.calls.length,4);assert.equal(app.groups.length,1);assert.equal(app.groups[0].length,4);
+ assert.ok(app.calls.every(p=>p.width===8192));
+});

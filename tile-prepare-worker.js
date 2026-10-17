@@ -1,5 +1,5 @@
 'use strict';
-importScripts('./lossless-upload.js?v=60','./jpeg-lossless.js?v=60');
+importScripts('./lossless-upload.js?v=61','./jpeg-lossless.js?v=61');
 const jpeg=JpegLossless.create();
 async function tone(file){
  const image=await createImageBitmap(file,{resizeWidth:50,resizeHeight:50});
@@ -20,17 +20,18 @@ async function tone(file){
 }
 self.onmessage=async e=>{
  const {req,file,info,jobs}=e.data;let source,meta,jpegOpened=false;const regions=[];let response;
- const started=performance.now(),timings={toneMs:0,encodeMs:0,probes:0};
+ const timings={toneMs:0,encodeMs:0,probes:0};
  try{
-  const colors=await tone(file);
-  timings.toneMs=performance.now()-started;
   const needsTransform=jobs.some(j=>j.kind!=='full'||!LosslessUpload.fits(file.size,file.type||'application/octet-stream')||!LosslessUpload.dimensionsFit(j.width,j.height));
   const isJpeg=!!info.jpeg||/image\/jpe?g/i.test(file.type)||(!file.type&&/\.(jpe?g|jfif)$/i.test(file.name||''));
   if(needsTransform&&isJpeg){
    meta=info.jpeg;if(!meta){meta=await jpeg.open(file);jpegOpened=meta.eligible;}
    if(!meta.eligible)throw Error(meta.reason||'Unsupported JPEG slicing; no PNG conversion is used');
    if(meta.width!==info.width||meta.height!==info.height)throw Error('JPEG dimensions differ; refusing to resize or convert');
+   JpegLossless.assertWorkspace(meta,file.size);
   }
+  const toneStarted=performance.now(),colors=await tone(file);
+  timings.toneMs=performance.now()-toneStarted;
   for(const job of jobs){
    const full=job.kind==='full',width=full?job.width:job.sw,height=full?job.height:job.sh;
    const sourceX=full?0:job.sx,sourceY=full?0:job.sy;

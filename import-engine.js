@@ -14,6 +14,8 @@
  }
  function preparationWorkers(sources,device=root.navigator||{}){
   const cores=Number(device.hardwareConcurrency)||4,memory=Number(device.deviceMemory)||0;
+  const largestWorkingSet=Math.max(0,...sources.map(s=>s.info?.jpeg?.coefficientBytes??(s.info?s.info.width*s.info.height*4:0)));
+  if(largestWorkingSet>=512*1024*1024)return 1;
   const large=sources.some(s=>s.info&&s.info.width*s.info.height*4>256*1024*1024);
   return Math.max(1,Math.min(sources.length||1,large||(memory&&memory<=4)?2:Math.max(2,Math.min(4,Math.floor(cores/2)))));
  }

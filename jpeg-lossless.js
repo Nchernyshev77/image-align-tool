@@ -1,6 +1,7 @@
 // JPEG coefficient cropping client. All image processing stays on this device.
 (function(root){
   'use strict';
+  const HEAP_BYTES=2147483648,WORKSPACE_HEADROOM=256*1024*1024;
   function info(bytes){
     if(bytes[0]!==255||bytes[1]!==216)throw Error('Invalid JPEG');
     let result,orientation=1;
@@ -15,7 +16,9 @@
         const count=d[5];if(d[0]!==8||![1,3].includes(count)||d.length<6+3*count)throw Error('Unsupported JPEG precision/components');
         const h=[],v=[];for(let i=0;i<count;i++){h.push(d[7+3*i]>>4);v.push(d[7+3*i]&15);}
         if([...h,...v].some(x=>x<1||x>4))throw Error('Invalid JPEG sampling');
-        result={width:(d[3]<<8)|d[4],height:(d[1]<<8)|d[2],mcuX:8*Math.max(...h),mcuY:8*Math.max(...v),
+        const width=(d[3]<<8)|d[4],height=(d[1]<<8)|d[2],maxH=Math.max(...h),maxV=Math.max(...v);
+        const coefficientBytes=h.reduce((sum,value,i)=>sum+Math.ceil(width*value/(maxH*8))*Math.ceil(height*v[i]/(maxV*8))*128,0);
+        result={width,height,coefficientBytes,mcuX:8*maxH,mcuY:8*maxV,
           safeX:h.every(x=>x===h[0]),safeY:v.every(x=>x===v[0])};
       }
       if(marker===0xe1&&d.length>=14&&String.fromCharCode(...d.subarray(0,6))==='Exif\0\0'){
@@ -40,7 +43,13 @@
     return {mcuX:meta.mcuX,mcuY:meta.mcuY,safeX:true,safeY:true,
       preferredAxis:!meta.safeX&&meta.safeY?'y':meta.safeX&&!meta.safeY?'x':null};
   }
-  function create({workerUrl='./jpeg-lossless-worker.js?v=60'}={}){
+  function workspaceBytes(meta,fileBytes=0){return (meta.coefficientBytes??meta.width*meta.height*6)+fileBytes+WORKSPACE_HEADROOM;}
+  function assertWorkspace(meta,fileBytes=0){
+    const bytes=workspaceBytes(meta,fileBytes);
+    if(bytes>HEAP_BYTES)throw Error(`Estimated workspace for JPEG ${meta.width}×${meta.height} exceeds the current 2 GiB processing limit; resolution was not reduced`);
+    return bytes;
+  }
+  function create({workerUrl='./jpeg-lossless-worker.js?v=61'}={}){
     let worker,req=0;const pending=new Map();
     function call(message,transfer=[]){
       if(!worker){worker=new Worker(workerUrl);
@@ -50,11 +59,12 @@
     }
     return {
       async open(file){const buffer=await file.arrayBuffer();const meta=info(new Uint8Array(buffer));
+        assertWorkspace(meta,buffer.byteLength);
         if(meta.eligible)await call({type:'open',buffer},[buffer]);return meta;},
       async crop(rect){const result=await call({type:'crop',rect});return new Blob([result.buffer],{type:'image/jpeg'});},
       async close(){if(worker)await call({type:'close'});},
       dispose(){if(worker)worker.terminate();worker=null;for(const p of pending.values())p.reject(Error('JPEG worker disposed'));pending.clear();},
     };
   }
-  root.JpegLossless={info,create,cropAlignment};
+  root.JpegLossless={info,create,cropAlignment,workspaceBytes,assertWorkspace,HEAP_BYTES};
 })(typeof window==='undefined'?globalThis:window);

@@ -61,3 +61,16 @@ test('4:2:2 prefers exact horizontal seams but can cut across chroma when pixel 
  const forced=L.dyadicRegions(16384,4096,2,{...alignment,maxWidth:8192,maxHeight:4096});
  assert.ok(forced.every(r=>r.width===8192&&r.height===4096));
 });
+
+test('workspace preflight distinguishes 16K, wide 32K and square 32K without allocating image coefficients',async()=>{
+ const {jpeg}=require('./large-jpeg-fixture');
+ for(const sampling of ['420','444']){
+  const bytes=jpeg(16384,16384,sampling),meta=J.info(bytes);
+  assert.equal(meta.coefficientBytes,16384*16384*(sampling==='420'?3:6));
+  assert.ok(J.assertWorkspace(meta,bytes.length)<=J.HEAP_BYTES);
+ }
+ const strip=jpeg(32768,4096),stripMeta=J.info(strip);assert.ok(J.assertWorkspace(stripMeta,strip.length)<J.HEAP_BYTES);
+ const square=jpeg(32768,32768),squareMeta=J.info(square);assert.equal(squareMeta.coefficientBytes,3*1024**3);
+ assert.throws(()=>J.assertWorkspace(squareMeta,square.length),/2 GiB/);
+ const worker=workerHarness();await assert.rejects(worker.call({type:'open',buffer:square.buffer}),/2 GiB/);
+});

@@ -160,7 +160,8 @@ test('worker selection respects CPU, low memory, large images and batch size',()
  assert.equal(E.preparationWorkers(sources,{hardwareConcurrency:16,deviceMemory:4}),2);
  assert.equal(E.preparationWorkers(sources,{hardwareConcurrency:4}),2);
  assert.equal(E.preparationWorkers(sources.slice(0,1),{hardwareConcurrency:16,deviceMemory:8}),1);
- assert.equal(E.preparationWorkers([{info:{width:20000,height:20000}},...sources],{hardwareConcurrency:16,deviceMemory:8}),2);
+ assert.equal(E.preparationWorkers([{info:{width:20000,height:20000}},...sources],{hardwareConcurrency:16,deviceMemory:8}),1);
+ assert.equal(E.preparationWorkers([{info:{width:16384,height:16384,jpeg:{coefficientBytes:805306368}}},...sources],{hardwareConcurrency:16,deviceMemory:8}),1);
 });
 
 test('summary includes per-stage timings without storing image data',async()=>{

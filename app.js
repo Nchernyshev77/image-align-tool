@@ -1,13 +1,11 @@
 // app.js
-// Test 60: adaptive preparation, independent metadata and immediate source groups.
+// Test 61: unified binary slicing, workspace preflight and immediate source groups.
 const { board } = window.miro;
 
 // ---- color / slice settings ----
 const SAT_CODE_MAX = 99;
 const SAT_BOOST = 4.0;
 const SAT_GROUP_THRESHOLD = 35;
-const SLICE_TILE_SIZE = 4096;
-const HUGE_SLICE_TILE_SIZE = 2048;
 let MAX_SLICE_DIM = 16384;
 const MAX_URL_BYTES = window.LosslessUpload.URL_LIMIT;
 const CREATE_IMAGE_MAX_RETRIES = 5;
@@ -18,8 +16,6 @@ const PART_CONCURRENCY_PER_SOURCE = 8;
 const META_APP_ID = "image-align-tool";
 const MAX_NOTIFICATION_MESSAGE_LENGTH = 80;
 const LARGE_IMAGE_DIMENSION_WARNING = 16384;
-const LARGE_IMAGE_WORKER_MIN_DIM = 24000;
-const LARGE_IMAGE_WORKER_MIN_TILES = 36;
 const TOO_LARGE_IMPORT_MESSAGE = "Image is too large for this browser";
 const HUGE_INIT_FAILURE_MESSAGE = "Huge mode init failed";
 const FAILURE_UI_COLOR = "#c62828";
@@ -739,15 +735,10 @@ async function handleStitchSubmit(event) {
       const fallback=sources.find(s=>s.info)?.info||{width:4096,height:4096};
       const infos=sources.map(source=>{
         const info=source.info||fallback,width=info.width,height=info.height;
-        const baseTiles=Math.ceil(width/SLICE_TILE_SIZE)*Math.ceil(height/SLICE_TILE_SIZE);
-        const huge=width>LARGE_IMAGE_WORKER_MIN_DIM||height>LARGE_IMAGE_WORKER_MIN_DIM||baseTiles>=LARGE_IMAGE_WORKER_MIN_TILES;
-        // Ordinary files use the worker's minimal 2/4/8 plan for both byte and
-        // pixel limits. The old fixed 4096 grid caused avoidable extra pieces.
-        const needsSlice=huge;
-        return {...info,file:source.file,width,height,needsSlice,sliceTileSize:huge?HUGE_SLICE_TILE_SIZE:SLICE_TILE_SIZE};
+        return {...info,file:source.file,width,height};
       });
       let centers,centerMap;
-      if(skipMissing&&!infos.some(info=>info.needsSlice)&&infos.some(info=>extractTrailingNumber(info.file.name||'')!==null)){
+      if(skipMissing&&infos.some(info=>extractTrailingNumber(info.file.name||'')!==null)){
         let next=Math.max(...infos.map(info=>extractTrailingNumber(info.file.name||'')||0));
         const numbered=infos.map(info=>({info,num:extractTrailingNumber(info.file.name||'')??++next}));
         centerMap=computeSkipMissingSlotCenters(numbered,imagesPerRow,startCorner,viewCenterX,viewCenterY);
@@ -755,14 +746,7 @@ async function handleStitchSubmit(event) {
       for(let i=0;i<sources.length;i++){
         const source=sources[i],info=infos[i],center=centerMap?centerMap.get(source.file):centers[i];
         if(!source.info){source.jobs=[];continue;}
-        if(!info.needsSlice){source.jobs=[{kind:'full',width:info.width,height:info.height,x:center.x,y:center.y}];continue;}
-        const jobs=[],size=info.sliceTileSize,left=center.x-info.width/2,top=center.y-info.height/2;
-        let index=0;const match=source.name.match(/^(.*?)(\.[^.]*$|$)/),base=match?match[1]:source.name,ext=match?match[2]:'';
-        for(let sy=0;sy<info.height;sy+=size)for(let sx=0;sx<info.width;sx+=size){
-          const sw=Math.min(size,info.width-sx),sh=Math.min(size,info.height-sy);index++;
-          jobs.push({kind:'tile',sx,sy,sw,sh,x:left+sx+sw/2,y:top+sy+sh/2,tileIndex:index,titleName:`${base}_${String(index).padStart(2,'0')}${ext}`});
-        }
-        source.jobs=jobs;
+        source.jobs=[{kind:'full',width:info.width,height:info.height,x:center.x,y:center.y}];
       }
     };
     const onProgress=state=>{
@@ -778,7 +762,7 @@ async function handleStitchSubmit(event) {
     const result=await window.ImportEngine.run({files,board,scan:window.FastImageScan.scan,layout,
       createPreparer:()=>window.TilePreparation.create(),onProgress,options:{readDataUrl:readOriginalDataUrl}});
     const elapsedMs=showElapsed();
-    window.ImageAlignLastImport={version:60,elapsedMs,workers:result.workers,timings:result.timings,success:result.success,verified:result.verified,totalParts:result.totalParts,passes:result.passes,
+    window.ImageAlignLastImport={version:61,elapsedMs,workers:result.workers,timings:result.timings,success:result.success,verified:result.verified,totalParts:result.totalParts,passes:result.passes,
       failures:result.failures,groupErrors:result.groupErrors,boardError:result.boardError,duplicates:result.duplicates,
       sources:result.sources.map(s=>({fileName:s.name,fileBytes:s.file.size,width:s.info?.width,height:s.info?.height,
         modes:[...new Set(s.parts.map(p=>p.region.mode))],parts:s.parts.length,pngReasons:[...new Set(s.parts.map(p=>p.region.reason).filter(Boolean))]}))};
