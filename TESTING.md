@@ -1,6 +1,14 @@
-# Verified streaming import — version 62
+# Verified streaming import — version 63
 
 Test branch: `test/original-upload-52`. Main and the Pages source branch are unchanged.
+
+## Version 63: real-file preparation fix
+
+JPEG coefficient arrays are now read once per source by `open_jpeg`, reused by every `crop_jpeg`, and destroyed by `close_jpeg`. The compressed input allocation is released after coefficient loading. This removes whole-source entropy decoding from each size probe. Crops still copy native quantized coefficients and preserve quantization tables, sampling and ICC; no pixel encoder or quality setting is involved.
+
+If EXIF IFD1 contains a valid embedded JPEG thumbnail, only that small thumbnail is decoded for tone and complexity analysis. The original image data used for uploads never passes through that preview. Missing or unreadable embedded thumbnails keep the existing image-preview fallback. Preparation reports preview, coefficient reading, and per-plan completed-part progress. Progress events do not resolve a preparation request before its result. Large-file timeout errors include the stage and version.
+
+Real-source timing and pixel-comparison reports remain local. Public checks use synthetic fixtures only. A square 32768×32768 4:4:4 image requires 6 GiB of coefficient storage, exceeding this wasm32 module's 4 GiB ceiling. Increasing crop count cannot remove that whole-source allocation. Supporting such sources requires a different memory/storage implementation; no resolution reduction is performed.
 
 ## Interface
 
@@ -34,7 +42,7 @@ Documented Web SDK limits are 100,000 credits/minute and 1,000,000/hour. Creatin
 
 ## Source dimensions and workspace
 
-The JPEG runtime is rebuilt from pinned libjpeg-turbo 3.2.0 with Emscripten 4.0.21, `MAXIMUM_MEMORY=4GB`, memory growth, and unsigned pointer handling. The declared WASM maximum is 65536 pages; the application uses the same one-page-below-4-GiB usable heap maximum as Emscripten. Only the coefficient-domain crop entry point is included; the old downscale/recompression branch is removed. `codec/build.sh` and `.github/workflows/build-jpeg.yml` reproduce the binary. The workflow tests generated files before committing them to the existing test branch.
+The JPEG runtime is rebuilt from pinned libjpeg-turbo 3.2.0 with Emscripten 4.0.21, `MAXIMUM_MEMORY=4GB`, memory growth, and unsigned pointer handling. The declared WASM maximum is 65536 pages; the application uses the same one-page-below-4-GiB usable heap maximum as Emscripten. Only coefficient-domain open/crop/close operations and a compatibility crop entry point are included; the old downscale/recompression branch is removed. `codec/build.sh` and `.github/workflows/build-jpeg.yml` reproduce the binary. The workflow tests generated files before committing them to the existing test branch.
 
 Scanning computes native coefficient-buffer sizes from component sampling factors and block counts. Before thumbnail decoding or cropping, estimated workspace (source coefficients + source file bytes + 512 MiB headroom) is checked. Crop-buffer estimates are conservative, and actual browser memory availability can still be lower. A source above the estimate fails without resizing or PNG conversion. More pieces do not reduce the native library's whole-source coefficient allocation. Large JPEG sources still use one preparation lane; preparation has a ten-minute deadline for working sets of at least 512 MiB, while ordinary tiles keep two minutes. Closing a large source terminates its native worker so a grown WASM heap is released before the next source. Small sources reuse their native runtime.
 
@@ -42,7 +50,7 @@ Scanning computes native coefficient-buffer sizes from component sampling factor
 
 ## Quality and rollback
 
-The vendored JPEG coefficient transform, MCU alignment, all supported chroma sampling modes, ICC preservation, PNG precision restrictions, native resolution, reversed corners and missing source slots remain covered. No upload uses JPEG quality re-encoding or pixel resizing. JPEG crops copy quantized coefficients with scale hardcoded to 1 and preserve ICC bytes. Cropping 4:2:0, or cropping 4:2:2 across its subsampled axis, can change decoded RGB pixels in a narrow strip at new boundaries because chroma upsampling loses neighboring context. This mode intentionally accepts those edge differences instead of converting JPEG to PNG. Unsupported sliced JPEGs (including EXIF orientation transforms) fail explicitly rather than converting; fitting originals still upload unchanged. PNG input handling is unchanged.
+The vendored JPEG coefficient transform, MCU alignment, all supported chroma sampling modes, ICC preservation, PNG precision restrictions, native resolution, reversed corners and missing source slots remain covered. No upload uses JPEG quality re-encoding or pixel resizing. JPEG crops copy quantized coefficients without pixel recompression and preserve ICC bytes. Cropping 4:2:0, or cropping 4:2:2 across its subsampled axis, can change decoded RGB pixels in a narrow strip at new boundaries because chroma upsampling loses neighboring context. This mode intentionally accepts those edge differences instead of converting JPEG to PNG. Unsupported sliced JPEGs (including EXIF orientation transforms) fail explicitly rather than converting; fitting originals still upload unchanged. PNG input handling is unchanged.
 
 The final internal summary also records each filename, original bytes, scanned dimensions, selected formats and part count to explain slicing without exposing image content.
 

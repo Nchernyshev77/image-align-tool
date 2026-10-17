@@ -50,9 +50,45 @@ test('production JPEG worker runs vendored WASM, keeps dimensions/ICC, and rejec
    assert.deepEqual(L.jpegProfile(out),profile);
   }
   await assert.rejects(worker.call({type:'crop',rect:{x:1,y:0,width:32,height:32}}),/MCU/);
+  const rect={x:0,y:0,width:32,height:32};
+  const before=await worker.call({type:'crop',rect});
+  await worker.call({type:'crop',rect:{x:32,y:32,width:32,height:32}});
+  const after=await worker.call({type:'crop',rect});
+  assert.deepEqual(new Uint8Array(after.buffer),new Uint8Array(before.buffer),'Cached coefficients must survive other crops and rejected boundaries');
   await worker.call({type:'close'});
  }
  await assert.rejects(worker.call({type:'crop',rect:{x:0,y:0,width:32,height:32}}),/not open/);
+});
+
+test('EXIF thumbnail offsets address the original bytes and malformed optional thumbnails are ignored',()=>{
+ const original=Buffer.from(fixtures['444'],'base64'),preview=Buffer.from(fixtures['420'],'base64');
+ for(const le of [true,false]){
+  const tiff=new Uint8Array(44+preview.length),view=new DataView(tiff.buffer);
+  tiff.set(le?[73,73]:[77,77]);view.setUint16(2,42,le);view.setUint32(4,8,le);
+  view.setUint16(8,0,le);view.setUint32(10,14,le);view.setUint16(14,2,le);
+  for(const [at,tag,value] of [[16,0x201,44],[28,0x202,preview.length]]){
+   view.setUint16(at,tag,le);view.setUint16(at+2,4,le);view.setUint32(at+4,1,le);view.setUint32(at+8,value,le);
+  }
+  tiff.set(preview,44);
+  const segment=Buffer.concat([Buffer.from([255,225,0,0]),Buffer.from('Exif\0\0'),tiff]);segment.writeUInt16BE(segment.length-2,2);
+  const bytes=Buffer.concat([original.subarray(0,2),segment,original.subarray(2)]),thumb=J.info(bytes).thumbnail;
+  assert.equal(thumb.offset,56);assert.deepEqual(bytes.subarray(thumb.offset,thumb.offset+thumb.length),preview);
+  bytes.fill(255,2+10+28+8,2+10+28+12);
+  assert.equal(J.info(bytes).thumbnail,undefined);
+ }
+});
+
+test('preparation progress does not resolve the operation before its final result',async()=>{
+ let instance;
+ class Worker{constructor(){instance=this;}postMessage(message){this.request=message;}terminate(){}}
+ const context=vm.createContext({Worker,setTimeout,clearTimeout,Error});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../tile-preparation.js'),'utf8'),context);
+ const client=context.TilePreparation.create(),stages=[];let finished=false;
+ const result=client.prepare({size:10},{width:32,height:32},[],p=>stages.push(p.stage)).then(r=>{finished=true;return r;});
+ instance.onmessage({data:{req:instance.request.req,progress:{stage:'Reading JPEG coefficients once…'}}});
+ await Promise.resolve();assert.equal(finished,false);assert.deepEqual(stages,['Reading JPEG coefficients once…']);
+ instance.onmessage({data:{req:instance.request.req,regions:[]}});
+ assert.deepEqual((await result).regions,[]);client.dispose();
 });
 
 test('4:2:2 prefers exact horizontal seams but can cut across chroma when pixel limits require it',()=>{

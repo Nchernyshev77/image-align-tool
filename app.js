@@ -1,5 +1,5 @@
 // app.js
-// Test 62: 4 GiB native JPEG workspace and large-file memory release.
+// Test 63: cached JPEG coefficients, embedded preview, preparation progress.
 const { board } = window.miro;
 
 // ---- color / slice settings ----
@@ -762,7 +762,7 @@ async function handleStitchSubmit(event) {
     const result=await window.ImportEngine.run({files,board,scan:window.FastImageScan.scan,layout,
       createPreparer:()=>window.TilePreparation.create(),onProgress,options:{readDataUrl:readOriginalDataUrl}});
     const elapsedMs=showElapsed();
-    window.ImageAlignLastImport={version:62,elapsedMs,workers:result.workers,timings:result.timings,success:result.success,verified:result.verified,totalParts:result.totalParts,passes:result.passes,
+    window.ImageAlignLastImport={version:63,elapsedMs,workers:result.workers,timings:result.timings,success:result.success,verified:result.verified,totalParts:result.totalParts,passes:result.passes,
       failures:result.failures,groupErrors:result.groupErrors,boardError:result.boardError,duplicates:result.duplicates,
       sources:result.sources.map(s=>({fileName:s.name,fileBytes:s.file.size,width:s.info?.width,height:s.info?.height,
         modes:[...new Set(s.parts.map(p=>p.region.mode))],parts:s.parts.length,pngReasons:[...new Set(s.parts.map(p=>p.region.reason).filter(Boolean))]}))};

@@ -62,7 +62,7 @@
   async function prepare(source,worker){
    if(!source.info)return false;
    try{
-    const output=await measure('prepareMs',()=>worker.prepare(source.file,source.info,source.jobs));
+    const output=await measure('prepareMs',()=>worker.prepare(source.file,source.info,source.jobs,detail=>emit({phase:"prepare",status:detail.stage})));
     if(output.timings)for(const key of ['toneMs','encodeMs','probes'])timings[key]+=output.timings[key]||0;
     if(output.regions.length!==source.jobs.length)throw Error('Prepared region count changed');
     const descriptors=[];

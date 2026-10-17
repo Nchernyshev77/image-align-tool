@@ -1,15 +1,15 @@
 'use strict';
-importScripts('./lossless-upload.js?v=62','./jpeg-lossless.js?v=62');
-let runtime,inputPtr=0,inputSize=0,sourceInfo,profile;
+importScripts('./lossless-upload.js?v=63','./jpeg-lossless.js?v=63');
+let runtime,inputPtr=0,opened=false,sourceInfo,profile;
 function load(){
   if(runtime)return runtime;
   runtime=new Promise((resolve,reject)=>{
-    self.Module={locateFile:p=>new URL('./vendor/jpegcropscale/'+p+'?v=62',self.location.href).href,
+    self.Module={locateFile:p=>new URL('./vendor/jpegcropscale/'+p+'?v=63',self.location.href).href,
       onRuntimeInitialized:()=>resolve(self.Module),onAbort:reason=>reject(Error(String(reason))),print:()=>{},printErr:()=>{}};
-    importScripts('./vendor/jpegcropscale/jpeg_worker.js?v=62');
+    importScripts('./vendor/jpegcropscale/jpeg_worker.js?v=63');
   });return runtime;
 }
-async function close(){if(inputPtr){const m=await load();m._free(inputPtr);}inputPtr=0;inputSize=0;profile=null;sourceInfo=null;}
+async function close(){if(opened||inputPtr){const m=await load();if(opened)m._close_jpeg();if(inputPtr)m._free(inputPtr);}inputPtr=0;opened=false;profile=null;sourceInfo=null;}
 self.onmessage=async e=>{
  const msg=e.data;
  try{
@@ -17,19 +17,26 @@ self.onmessage=async e=>{
     await close();const bytes=new Uint8Array(msg.buffer);sourceInfo=JpegLossless.info(bytes);
     if(!sourceInfo.eligible)throw Error(sourceInfo.reason);
     JpegLossless.assertWorkspace(sourceInfo,bytes.length);
-    profile=LosslessUpload.jpegProfile(bytes);const m=await load();inputSize=bytes.length;inputPtr=m._malloc(inputSize)>>>0;
-    if(!inputPtr)throw Error('Not enough memory for JPEG source');m.HEAPU8.set(bytes,inputPtr);
+    profile=LosslessUpload.jpegProfile(bytes);const m=await load();
+    if(!m._open_jpeg||!m._crop_jpeg)throw Error('JPEG codec version mismatch; reopen the application');
+    inputPtr=m._malloc(bytes.length)>>>0;
+    if(!inputPtr)throw Error('Not enough memory for JPEG source');
+    try{
+      m.HEAPU8.set(bytes,inputPtr);
+      if(m._open_jpeg(inputPtr,bytes.length)!==0)throw Error('Reading JPEG coefficients failed: '+m.UTF8ToString(m._jpeg_error()>>>0));
+      opened=true;
+    }finally{m._free(inputPtr);inputPtr=0;}
     self.postMessage({req:msg.req,heapBytes:m.HEAPU8.length});return;
   }
   if(msg.type==='close'){await close();self.postMessage({req:msg.req});return;}
-  if(msg.type!=='crop'||!inputPtr)throw Error('JPEG source is not open');
+  if(msg.type!=='crop'||!opened)throw Error('JPEG source is not open');
   const r=msg.rect,m=await load();
   if(![r.x,r.y,r.width,r.height].every(Number.isSafeInteger)||r.x<0||r.y<0||r.width<1||r.height<1||r.x+r.width>sourceInfo.width||r.y+r.height>sourceInfo.height||r.x%sourceInfo.mcuX||r.y%sourceInfo.mcuY)throw Error('JPEG crop must match native MCU boundaries');
   const sizePtr=m._malloc(4)>>>0;if(!sizePtr)throw Error('Not enough memory for JPEG crop');let out=0;
   try{
     m.HEAPU32[sizePtr>>>2]=0;
-    // Unsigned pointers are required above 2 GiB. Scale stays hardcoded to 1.
-    out=m._process_jpeg(inputPtr,inputSize,1,r.x,r.y,r.width,r.height,sizePtr)>>>0;
+    // Unsigned pointers are required above 2 GiB. Reuse the native coefficients.
+    out=m._crop_jpeg(r.x,r.y,r.width,r.height,sizePtr)>>>0;
     const size=m.HEAPU32[sizePtr>>>2];
     if(!out||!size||out+size>m.HEAPU8.length){
       const reason=m._jpeg_error?m.UTF8ToString(m._jpeg_error()>>>0):'';

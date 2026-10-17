@@ -5,7 +5,7 @@
   const HEAP_BYTES=4294901760,WORKSPACE_HEADROOM=512*1024*1024;
   function info(bytes){
     if(bytes[0]!==255||bytes[1]!==216)throw Error('Invalid JPEG');
-    let result,orientation=1;
+    let result,orientation=1,thumbnail;
     for(let p=2;p+4<=bytes.length;){
       if(bytes[p++]!==255)throw Error('Invalid JPEG marker');
       while(bytes[p]===255)p++;
@@ -29,11 +29,29 @@
         const n=t.getUint16(offset,le);
         for(let i=0;i<n;i++){const e=offset+2+i*12;if(e+12>t.byteLength)throw Error('Truncated EXIF');
           if(t.getUint16(e,le)===0x112){if(t.getUint16(e+2,le)!==3||t.getUint32(e+4,le)!==1)throw Error('Invalid EXIF orientation');orientation=t.getUint16(e+8,le);}}
+        // EXIF's optional JPEG thumbnail is only used for tone/complexity analysis.
+        const next=offset+2+n*12;
+        if(next+4<=t.byteLength){
+          const ifd=t.getUint32(next,le);
+          if(ifd&&ifd+2<=t.byteLength){
+            const count=t.getUint16(ifd,le);let start=0,length=0;
+            if(ifd+2+count*12<=t.byteLength){
+              for(let i=0;i<count;i++){
+                const e=ifd+2+i*12;
+                if(t.getUint16(e+2,le)!==4||t.getUint32(e+4,le)!==1)continue;
+                const tag=t.getUint16(e,le),value=t.getUint32(e+8,le);
+                if(tag===0x201)start=value;if(tag===0x202)length=value;
+              }
+              if(start&&length>=4&&start+length<=t.byteLength&&t.getUint8(start)===255&&t.getUint8(start+1)===216)
+                thumbnail={offset:p+8+start,length};
+            }
+          }
+        }
       }
       p+=len;
     }
     if(!result)throw Error('JPEG dimensions missing');
-    result.orientation=orientation;
+    result.orientation=orientation;if(thumbnail)result.thumbnail=thumbnail;
     // All supported sampling modes can be cropped in the coefficient domain.
     // safeX/safeY describe exact RGB seam rendering, not transform eligibility.
     result.eligible=orientation===1;
@@ -50,7 +68,7 @@
     if(bytes>HEAP_BYTES)throw Error(`Estimated workspace for JPEG ${meta.width}×${meta.height} exceeds the current 4 GiB processing limit; resolution was not reduced`);
     return bytes;
   }
-  function create({workerUrl='./jpeg-lossless-worker.js?v=62'}={}){
+  function create({workerUrl='./jpeg-lossless-worker.js?v=63'}={}){
     let worker,req=0,releaseOnClose=false,peakHeapBytes=0;const pending=new Map();
     function dispose(){if(worker)worker.terminate();worker=null;for(const p of pending.values())p.reject(Error('JPEG worker disposed'));pending.clear();releaseOnClose=false;}
     function call(message,transfer=[]){
