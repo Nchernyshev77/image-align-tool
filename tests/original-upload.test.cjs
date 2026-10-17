@@ -59,5 +59,11 @@ test('a scan failure remains visible in the final ordinary error list',async()=>
  assert.notEqual(app.el('stitchProgressBar').style.width,'100%');
 });
 test('large source regions keep native widths and one group',async()=>{
- const app=setup([{...fixture(),width:9000,height:4096}]);await app.run();assert.deepEqual(app.calls.map(p=>p.width),[4096,4096,808]);assert.equal(app.groups.length,1);assert.equal(app.groups[0].length,3);
+ const app=setup([{...fixture('Tile_1.jpg',28000000),width:9000,height:4096}]);await app.run();assert.deepEqual(app.calls.map(p=>p.width),[4096,4096,808]);assert.equal(app.groups.length,1);assert.equal(app.groups[0].length,3);
+});
+
+test('18MB originals stay byte-for-byte whole even above old pixel slicing thresholds',async()=>{
+ const files=[[4096,4096],[8192,8192],[9000,4096]].map(([width,height],i)=>({...fixture(`Tile_${i+1}.jpg`,18000000),width,height}));
+ const app=setup(files);await app.run();assert.equal(app.result.success,true);assert.equal(app.calls.length,3);assert.equal(app.groups.length,0);
+ for(let i=0;i<files.length;i++){const call=app.calls.find(p=>p.title.endsWith(files[i].name));assert.equal(call.width,files[i].width);assert.deepEqual(Buffer.from(call.url.split(',')[1],'base64'),files[i].bytes);}
 });

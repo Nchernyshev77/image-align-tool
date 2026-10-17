@@ -1,5 +1,5 @@
 // app.js
-// Test 56: fast scan, two preparation workers, streaming uploads and five-pass verification.
+// Test 58: adaptive preparation, independent metadata and immediate source groups.
 const { board } = window.miro;
 
 // ---- color / slice settings ----
@@ -741,7 +741,8 @@ async function handleStitchSubmit(event) {
       const fallback=sources.find(s=>s.info)?.info||{width:4096,height:4096};
       const infos=sources.map(source=>{
         const info=source.info||fallback,width=info.width,height=info.height;
-        const needsSlice=width>SLICE_THRESHOLD_WIDTH||height>SLICE_THRESHOLD_HEIGHT;
+        const originalFits=window.LosslessUpload.fits(source.file.size,source.file.type||'application/octet-stream');
+        const needsSlice=!originalFits&&(width>SLICE_THRESHOLD_WIDTH||height>SLICE_THRESHOLD_HEIGHT);
         const baseTiles=Math.ceil(width/SLICE_TILE_SIZE)*Math.ceil(height/SLICE_TILE_SIZE);
         const huge=width>LARGE_IMAGE_WORKER_MIN_DIM||height>LARGE_IMAGE_WORKER_MIN_DIM||baseTiles>=LARGE_IMAGE_WORKER_MIN_TILES;
         return {...info,file:source.file,width,height,needsSlice,sliceTileSize:huge?HUGE_SLICE_TILE_SIZE:SLICE_TILE_SIZE};
@@ -766,6 +767,7 @@ async function handleStitchSubmit(event) {
       }
     };
     const onProgress=state=>{
+      window.ImageAlignImportProgress={...state};
       if(scanEl)scanEl.textContent=`1. Scanning: ${state.scanDone} / ${state.totalSources}`;
       if(prepareEl)prepareEl.textContent=`2. Preparing: ${state.prepareDone} / ${state.totalSources}`;
       if(uploadEl)uploadEl.textContent=`3. Uploading: ${state.uploaded} / ${state.totalParts||'…'}`;
@@ -777,7 +779,7 @@ async function handleStitchSubmit(event) {
     const result=await window.ImportEngine.run({files,board,scan:window.FastImageScan.scan,layout,
       createPreparer:()=>window.TilePreparation.create(),onProgress,options:{readDataUrl:readOriginalDataUrl}});
     const elapsedMs=showElapsed();
-    window.ImageAlignLastImport={version:57,elapsedMs,success:result.success,verified:result.verified,totalParts:result.totalParts,passes:result.passes,
+    window.ImageAlignLastImport={version:58,elapsedMs,workers:result.workers,timings:result.timings,success:result.success,verified:result.verified,totalParts:result.totalParts,passes:result.passes,
       failures:result.failures,groupErrors:result.groupErrors,boardError:result.boardError,duplicates:result.duplicates};
     if(resultEl){
       resultEl.hidden=false;

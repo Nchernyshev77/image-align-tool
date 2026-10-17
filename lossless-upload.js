@@ -42,16 +42,21 @@
     return rects;
   }
 
-  async function planParts(width,height,encode,{firstCount=2,onAttempt=()=>{},mime=PNG_MIME,alignment={}}={}) {
+  async function planParts(width,height,encode,{firstCount=2,onAttempt=()=>{},mime=PNG_MIME,alignment={},priority=()=>0}={}) {
     for(let count=firstCount;count<=256;count*=2){
-      onAttempt(count);const parts=[];
-      for(const rect of dyadicRegions(width,height,count,alignment)){
+      onAttempt(count);const parts=new Array(count);
+      // Probe the most complex area first. A bad candidate can then be rejected
+      // sooner, without skipping a valid smaller layout or changing output order.
+      const candidates=dyadicRegions(width,height,count,alignment).map((rect,index)=>({rect,index,score:priority(rect)}));
+      candidates.sort((a,b)=>b.score-a.score||a.index-b.index);
+      let complete=true;
+      for(const {rect,index} of candidates){
         const blob=await encode(rect);
         if(!blob||blob.type!==mime)throw Error('Image encoding failed');
-        if(!fits(blob.size,mime))break;
-        parts.push({...rect,blob});
+        if(!fits(blob.size,mime)){complete=false;break;}
+        parts[index]={...rect,blob};
       }
-      if(parts.length===count)return parts;
+      if(complete)return parts;
       parts.length=0;
     }
     throw Error('Image cannot fit the upload limit within 256 parts');

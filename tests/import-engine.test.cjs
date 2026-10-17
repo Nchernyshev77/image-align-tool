@@ -12,7 +12,7 @@ function setup(count=1,options={}){
    try{
     if(options.onCreate)await options.onCreate(params,call);
     if(options.failBefore&&options.failBefore(params,call))throw Error('Network rejected request');
-    const widget={...params,id:String(++next),type:'image',async setMetadata(key,value){metadata.push({key,value});}};
+    const widget={...params,id:String(++next),type:'image',async setMetadata(key,value){if(options.onMetadata)await options.onMetadata(this);metadata.push({key,value});}};
     if(!options.drop||!options.drop(params,call))images.set(widget.id,widget);
     if(options.lostReply&&options.lostReply(params,call))throw Error('Connection lost after server accepted image');
     return widget;
@@ -21,10 +21,12 @@ function setup(count=1,options={}){
   async get(){if(options.readError)throw Error('Cannot read board');if(options.onRead)await options.onRead(images);return [...images.values()];},
   async group({items}){
    if(options.groupGate)await options.groupGate.promise;
+   if(items.some(item=>!images.has(item.id)))throw Error('Cannot group an image missing from the board');
    const id='g'+groups.length;groups.push(items.map(i=>i.id));for(const item of items){item.groupId=id;}
    if(options.lostGroupReply&&groups.length===1)throw Error('Group response lost');
    if(options.groupError)throw Error('Cannot group');return {id};
   },
+  async getById(id){return {async ungroup(){for(const item of images.values())if(item.groupId===id)item.groupId=undefined;}};},
  };
  const createPreparer=()=>({
   async prepare(file,info,jobs){
@@ -43,7 +45,7 @@ function setup(count=1,options={}){
   if(options.scanError&&options.scanError(file,scans.get(file.index)))throw Error('File unreadable');return {width:4096,height:4096};
  },layout:async sources=>{for(const s of sources)s.jobs=s.info?[{kind:'full',width:4096,height:4096,x:s.index*4096,y:0}]:[];},
  createPreparer,onProgress:s=>{progress.push({...s});if(options.progress)options.progress(s);},
- options:{readDataUrl:async blob=>'data:'+blob.type+';base64,AAAA',rateLimit:false,retryDelayMs:0,requestMs:1000,...options.engine}};
+ options:{readDataUrl:async blob=>'data:'+blob.type+';base64,AAAA',rateLimit:false,retryDelayMs:0,requestMs:1000,workers:2,...options.engine}};
  return {input,files,images,groups,calls,progress,metadata,scans,preps,get maxPrepare(){return maxPrepare;},get maxUploads(){return maxUploads;},get disposed(){return disposed;},run:()=>E.run(input)};
 }
 
@@ -128,4 +130,41 @@ test('a late server-created image appearing during retry delay is found before r
 test('timed-out active source requests do not allow an unbounded stream of new requests',async()=>{
  const blocked=gate();const app=setup(12,{parts:1,onCreate:()=>blocked.promise,engine:{requestMs:5}});
  const result=await app.run();assert.equal(result.success,false);assert.ok(app.calls.length<=5);blocked.resolve();
+});
+
+test('a complete source is grouped before remaining uploads and metadata finish',async()=>{
+ const uploads=gate(),metadata=gate();
+ const app=setup(12,{onCreate:p=>p.alt.includes(':0.')?undefined:uploads.promise,onMetadata:()=>metadata.promise,engine:{workers:4}});
+ const running=app.run();await until(()=>app.groups.length===1);
+ assert.equal(app.groups[0].length,4);assert.equal(app.images.size,4);assert.equal(app.metadata.length,0);
+ assert.ok(app.calls.length>4);uploads.resolve();metadata.resolve();const result=await running;
+ assert.equal(result.success,true);assert.equal(app.groups.length,12);
+});
+
+test('slow metadata never holds the five source upload slots; its own concurrency stays bounded',async()=>{
+ const blocked=gate();let active=0,max=0;
+ const app=setup(16,{parts:1,onMetadata:async()=>{active++;max=Math.max(max,active);await blocked.promise;active--;}});
+ const running=app.run();await until(()=>app.images.size===16);assert.equal(app.metadata.length,0);assert.equal(max,4);
+ blocked.resolve();const result=await running;assert.equal(result.success,true);assert.equal(app.metadata.length,16);
+});
+
+test('four preparation lanes still bound lookahead to five uploading plus four preparing sources',async()=>{
+ const blocked=gate(),preparing=[];const app=setup(16,{onCreate:()=>blocked.promise,prepare:file=>preparing.push(file.index),engine:{workers:4}});
+ const running=app.run();await until(()=>app.calls.length===20);assert.ok(preparing.length<=9);blocked.resolve();
+ const result=await running;assert.equal(result.success,true);assert.equal(result.workers,4);assert.equal(app.disposed,4);
+});
+
+test('worker selection respects CPU, low memory, large images and batch size',()=>{
+ const sources=Array.from({length:20},()=>({info:{width:4096,height:4096}}));
+ assert.equal(E.preparationWorkers(sources,{hardwareConcurrency:16,deviceMemory:8}),4);
+ assert.equal(E.preparationWorkers(sources,{hardwareConcurrency:16,deviceMemory:4}),2);
+ assert.equal(E.preparationWorkers(sources,{hardwareConcurrency:4}),2);
+ assert.equal(E.preparationWorkers(sources.slice(0,1),{hardwareConcurrency:16,deviceMemory:8}),1);
+ assert.equal(E.preparationWorkers([{info:{width:20000,height:20000}},...sources],{hardwareConcurrency:16,deviceMemory:8}),2);
+});
+
+test('summary includes per-stage timings without storing image data',async()=>{
+ const app=setup(2),result=await app.run();assert.equal(result.success,true);
+ for(const key of ['scanMs','prepareMs','readMs','uploadMs','metadataMs','groupMs','verifyMs','admissionWaitMs','rateWaitMs','totalMs'])assert.ok(Number.isFinite(result.timings[key])&&result.timings[key]>=0,key);
+ assert.ok(result.timings.totalMs>0);assert.equal(result.workers,2);
 });

@@ -1,16 +1,16 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>Streaming import browser checks · 56</title>
+<title>Streaming import browser checks · 58</title>
 <style>body{font:16px system-ui;margin:32px;max-width:1000px}pre{white-space:pre-wrap;padding:16px;background:#f3f4f6}button{padding:10px 16px}</style>
-<h1>Streaming import browser checks · 56</h1>
+<h1>Streaming import browser checks · 58</h1>
 <p>Local synthetic images only. No Miro uploads or network requests for images.</p>
 <button id="run">Run pixel and color checks</button>
 <pre id="result">Ready</pre>
-<script src="../lossless-upload.js?v=56"></script>
+<script src="../lossless-upload.js?v=58"></script>
 <script src="../jpeg-lossless.js?v=55"></script>
 <script src="../fast-image-scan.js?v=56"></script>
-<script src="../tile-preparation.js?v=56"></script>
-<script src="../import-engine.js?v=56"></script>
+<script src="../tile-preparation.js?v=58"></script>
+<script src="../import-engine.js?v=58"></script>
 <script>
 const L=window.LosslessUpload;
 const result=document.getElementById('result');
@@ -102,7 +102,7 @@ async function fixtureTest(){
 }
 async function preparationAndRecoveryTest(){
  const fixtures=await(await fetch('./jpeg-fixtures.json')).json(),files=['444','420'].map((type,i)=>new File([Uint8Array.from(atob(fixtures[type]),c=>c.charCodeAt(0))],`Tile_${i+1}.jpg`,{type:'image/jpeg'}));
- const clients=[TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=56'}),TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=56'})];
+ const clients=[TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=58'}),TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=58'})];
  try{
   await Promise.all(files.map(async(file,i)=>{
    const info=await FastImageScan.scan(file),expected=await pixels(file);
@@ -117,18 +117,43 @@ async function preparationAndRecoveryTest(){
    const item={...params,id:String(calls),setMetadata:async()=>{}};images.set(item.id,item);
    if(calls===2)throw Error('Synthetic lost reply');return item;},
   get:async()=>[...images.values()],group:async({items})=>{groups++;items.forEach(i=>i.groupId='g'+groups);return {id:'g'+groups};}};
- const imported=await ImportEngine.run({files,board,scan:FastImageScan.scan,createPreparer:()=>TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=56'}),
+ const imported=await ImportEngine.run({files,board,scan:FastImageScan.scan,createPreparer:()=>TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=58'}),
   layout:async sources=>{for(const s of sources)s.jobs=L.dyadicRegions(s.info.width,s.info.height,4).map(r=>({kind:'tile',sx:r.x,sy:r.y,sw:r.width,sh:r.height,x:r.x+r.width/2,y:r.y+r.height/2}));},
   options:{rateLimit:false,retryDelayMs:0,readDataUrl:blob=>new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=()=>reject(r.error);r.readAsDataURL(blob);})}});
  assert(imported.success,'Recovery did not finish');assert(imported.verified===8&&calls===9&&images.size===8&&groups===2,'Missing-part recovery or duplicate protection failed');
  log('PASS streaming import: eight parts verified, failed part reloaded, lost reply recovered without duplicate, two source groups');
+}
+async function immediateGroupTest(){
+ const fixture=await(await fetch('./jpeg-fixtures.json')).json();
+ const files=[0,1].map(i=>new File([Uint8Array.from(atob(fixture['444']),c=>c.charCodeAt(0))],`Tile_${i+1}.jpg`,{type:'image/jpeg'}));
+ let releaseUploads,releaseMetadata,firstGroup;
+ const uploads=new Promise(r=>releaseUploads=r),metadata=new Promise(r=>releaseMetadata=r),earlyGroup=new Promise(r=>firstGroup=r);
+ const images=new Map();let calls=0,groups=0;
+ const board={async createImage(params){
+   if(params.alt.includes(':1.'))await uploads;
+   const item={...params,id:String(++calls),setMetadata:async()=>metadata};images.set(item.id,item);return item;
+  },get:async()=>[...images.values()],group:async({items})=>{
+   groups++;items.forEach(i=>i.groupId='g'+groups);if(groups===1)firstGroup();return {id:'g'+groups};
+  }};
+ const run=ImportEngine.run({files,board,scan:FastImageScan.scan,createPreparer:()=>TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=58'}),
+  layout:async sources=>{for(const s of sources)s.jobs=L.dyadicRegions(s.info.width,s.info.height,4).map(r=>({kind:'tile',sx:r.x,sy:r.y,sw:r.width,sh:r.height,x:r.x+r.width/2,y:r.y+r.height/2}));},
+  options:{workers:2,rateLimit:false,retryDelayMs:0,readDataUrl:blob=>new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=()=>reject(r.error);r.readAsDataURL(blob);})}});
+ try{
+  let timer;
+  try{await Promise.race([earlyGroup,new Promise((_,reject)=>timer=setTimeout(()=>reject(Error('Immediate grouping timed out')),15000))]);}finally{clearTimeout(timer);}
+  assert(images.size===4&&groups===1,'Group did not precede remaining uploads');
+  log('PASS immediate group: first four pieces grouped while second source and metadata are blocked');
+ }finally{releaseUploads();releaseMetadata();}
+ const imported=await run;assert(imported.success&&groups===2,'Immediate group import failed');
+ assert(imported.timings.encodeMs>0&&imported.timings.probes===8,'Preparation measurements missing');
+ log('PASS native workers, independent metadata queue and timing summary');
 }
 async function largeTest(){
  const c=document.createElement('canvas');c.width=c.height=4096;
  const ctx=c.getContext('2d',{colorSpace:'srgb'}),data=ctx.createImageData(c.width,c.height);
  let seed=123456789;
  for(let i=0;i<data.data.length;i+=4){seed^=seed<<13;seed^=seed>>>17;seed^=seed<<5;data.data[i]=seed&255;data.data[i+1]=(seed>>>8)&255;data.data[i+2]=(seed>>>16)&255;data.data[i+3]=255;}
- ctx.putImageData(data,0,0);const file=await blobOf(c),client=TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=56'});
+ ctx.putImageData(data,0,0);const file=await blobOf(c),client=TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=58'});
  log(`4096×4096 source PNG: ${file.size} bytes; checking worker candidate layouts…`);
  try{
   const info=await FastImageScan.scan(file),prepared=await client.prepare(file,info,[{kind:'full',width:4096,height:4096}]),region=prepared.regions[0];
@@ -138,7 +163,7 @@ async function largeTest(){
 }
 document.getElementById('run').onclick=async()=>{
   document.getElementById('run').disabled=true;lines.length=0;log('Running…');
-  try{await preparationAndRecoveryTest();await fixtureTest();for(const space of ['srgb','display-p3'])for(const type of ['image/jpeg','image/png'])await smallColorTest(space,type);await largeTest();log('ALL CHECKS PASSED');}
+  try{await immediateGroupTest();await preparationAndRecoveryTest();await fixtureTest();for(const space of ['srgb','display-p3'])for(const type of ['image/jpeg','image/png'])await smallColorTest(space,type);await largeTest();log('ALL CHECKS PASSED');}
   catch(e){log('FAILED: '+e.message);console.error(e);}
   finally{document.getElementById('run').disabled=false;}
 };

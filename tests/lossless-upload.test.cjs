@@ -35,6 +35,16 @@ test('all candidate PNGs are checked; a later oversized part rejects the whole l
   assert.equal(parts.length,4);
 });
 
+test('complexity hints reject a bad layout earlier while retaining the smallest valid binary layout and part order',async()=>{
+ const calls=[],attempts=[];
+ const parts=await L.planParts(4096,4096,async r=>{calls.push(r);return {type:'image/png',size:r.width===2048&&r.height===4096&&r.x>0?23000000:100};},
+  {priority:r=>r.x,onAttempt:n=>attempts.push(n)});
+ assert.deepEqual(attempts,[2,4]);assert.equal(calls[0].x,2048);assert.equal(calls.length,5);
+ assert.deepEqual(parts.map(({blob,...r})=>r),L.dyadicRegions(4096,4096,4));
+ const whole=await L.planParts(4096,4096,async()=>({type:'image/png',size:100}),{priority:r=>r.x});
+ assert.equal(whole.length,2);assert.equal(whole[0].x,0);
+});
+
 const marker=(type,data)=>Buffer.concat([Buffer.from([255,type,(data.length+2)>>8,(data.length+2)&255]),data]);
 const fakeJpeg=profile=> {
   const first=profile.subarray(0,75),last=profile.subarray(75);

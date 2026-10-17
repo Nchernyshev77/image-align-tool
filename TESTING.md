@@ -1,4 +1,4 @@
-# Verified streaming import — version 56
+# Verified streaming import — version 58
 
 Test branch: `test/original-upload-52`. Main and the Pages source branch are unchanged.
 
@@ -10,9 +10,9 @@ The header/version explanations and Upload diagnostics panel are removed. Progre
 
 JPEG/PNG scanning reads dimensions/EXIF from file headers, rather than decoding every full image. Four header reads can overlap. Unsupported formats fall back to a browser decode. Unreadable files are checked up to five times and remain in the final error list.
 
-Two preparation workers run off the main thread. They compute thumbnail tone codes, select lossless JPEG crops or PNG fallback, cut and measure actual encoded sizes. The PNG encoder uses a native-resolution OffscreenCanvas. JPEGs already known to need PNG do not incur a second full-file read just to rediscover their chroma sampling. Powers-of-two plans (2,4,8…) and original pass-through behavior remain.
+Two to four preparation workers run off the main thread, selected after header scanning from CPU count, reported memory and decoded dimensions. A one-file batch creates only one worker. They compute thumbnail tone codes, select lossless JPEG crops or PNG fallback, cut and measure actual encoded sizes. The PNG encoder uses a native-resolution OffscreenCanvas. JPEGs already known to need PNG do not incur a second full-file read just to rediscover their chroma sampling. Powers-of-two plans (2,4,8…) remain. Thumbnail complexity only changes the order in which candidate regions are measured: likely heavier regions are checked first so invalid layouts fail earlier. It never skips a valid smaller layout, changes output order, or replaces actual output-size checks. Originals that fit the measured data-URL limit bypass both pixel-size slicing thresholds and format conversion; an 18MB 8192-square JPEG stays one unchanged JPEG.
 
-Preparation and upload overlap after scanning/layout. At most five source files are uploading and two further sources are being prepared/awaiting admission. Parts of a source upload concurrently (up to eight). Selected blobs are reused, then released after each upload attempt; no complete-batch IndexedDB staging and no all-batch Base64 cache. A retry regenerates only affected sources from the still-selected local Files. Prepared region metadata must not retain a reference to the worker's blob array.
+Preparation and upload overlap after scanning/layout. At most five source files are uploading and at most one further source per preparation worker is being prepared/awaiting admission. Parts of a source upload concurrently (up to eight). Selected blobs are reused, then released after each upload attempt; no complete-batch IndexedDB staging and no all-batch Base64 cache. A retry regenerates only affected sources from the still-selected local Files. Prepared region metadata must not retain a reference to the worker's blob array.
 
 ## Completeness and automatic recovery
 
@@ -22,7 +22,7 @@ An import-specific part marker is provided atomically as the image `alt` during 
 
 An upload taking more than two minutes becomes uncertain. It is never sent again while its original SDK promise remains pending. New source dispatch pauses if this would exceed the concurrency/memory bounds; verification can still find a completed image. A late or failed read cannot become a false success. The SDK has no transactional idempotency key: a remote creation delayed beyond both a settled error and repeated board snapshots cannot be made exactly-once by a browser app. Duplicate markers are detected and reported, without deleting board content automatically.
 
-Successfully verified parts are grouped by source. Lost grouping replies are reconciled through groupId. Group errors are reported and retried. Requests are bounded and all settled requests are reconciled before final success. Grouping waits for a complete source until the last pass; on final partial failure, available pieces can remain grouped.
+As soon as every piece of a source receives its createImage acknowledgement, the source is queued for grouping immediately, while other sources keep uploading. A separate five-task grouping queue prevents duplicate concurrent group requests for the same source. Four metadata tasks can run independently; slow metadata never holds source upload slots. Final verification still reconciles the board, retries lost grouping replies and repairs a group if a missing image is replaced. Successfully recovered parts are grouped by source. Lost grouping replies are reconciled through groupId. Group errors are reported and retried. Requests are bounded and all settled requests are reconciled before final success. Grouping waits for a complete source until the last pass; on final partial failure, available pieces can remain grouped.
 
 After five unsuccessful passes, the app shows an error and lists filenames/missing part counts; initial header failures cannot disappear from totals. Closing the app/browser stops the run; cross-session resume is not implemented.
 
@@ -36,7 +36,9 @@ Documented Web SDK limits are 100,000 credits/minute and 1,000,000/hour. Creatin
 
 The vendored JPEG coefficient transform, MCU alignment, full-chroma seam guards, ICC preservation, PNG precision restrictions, native resolution, reversed corners and missing source slots remain covered. No upload uses JPEG quality re-encoding or pixel resizing.
 
-Run `node --test tests/*.test.cjs` and syntax checks. New tests cover a 256-source/1024-part mock batch, two preparation lanes, bounded lookahead, overlap, lost/late replies, silently dropped images, five-pass failure, board-read failure, failed preparation, pending timeout, grouping response loss, request budgeting, header-only scanning, and persistent UI errors.
+Internal progress and final summaries include worker count and timings for scan, preparation, encoding probes, Base64 reads, SDK upload, metadata, grouping, verification, upload-slot waiting and rate-limit waiting. Concurrent stage work is summed and must not be added together to estimate elapsed time; rate-limit waiting is measured as a union of waiting intervals. The centered UI keeps its total elapsed time and no diagnostics panel is added.
+
+Run `node --test tests/*.test.cjs` and syntax checks. New tests cover a 256-source/1024-part mock batch, two/four preparation lanes, bounded lookahead, overlap, immediate grouping while other uploads and metadata are blocked, independent metadata admission, unchanged under-limit originals above legacy pixel thresholds, lost/late replies, silently dropped images, five-pass failure, board-read failure, failed preparation, pending timeout, grouping response loss, request budgeting, header-only scanning, and persistent UI errors.
 
 `tests/browser-lossless.html` exercises two real background preparation workers, nested JPEG WASM, PNG fallback, actual automatic recovery against a local fake SDK, exact raw pixels and ICC, and a 57.7MB 4096-square PNG in a worker. No synthetic images are sent to Miro. Real large-batch Miro performance must be checked by the user.
 
