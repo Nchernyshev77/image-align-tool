@@ -21,7 +21,7 @@ jobs:
           test "$(git -C "$RUNNER_TEMP/image-align-emsdk" rev-parse HEAD)" = b2436aafa7351ee1b581f15841f1b45ed716a279
           "$RUNNER_TEMP/image-align-emsdk/emsdk" install 4.0.21
           "$RUNNER_TEMP/image-align-emsdk/emsdk" activate 4.0.21
-      - name: Build 4 GiB coefficient crop module
+      - name: Build 4 GiB and 16 GiB coefficient crop modules
         shell: bash
         run: |
           source "$RUNNER_TEMP/image-align-emsdk/emsdk_env.sh"
@@ -30,10 +30,11 @@ jobs:
         run: |
           node --test tests/*.test.cjs
           node codec/verify-build.cjs
+          node codec/verify-memory64.cjs
       - name: Commit verified generated codec
         shell: bash
         run: |
-          git add vendor/jpegcropscale/jpeg_worker.js vendor/jpegcropscale/jpeg_worker.wasm
+          git add vendor/jpegcropscale/jpeg_worker*.js vendor/jpegcropscale/jpeg_worker*.wasm
           if git diff --cached --quiet; then exit 0; fi
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Build verified 4 GiB native JPEG coefficient crop codec'
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Build verified native JPEG codecs for wasm32 and memory64'
           git push origin HEAD:refs/heads/test/original-upload-52
