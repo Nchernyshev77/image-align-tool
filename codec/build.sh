@@ -17,5 +17,5 @@ emcc "$repo_dir/codec/jpeg_worker.c" "$build_dir/wasm/libturbojpeg.a" \
   -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sINITIAL_MEMORY=32MB \
   -sMALLOC=emmalloc -sENVIRONMENT=worker,node \
   -sEXPORTED_FUNCTIONS='["_process_jpeg","_jpeg_error","_free_buffer","_malloc","_free"]' \
-  -sEXPORTED_RUNTIME_METHODS='["UTF8ToString"]' \
+  -sEXPORTED_RUNTIME_METHODS='["UTF8ToString","HEAPU8","HEAPU32"]' \
   -o "$repo_dir/vendor/jpegcropscale/jpeg_worker.js"
