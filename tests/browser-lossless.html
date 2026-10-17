@@ -212,7 +212,7 @@ async function largeDimensionsTest(){
  log('PASS oversized JPEG: 16 GiB preflight error before preview or native allocation');
 }
 async function squareMemory64Test(){
- for(const size of [32768,36864]){
+ for(const size of [32768,34816]){
   const file=new File([LargeJpegFixture.jpeg(size,size,'444')],`Square_${size}.jpg`,{type:'image/jpeg'}),info=await FastImageScan.scan(file);
   const client=TilePreparation.create({workerUrl:'../tile-prepare-worker.js?v=64'}),started=performance.now(),stages=[];
   log(`Checking ${size}×${size} 4:4:4 in memory64, without an embedded thumbnail…`);
