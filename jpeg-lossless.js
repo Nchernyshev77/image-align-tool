@@ -1,7 +1,8 @@
 // JPEG coefficient cropping client. All image processing stays on this device.
 (function(root){
   'use strict';
-  const HEAP_BYTES=2147483648,WORKSPACE_HEADROOM=256*1024*1024;
+  // Leave one WASM page below 4 GiB, matching Emscripten's usable heap maximum.
+  const HEAP_BYTES=4294901760,WORKSPACE_HEADROOM=512*1024*1024;
   function info(bytes){
     if(bytes[0]!==255||bytes[1]!==216)throw Error('Invalid JPEG');
     let result,orientation=1;
@@ -46,24 +47,30 @@
   function workspaceBytes(meta,fileBytes=0){return (meta.coefficientBytes??meta.width*meta.height*6)+fileBytes+WORKSPACE_HEADROOM;}
   function assertWorkspace(meta,fileBytes=0){
     const bytes=workspaceBytes(meta,fileBytes);
-    if(bytes>HEAP_BYTES)throw Error(`Estimated workspace for JPEG ${meta.width}×${meta.height} exceeds the current 2 GiB processing limit; resolution was not reduced`);
+    if(bytes>HEAP_BYTES)throw Error(`Estimated workspace for JPEG ${meta.width}×${meta.height} exceeds the current 4 GiB processing limit; resolution was not reduced`);
     return bytes;
   }
-  function create({workerUrl='./jpeg-lossless-worker.js?v=61'}={}){
-    let worker,req=0;const pending=new Map();
+  function create({workerUrl='./jpeg-lossless-worker.js?v=62'}={}){
+    let worker,req=0,releaseOnClose=false,peakHeapBytes=0;const pending=new Map();
+    function dispose(){if(worker)worker.terminate();worker=null;for(const p of pending.values())p.reject(Error('JPEG worker disposed'));pending.clear();releaseOnClose=false;}
     function call(message,transfer=[]){
       if(!worker){worker=new Worker(workerUrl);
-        worker.onmessage=e=>{const waiter=pending.get(e.data.req);if(!waiter)return;pending.delete(e.data.req);e.data.error?waiter.reject(Error(e.data.error)):waiter.resolve(e.data);};
+        worker.onmessage=e=>{const waiter=pending.get(e.data.req);if(!waiter)return;pending.delete(e.data.req);peakHeapBytes=Math.max(peakHeapBytes,e.data.heapBytes||0);e.data.error?waiter.reject(Error(e.data.error)):waiter.resolve(e.data);};
         worker.onerror=e=>{for(const p of pending.values())p.reject(Error(e.message||'JPEG worker failed'));pending.clear();worker.terminate();worker=null;};}
       return new Promise((resolve,reject)=>{const id=++req;pending.set(id,{resolve,reject});worker.postMessage({...message,req:id},transfer);});
     }
     return {
-      async open(file){const buffer=await file.arrayBuffer();const meta=info(new Uint8Array(buffer));
+      async open(file,scannedMeta){
+        peakHeapBytes=0;
+        if(scannedMeta)assertWorkspace(scannedMeta,file.size);
+        const buffer=await file.arrayBuffer(),meta=info(new Uint8Array(buffer));
         assertWorkspace(meta,buffer.byteLength);
+        releaseOnClose=meta.coefficientBytes+buffer.byteLength>=512*1024*1024;
         if(meta.eligible)await call({type:'open',buffer},[buffer]);return meta;},
       async crop(rect){const result=await call({type:'crop',rect});return new Blob([result.buffer],{type:'image/jpeg'});},
-      async close(){if(worker)await call({type:'close'});},
-      dispose(){if(worker)worker.terminate();worker=null;for(const p of pending.values())p.reject(Error('JPEG worker disposed'));pending.clear();},
+      async close(){if(releaseOnClose)dispose();else if(worker)await call({type:'close'});},
+      get peakHeapBytes(){return peakHeapBytes;},
+      dispose,
     };
   }
   root.JpegLossless={info,create,cropAlignment,workspaceBytes,assertWorkspace,HEAP_BYTES};

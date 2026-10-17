@@ -1,5 +1,5 @@
 'use strict';
-importScripts('./lossless-upload.js?v=61','./jpeg-lossless.js?v=61');
+importScripts('./lossless-upload.js?v=62','./jpeg-lossless.js?v=62');
 const jpeg=JpegLossless.create();
 async function tone(file){
  const image=await createImageBitmap(file,{resizeWidth:50,resizeHeight:50});
@@ -46,7 +46,7 @@ self.onmessage=async e=>{
    let mode='original',parts,reason,attempts=[];
    if(full&&LosslessUpload.fits(file.size,file.type||'application/octet-stream')&&LosslessUpload.dimensionsFit(width,height))parts=[{x:0,y:0,width,height,original:true,size:file.size,mime:file.type}];
    else{
-    if(isJpeg){if(!jpegOpened){meta=await jpeg.open(file);jpegOpened=true;}mode='lossless-jpeg';parts=await LosslessUpload.planParts(width,height,measured(r=>jpeg.crop({...r,x:r.x+sourceX,y:r.y+sourceY})),
+    if(isJpeg){if(!jpegOpened){meta=await jpeg.open(file,meta);jpegOpened=true;}mode='lossless-jpeg';parts=await LosslessUpload.planParts(width,height,measured(r=>jpeg.crop({...r,x:r.x+sourceX,y:r.y+sourceY})),
      {...limits,mime:'image/jpeg',alignment:JpegLossless.cropAlignment(meta),priority,firstCount:full?2:1,onAttempt:n=>attempts.push(n)});}
     else{
      mode='lossless-png';
@@ -57,6 +57,7 @@ self.onmessage=async e=>{
    }
    regions.push({mode,attempts,reason,sourceX,sourceY,width,height,parts:parts.map(p=>({...p,size:p.blob?p.blob.size:p.size,mime:p.blob?p.blob.type:p.mime}))});
   }
+  timings.jpegPeakHeapBytes=jpeg.peakHeapBytes;
   response={req,regions,satCode:colors.satCode,briCode:colors.briCode,timings};
  }catch(error){response={req,error:error.message||String(error)};}
  finally{if(source)source.close();await jpeg.close();}

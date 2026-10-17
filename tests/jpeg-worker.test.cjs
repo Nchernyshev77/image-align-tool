@@ -62,15 +62,38 @@ test('4:2:2 prefers exact horizontal seams but can cut across chroma when pixel 
  assert.ok(forced.every(r=>r.width===8192&&r.height===4096));
 });
 
-test('workspace preflight distinguishes 16K, wide 32K and square 32K without allocating image coefficients',async()=>{
+test('4 GiB preflight accepts large 16K inputs and rejects sources exceeding the rebuilt heap',async()=>{
  const {jpeg}=require('./large-jpeg-fixture');
  for(const sampling of ['420','444']){
   const bytes=jpeg(16384,16384,sampling),meta=J.info(bytes);
   assert.equal(meta.coefficientBytes,16384*16384*(sampling==='420'?3:6));
   assert.ok(J.assertWorkspace(meta,bytes.length)<=J.HEAP_BYTES);
+  assert.ok(J.assertWorkspace(meta,600*1024**2)<J.HEAP_BYTES);
  }
  const strip=jpeg(32768,4096),stripMeta=J.info(strip);assert.ok(J.assertWorkspace(stripMeta,strip.length)<J.HEAP_BYTES);
- const square=jpeg(32768,32768),squareMeta=J.info(square);assert.equal(squareMeta.coefficientBytes,3*1024**3);
- assert.throws(()=>J.assertWorkspace(squareMeta,square.length),/2 GiB/);
- const worker=workerHarness();await assert.rejects(worker.call({type:'open',buffer:square.buffer}),/2 GiB/);
+ const square=jpeg(32768,32768,'444'),squareMeta=J.info(square);assert.equal(squareMeta.coefficientBytes,6*1024**3);
+ assert.throws(()=>J.assertWorkspace(squareMeta,square.length),/4 GiB/);
+ const worker=workerHarness();await assert.rejects(worker.call({type:'open',buffer:square.buffer}),/4 GiB/);
+});
+
+test('large JPEG close terminates the native worker to release its grown WASM heap',async()=>{
+ const instances=[];
+ class Worker{
+  constructor(){this.messages=[];instances.push(this);}
+  postMessage(message){this.messages.push(message.type);queueMicrotask(()=>this.onmessage({data:{req:message.req}}));}
+  terminate(){this.terminated=true;}
+ }
+ const context=vm.createContext({Worker,Blob,Uint8Array,DataView,Map,Math,Number,Error,String});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../jpeg-lossless.js'),'utf8'),context);
+ const client=context.JpegLossless.create(),small=new Blob([Buffer.from(fixtures['444'],'base64')]);
+ await client.open(small);await client.close();assert.equal(instances.length,1);assert.equal(instances[0].terminated,undefined);
+ const large=new Blob([require('./large-jpeg-fixture').jpeg(16384,16384,'444')]);
+ await client.open(large);await client.close();assert.equal(instances[0].terminated,true);
+ await client.open(small);assert.equal(instances.length,2);client.dispose();assert.equal(instances[1].terminated,true);
+});
+
+test('large preparation gets ten minutes while ordinary tiles keep the two-minute deadline',()=>{
+ require('../tile-preparation');
+ assert.equal(globalThis.TilePreparation.timeoutFor({size:28000000},{width:4096,height:4096,jpeg:{coefficientBytes:96*1024**2}}),120000);
+ assert.equal(globalThis.TilePreparation.timeoutFor({size:300000000},{width:16384,height:16384,jpeg:{coefficientBytes:1536*1024**2}}),600000);
 });

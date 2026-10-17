@@ -2,7 +2,7 @@ name: Build native JPEG codec
 on:
   push:
     branches: [test/original-upload-52]
-    paths: [codec/**, .github/workflows/build-jpeg.yml]
+    paths: [codec/**, jpeg-lossless.js, jpeg-lossless-worker.js, tile-preparation.js, tile-prepare-worker.js, tests/**, .github/workflows/build-jpeg.yml]
 permissions:
   contents: write
 concurrency:

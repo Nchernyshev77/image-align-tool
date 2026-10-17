@@ -1,4 +1,4 @@
-# Verified streaming import — version 61
+# Verified streaming import — version 62
 
 Test branch: `test/original-upload-52`. Main and the Pages source branch are unchanged.
 
@@ -34,9 +34,11 @@ Documented Web SDK limits are 100,000 credits/minute and 1,000,000/hour. Creatin
 
 ## Source dimensions and workspace
 
-The current vendored JPEG runtime has `getHeapMax() => 2147483648`, a 2 GiB WASM heap. This is independent of Miro’s per-part dimension and URL-size limits. Scanning computes the coefficient-buffer size from each component’s sampling factors and native block counts. Before thumbnail decoding or crop processing, estimated workspace (coefficient buffers + source bytes + 256 MiB headroom) is checked against that heap. The headroom covers crop workspace and bookkeeping and is conservative; actual browser memory availability can still be lower. A source that exceeds the estimate produces a clear error without resizing or PNG conversion. The fixed grid never avoided this limit because each native crop reads source coefficients.
+The JPEG runtime is rebuilt from pinned libjpeg-turbo 3.2.0 with Emscripten 4.0.21, `MAXIMUM_MEMORY=4GB`, memory growth, and unsigned pointer handling. The declared WASM maximum is 65536 pages; the application uses the same one-page-below-4-GiB usable heap maximum as Emscripten. Only the coefficient-domain crop entry point is included; the old downscale/recompression branch is removed. `codec/build.sh` and `.github/workflows/build-jpeg.yml` reproduce the binary. The workflow tests generated files before committing them to the existing test branch.
 
-`tests/large-jpeg-fixture.js` builds small constant-color JPEG files with real 16K/32K headers and valid entropy streams, without allocating a source-sized canvas. Browser checks exercise a real 16384×16384 4:2:0 JPEG (8 parts), a 32768×4096 JPEG (4 parts), and safe rejection of 32768×32768 4:2:0 (3 GiB of source coefficients alone). These controlled fixtures test native dimensions and allocation; they do not guarantee performance for high-detail files on every machine.
+Scanning computes native coefficient-buffer sizes from component sampling factors and block counts. Before thumbnail decoding or cropping, estimated workspace (source coefficients + source file bytes + 512 MiB headroom) is checked. Crop-buffer estimates are conservative, and actual browser memory availability can still be lower. A source above the estimate fails without resizing or PNG conversion. More pieces do not reduce the native library's whole-source coefficient allocation. Large JPEG sources still use one preparation lane; preparation has a ten-minute deadline for working sets of at least 512 MiB, while ordinary tiles keep two minutes. Closing a large source terminates its native worker so a grown WASM heap is released before the next source. Small sources reuse their native runtime.
+
+`tests/large-jpeg-fixture.js` builds constant-color JPEG files with real dimensions and valid entropy streams, without allocating a source-sized canvas. Browser checks cover a real 16384×16384 4:2:0 JPEG (8 parts), a 32768×4096 JPEG (4 parts), and safe rejection of 32768×32768 4:4:4 (6 GiB of coefficients alone). An additional 16K 4:4:4 fixture carries 512 MiB of ignored trailing input padding to force actual native memory above the old 2 GiB ceiling. `codec/verify-build.cjs` independently checks a native crop with that allocation; the browser test checks the complete worker preparation and eight-part result, dimensions, pixel samples, and actual peak heap. Padding stresses allocation, not image detail. These checks do not guarantee performance or available RAM for every real file or computer. Square 32K 4:2:0 now passes the workspace estimate but is not claimed as a tested supported workload.
 
 ## Quality and rollback
 
