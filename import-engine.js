@@ -66,7 +66,7 @@
     const descriptors=[];
     for(let j=0;j<output.regions.length;j++){
      const region=output.regions[j],job=source.jobs[j];
-     const regionInfo={mode:region.mode,sourceX:region.sourceX,sourceY:region.sourceY,width:region.width,height:region.height,attempts:region.attempts};
+     const regionInfo={mode:region.mode,reason:region.reason,sourceX:region.sourceX,sourceY:region.sourceY,width:region.width,height:region.height,attempts:region.attempts};
      for(let p=0;p<region.parts.length;p++){
       const part=region.parts[p],key=`${source.index}.${j}.${p}`,marker=`[ia:${runId}:${key}]`;
       const prefix=`C${String(output.satCode||0).padStart(2,'0')}/${String(output.briCode||0).padStart(3,'0')} `;

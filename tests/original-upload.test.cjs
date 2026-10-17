@@ -19,9 +19,9 @@ function setup(files,{parts=2,scanError=false}={}){
  context.window.FastImageScan={scan:async file=>{if(scanError&&file.name==='Tile_1.jpg')throw Error('Unreadable file');return {width:file.width,height:file.height};}};
  context.window.TilePreparation={create:()=>({dispose(){},async prepare(file,info,jobs){return {satCode:20,briCode:250,regions:jobs.map(job=>{
   const full=job.kind==='full',width=full?job.width:job.sw,height=full?job.height:job.sh;
-  const pass=full&&L.fits(file.size,file.type);
+  const pass=full&&L.fits(file.size,file.type)&&L.dimensionsFit(width,height);
   return {mode:pass?'original':'lossless-png',width,height,sourceX:full?0:job.sx,sourceY:full?0:job.sy,
-   parts:pass?[{x:0,y:0,width,height,original:true,size:file.size,mime:file.type}]:L.dyadicRegions(width,height,full?parts:1).map(r=>({...r,blob:{size:100,type:'image/png',bytes:Buffer.alloc(100,7)},size:100,mime:'image/png'}))};
+   parts:pass?[{x:0,y:0,width,height,original:true,size:file.size,mime:file.type}]:L.dyadicRegions(width,height,full?parts:1,{maxWidth:L.MAX_IMAGE_WIDTH,maxHeight:L.MAX_IMAGE_HEIGHT}).map(r=>({...r,blob:{size:100,type:'image/png',bytes:Buffer.alloc(100,7)},size:100,mime:'image/png'}))};
  })};}})};
  const run=context.window.ImportEngine.run;
  context.window.ImportEngine.run=input=>run({...input,options:{...input.options,rateLimit:false,retryDelayMs:0}});
@@ -58,12 +58,18 @@ test('a scan failure remains visible in the final ordinary error list',async()=>
  assert.equal(app.result.success,false);assert.match(app.el('stitchResult').textContent,/Tile_1.jpg/);assert.equal(app.el('stitchResult').hidden,false);assert.equal(app.el('stitchButton').disabled,false);
  assert.notEqual(app.el('stitchProgressBar').style.width,'100%');
 });
-test('large source regions keep native widths and one group',async()=>{
- const app=setup([{...fixture('Tile_1.jpg',28000000),width:9000,height:4096}]);await app.run();assert.deepEqual(app.calls.map(p=>p.width),[4096,4096,808]);assert.equal(app.groups.length,1);assert.equal(app.groups[0].length,3);
+test('ordinary large sources use a binary plan instead of an unconditional 4096 grid',async()=>{
+ const app=setup([{...fixture('Tile_1.jpg',28000000),width:9000,height:4096}]);await app.run();assert.deepEqual(app.calls.map(p=>p.width),[4500,4500]);assert.equal(app.groups.length,1);assert.equal(app.groups[0].length,2);
 });
 
-test('18MB originals stay byte-for-byte whole even above old pixel slicing thresholds',async()=>{
- const files=[[4096,4096],[8192,8192],[9000,4096]].map(([width,height],i)=>({...fixture(`Tile_${i+1}.jpg`,18000000),width,height}));
+test('18MB originals within Miro pixel limits stay byte-for-byte whole',async()=>{
+ const files=[[4096,4096],[8192,4096],[6144,3072]].map(([width,height],i)=>({...fixture(`Tile_${i+1}.jpg`,18000000),width,height}));
  const app=setup(files);await app.run();assert.equal(app.result.success,true);assert.equal(app.calls.length,3);assert.equal(app.groups.length,0);
  for(let i=0;i<files.length;i++){const call=app.calls.find(p=>p.title.endsWith(files[i].name));assert.equal(call.width,files[i].width);assert.deepEqual(Buffer.from(call.url.split(',')[1],'base64'),files[i].bytes);}
+});
+
+test('18MB image above pixel limits uses two legal parts instead of silently uploading an oversized original',async()=>{
+ const app=setup([{...fixture('Tile_1.jpg',18000000),width:8192,height:8192}]);await app.run();
+ assert.equal(app.result.success,true);assert.equal(app.calls.length,2);assert.equal(app.groups[0].length,2);
+ for(const call of app.calls)assert.equal(call.width,8192);
 });

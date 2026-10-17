@@ -1,5 +1,5 @@
 'use strict';
-importScripts('./lossless-upload.js?v=58','./jpeg-lossless.js?v=55');
+importScripts('./lossless-upload.js?v=59','./jpeg-lossless.js?v=55');
 const jpeg=JpegLossless.create();
 async function tone(file){
  const image=await createImageBitmap(file,{resizeWidth:50,resizeHeight:50});
@@ -24,7 +24,7 @@ self.onmessage=async e=>{
  try{
   const colors=await tone(file);
   timings.toneMs=performance.now()-started;
-  const needsTransform=jobs.some(j=>j.kind!=='full'||!LosslessUpload.fits(file.size,file.type||'application/octet-stream'));
+  const needsTransform=jobs.some(j=>j.kind!=='full'||!LosslessUpload.fits(file.size,file.type||'application/octet-stream')||!LosslessUpload.dimensionsFit(j.width,j.height));
   if(needsTransform&&/image\/jpe?g/i.test(file.type)){meta=info.jpeg;if(!meta){meta=await jpeg.open(file);jpegOpened=true;}}
   for(const job of jobs){
    const full=job.kind==='full',width=full?job.width:job.sw,height=full?job.height:job.sh;
@@ -36,18 +36,20 @@ self.onmessage=async e=>{
     return score/Math.max(1,(x1-x0)*(y1-y0))*r.width*r.height;
    };
    const measured=encode=>async r=>{const start=performance.now();timings.probes++;try{return await encode(r);}finally{timings.encodeMs+=performance.now()-start;}};
+   const limits={maxWidth:LosslessUpload.MAX_IMAGE_WIDTH,maxHeight:LosslessUpload.MAX_IMAGE_HEIGHT};
    let mode='original',parts,reason,attempts=[];
-   if(full&&LosslessUpload.fits(file.size,file.type||'application/octet-stream'))parts=[{x:0,y:0,width,height,original:true,size:file.size,mime:file.type}];
+   if(full&&LosslessUpload.fits(file.size,file.type||'application/octet-stream')&&LosslessUpload.dimensionsFit(width,height))parts=[{x:0,y:0,width,height,original:true,size:file.size,mime:file.type}];
    else{
     const safe=meta&&meta.eligible&&meta.width===info.width&&meta.height===info.height&&
+     (width<=LosslessUpload.MAX_IMAGE_WIDTH||meta.safeX)&&(height<=LosslessUpload.MAX_IMAGE_HEIGHT||meta.safeY)&&
      (meta.safeX||(sourceX===0&&width===meta.width))&&(meta.safeY||(sourceY===0&&height===meta.height));
     if(safe){if(!jpegOpened){meta=await jpeg.open(file);jpegOpened=true;}mode='lossless-jpeg';parts=await LosslessUpload.planParts(width,height,measured(r=>jpeg.crop({...r,x:r.x+sourceX,y:r.y+sourceY})),
-     {mime:'image/jpeg',alignment:meta,priority,firstCount:full?2:1,onAttempt:n=>attempts.push(n)});}
+     {...limits,mime:'image/jpeg',alignment:meta,priority,firstCount:full?2:1,onAttempt:n=>attempts.push(n)});}
     else{
      mode='lossless-png';reason=meta&&(meta.reason||'Crop edges require PNG');
      if(!source){source=await LosslessUpload.openSource(file);if(source.image.width!==info.width||source.image.height!==info.height)throw Error('Decoded dimensions differ; refusing to resize');}
      parts=await LosslessUpload.planParts(width,height,measured(r=>LosslessUpload.encodeRegion(source,{...r,x:r.x+sourceX,y:r.y+sourceY})),
-      {priority,firstCount:full?2:1,onAttempt:n=>attempts.push(n)});
+      {...limits,priority,firstCount:full?2:1,onAttempt:n=>attempts.push(n)});
     }
    }
    regions.push({mode,attempts,reason,sourceX,sourceY,width,height,parts:parts.map(p=>({...p,size:p.blob?p.blob.size:p.size,mime:p.blob?p.blob.type:p.mime}))});

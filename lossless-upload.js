@@ -3,6 +3,9 @@
   'use strict';
   const URL_LIMIT = 30_000_000;
   const PNG_MIME = 'image/png';
+  // https://help.miro.com/hc/en-us/articles/360017731613-Supported-file-formats
+  const MAX_IMAGE_WIDTH=8192,MAX_IMAGE_HEIGHT=4096;
+  const dimensionsFit=(width,height)=>width<=MAX_IMAGE_WIDTH&&height<=MAX_IMAGE_HEIGHT;
   const COLOR_CHUNKS = new Set(['iCCP', 'sRGB', 'gAMA', 'cHRM', 'cICP', 'mDCV', 'cLLI']);
   const ascii = bytes => String.fromCharCode(...bytes);
   const payloadBytes = (size, mime) => 4 * Math.ceil(size / 3) + `data:${mime};base64,`.length + 2;
@@ -23,7 +26,7 @@
     });
   }
 
-  function dyadicRegions(width,height,count,{mcuX=1,mcuY=1,safeX=true,safeY=true}={}) {
+  function dyadicRegions(width,height,count,{mcuX=1,mcuY=1,safeX=true,safeY=true,maxWidth=Infinity,maxHeight=Infinity}={}) {
     if(![width,height,count,mcuX,mcuY].every(Number.isSafeInteger)||width<1||height<1||count<1||(count&(count-1)))throw Error('Invalid binary partition');
     let rects=[{x:0,y:0,width,height}];
     while(rects.length<count){
@@ -32,7 +35,8 @@
         const xCut=Math.floor((r.x+r.width/2)/mcuX)*mcuX;
         const yCut=Math.floor((r.y+r.height/2)/mcuY)*mcuY;
         const xOk=safeX&&xCut>r.x&&xCut<r.x+r.width,yOk=safeY&&yCut>r.y&&yCut<r.y+r.height;
-        const axis=xOk&&(!yOk||r.width>=r.height)?'x':yOk?'y':null;
+        const preferX=r.width>maxWidth?(r.height<=maxHeight||r.width/maxWidth>=r.height/maxHeight):(r.height<=maxHeight&&r.width>=r.height);
+        const axis=xOk&&(!yOk||preferX)?'x':yOk?'y':null;
         if(!axis)throw Error('No further lossless block-aligned split is possible');
         if(axis==='x')next.push({...r,width:xCut-r.x},{...r,x:xCut,width:r.x+r.width-xCut});
         else next.push({...r,height:yCut-r.y},{...r,y:yCut,height:r.y+r.height-yCut});
@@ -42,12 +46,14 @@
     return rects;
   }
 
-  async function planParts(width,height,encode,{firstCount=2,onAttempt=()=>{},mime=PNG_MIME,alignment={},priority=()=>0}={}) {
+  async function planParts(width,height,encode,{firstCount=2,onAttempt=()=>{},mime=PNG_MIME,alignment={},priority=()=>0,maxWidth=Infinity,maxHeight=Infinity}={}) {
     for(let count=firstCount;count<=256;count*=2){
       onAttempt(count);const parts=new Array(count);
       // Probe the most complex area first. A bad candidate can then be rejected
       // sooner, without skipping a valid smaller layout or changing output order.
-      const candidates=dyadicRegions(width,height,count,alignment).map((rect,index)=>({rect,index,score:priority(rect)}));
+      const candidates=dyadicRegions(width,height,count,{...alignment,maxWidth,maxHeight}).map((rect,index)=>({rect,index,score:priority(rect)}));
+      // Dimension failures are known without encoding even one candidate.
+      if(candidates.some(({rect})=>rect.width>maxWidth||rect.height>maxHeight))continue;
       candidates.sort((a,b)=>b.score-a.score||a.index-b.index);
       let complete=true;
       for(const {rect,index} of candidates){
@@ -226,6 +232,6 @@
     }
   }
 
-  root.LosslessUpload = { URL_LIMIT, PNG_MIME, payloadBytes, fits, partitions, dyadicRegions, planParts, createUploadQueue,
+  root.LosslessUpload = { URL_LIMIT, PNG_MIME, MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT, dimensionsFit, payloadBytes, fits, partitions, dyadicRegions, planParts, createUploadQueue,
     openSource, encodeRegion, colorMetadata, preserveColor, pngChunks, chunk, jpegProfile };
 })(typeof window !== 'undefined' ? window : globalThis);

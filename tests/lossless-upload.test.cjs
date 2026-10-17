@@ -45,6 +45,16 @@ test('complexity hints reject a bad layout earlier while retaining the smallest 
  assert.equal(whole.length,2);assert.equal(whole[0].x,0);
 });
 
+test('dimension preflight skips impossible layouts without encoding and cuts the constrained axis first',async()=>{
+ let encoded=0;const attempts=[];
+ const limits={maxWidth:L.MAX_IMAGE_WIDTH,maxHeight:L.MAX_IMAGE_HEIGHT};
+ const parts=await L.planParts(16384,8192,async()=>{encoded++;return {type:'image/png',size:100};},{...limits,onAttempt:n=>attempts.push(n)});
+ assert.deepEqual(attempts,[2,4]);assert.equal(encoded,4);assert.ok(parts.every(p=>L.dimensionsFit(p.width,p.height)));
+ const two=await L.planParts(8192,4112,async()=>({type:'image/png',size:100}),limits);
+ assert.equal(two.length,2);assert.ok(two.every(p=>p.width===8192&&p.height===2056));
+ assert.equal(L.dimensionsFit(4096,4096),true);assert.equal(L.dimensionsFit(8192,8192),false);
+});
+
 const marker=(type,data)=>Buffer.concat([Buffer.from([255,type,(data.length+2)>>8,(data.length+2)&255]),data]);
 const fakeJpeg=profile=> {
   const first=profile.subarray(0,75),last=profile.subarray(75);

@@ -1,5 +1,5 @@
 // app.js
-// Test 58: adaptive preparation, independent metadata and immediate source groups.
+// Test 59: adaptive preparation, independent metadata and immediate source groups.
 const { board } = window.miro;
 
 // ---- color / slice settings ----
@@ -8,8 +8,6 @@ const SAT_BOOST = 4.0;
 const SAT_GROUP_THRESHOLD = 35;
 const SLICE_TILE_SIZE = 4096;
 const HUGE_SLICE_TILE_SIZE = 2048;
-const SLICE_THRESHOLD_WIDTH = 8192;
-const SLICE_THRESHOLD_HEIGHT = 4096;
 let MAX_SLICE_DIM = 16384;
 const MAX_URL_BYTES = window.LosslessUpload.URL_LIMIT;
 const CREATE_IMAGE_MAX_RETRIES = 5;
@@ -741,10 +739,11 @@ async function handleStitchSubmit(event) {
       const fallback=sources.find(s=>s.info)?.info||{width:4096,height:4096};
       const infos=sources.map(source=>{
         const info=source.info||fallback,width=info.width,height=info.height;
-        const originalFits=window.LosslessUpload.fits(source.file.size,source.file.type||'application/octet-stream');
-        const needsSlice=!originalFits&&(width>SLICE_THRESHOLD_WIDTH||height>SLICE_THRESHOLD_HEIGHT);
         const baseTiles=Math.ceil(width/SLICE_TILE_SIZE)*Math.ceil(height/SLICE_TILE_SIZE);
         const huge=width>LARGE_IMAGE_WORKER_MIN_DIM||height>LARGE_IMAGE_WORKER_MIN_DIM||baseTiles>=LARGE_IMAGE_WORKER_MIN_TILES;
+        // Ordinary files use the worker's minimal 2/4/8 plan for both byte and
+        // pixel limits. The old fixed 4096 grid caused avoidable extra pieces.
+        const needsSlice=huge;
         return {...info,file:source.file,width,height,needsSlice,sliceTileSize:huge?HUGE_SLICE_TILE_SIZE:SLICE_TILE_SIZE};
       });
       let centers,centerMap;
@@ -779,8 +778,10 @@ async function handleStitchSubmit(event) {
     const result=await window.ImportEngine.run({files,board,scan:window.FastImageScan.scan,layout,
       createPreparer:()=>window.TilePreparation.create(),onProgress,options:{readDataUrl:readOriginalDataUrl}});
     const elapsedMs=showElapsed();
-    window.ImageAlignLastImport={version:58,elapsedMs,workers:result.workers,timings:result.timings,success:result.success,verified:result.verified,totalParts:result.totalParts,passes:result.passes,
-      failures:result.failures,groupErrors:result.groupErrors,boardError:result.boardError,duplicates:result.duplicates};
+    window.ImageAlignLastImport={version:59,elapsedMs,workers:result.workers,timings:result.timings,success:result.success,verified:result.verified,totalParts:result.totalParts,passes:result.passes,
+      failures:result.failures,groupErrors:result.groupErrors,boardError:result.boardError,duplicates:result.duplicates,
+      sources:result.sources.map(s=>({fileName:s.name,fileBytes:s.file.size,width:s.info?.width,height:s.info?.height,
+        modes:[...new Set(s.parts.map(p=>p.region.mode))],parts:s.parts.length,pngReasons:[...new Set(s.parts.map(p=>p.region.reason).filter(Boolean))]}))};
     if(resultEl){
       resultEl.hidden=false;
       if(result.success)resultEl.textContent=`Verified ${result.verified} parts from ${files.length} files.`;
