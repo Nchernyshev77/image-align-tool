@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>JPEG memory64 reserve check · 64</title>
+<style>body{font:16px system-ui;margin:32px}pre{white-space:pre-wrap;background:#f3f4f6;padding:16px}button{padding:10px 16px}</style>
+<h1>JPEG memory64 reserve check · 64</h1>
+<p>One synthetic 34816×34816 JPEG, checked separately to limit simultaneous memory use. No Miro uploads.</p>
+<button id="run">Run 34K reserve check</button><pre id="log">Ready</pre>
+<script src="../lossless-upload.js?v=64"></script>
+<script src="../jpeg-lossless.js?v=64"></script>
+<script src="../fast-image-scan.js?v=56"></script>
+<script src="../tile-preparation.js?v=64"></script>
+<script src="./large-jpeg-fixture.js?v=64"></script>
+<script src="./memory64-checks.js?v=64"></script>
+<script>
+const L=LosslessUpload,lines=[];
+function assert(value,message){if(!value)throw Error(message);}
+function log(message){lines.push(message);document.getElementById('log').textContent=lines.join('\n');}
+document.getElementById('run').onclick=async()=>{
+ document.getElementById('run').disabled=true;lines.length=0;
+ try{await squareMemory64Test([34816]);log('RESERVE CHECK PASSED');}catch(error){log('FAILED: '+error.message);}
+ finally{document.getElementById('run').disabled=false;}
+};
+</script>
