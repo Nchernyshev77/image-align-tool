@@ -1,6 +1,6 @@
 # Verified streaming import — version 64
 
-Test branch: `test/original-upload-52`. Main and the Pages source branch are unchanged.
+Production branch: `main`; GitHub Pages publishes `/` from `main`. The reviewed version 64 is also retained on `test/original-upload-52`.
 
 ## Version 64: automatic memory64 routing
 
@@ -46,7 +46,7 @@ Documented Web SDK limits are 100,000 credits/minute and 1,000,000/hour. Creatin
 
 ## Source dimensions and workspace
 
-The JPEG runtime is rebuilt from pinned libjpeg-turbo 3.2.0 with Emscripten 4.0.21, separate 4 GiB wasm32 and 16 GiB memory64 builds, memory growth, and architecture-aware pointer handling. The declared maxima are 65536 and 262144 pages; preflight leaves a page below each ceiling. Only coefficient-domain open/crop/close operations and a compatibility crop entry point are included; the old downscale/recompression branch is removed. `codec/build.sh` and `.github/workflows/build-jpeg.yml` reproduce the binary. The workflow tests generated files before committing them to the existing test branch.
+The JPEG runtime is rebuilt from pinned libjpeg-turbo 3.2.0 with Emscripten 4.0.21, separate 4 GiB wasm32 and 16 GiB memory64 builds, memory growth, and architecture-aware pointer handling. The declared maxima are 65536 and 262144 pages; preflight leaves a page below each ceiling. Only coefficient-domain open/crop/close operations and a compatibility crop entry point are included; the old downscale/recompression branch is removed. `codec/build.sh` and `.github/workflows/build-jpeg.yml` reproduce the binary. The workflow runs on main and the test branch, tests generated files, and commits any updated codec artifacts back to the branch that triggered it.
 
 Scanning computes native coefficient-buffer sizes from component sampling factors and block counts. Before thumbnail decoding or cropping, estimated workspace (source coefficients + source file bytes + 512 MiB headroom for wasm32 or 1 GiB for memory64) is checked. Crop-buffer estimates are conservative, and actual browser memory availability can still be lower. A source above the estimate fails without resizing or PNG conversion. More pieces do not reduce the native library's whole-source coefficient allocation. Large JPEG sources still use one preparation lane; preparation has a ten-minute deadline for working sets of at least 512 MiB, while ordinary tiles keep two minutes. Closing a large source terminates its native worker so a grown WASM heap is released before the next source. Small sources reuse their native runtime.
 
@@ -64,4 +64,4 @@ Run `node --test tests/*.test.cjs` and syntax checks. New tests cover a 256-sour
 
 `tests/browser-lossless.html` exercises two real background preparation workers, nested JPEG WASM, JPEG-only processing for 4:2:0/4:2:2/4:4:4, actual automatic recovery against a local fake SDK, exact JPEG interior pixels, measured JPEG seam differences, ICC, and a 57.7MB 4096-square PNG in a worker. No synthetic images are sent to Miro. Real large-batch Miro performance must be checked by the user.
 
-Pages remains `test/original-upload-52`, `/ (root)`. To revert: Settings > Pages > main > root > Save, wait for deployment, reopen the Miro app. Do not merge the experiment into main.
+Pages publishes `main`, `/ (root)`. Rollback uses a reviewed revert on main followed by the normal Pages deployment. The test branch retains the reviewed version 64 snapshot.

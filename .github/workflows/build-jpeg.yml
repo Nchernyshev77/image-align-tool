@@ -1,7 +1,7 @@
 name: Build native JPEG codec
 on:
   push:
-    branches: [test/original-upload-52]
+    branches: [main, test/original-upload-52]
     paths: [codec/**, jpeg-lossless.js, jpeg-lossless-worker.js, tile-preparation.js, tile-prepare-worker.js, tests/**, .github/workflows/build-jpeg.yml]
 permissions:
   contents: write
@@ -40,4 +40,4 @@ jobs:
           git add vendor/jpegcropscale/jpeg_worker*.js vendor/jpegcropscale/jpeg_worker*.wasm
           if git diff --cached --quiet; then exit 0; fi
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Build verified native JPEG codecs for wasm32 and memory64'
-          git push origin HEAD:refs/heads/test/original-upload-52
+          git push origin "HEAD:${GITHUB_REF}"
