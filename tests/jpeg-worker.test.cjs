@@ -16,17 +16,23 @@ function quantizationTables(bytes){
  }
  return tables;
 }
-function workerHarness(){
- const root=path.resolve(__dirname,'..');let req=0,waiting;
+function workerHarness({memory64Supported=true,reserveAbove4GiB=false}={}){
+ const root=path.resolve(__dirname,'..');let req=0,waiting,reservation=0;
  const context=vm.createContext({require,process,__dirname:path.join(root,'vendor/jpegcropscale'),console,
-   Uint8Array,Uint32Array,ArrayBuffer,WebAssembly,URL,TextDecoder,TextEncoder,performance,setTimeout,clearTimeout,
+   Uint8Array,Uint32Array,ArrayBuffer,WebAssembly:memory64Supported?WebAssembly:{validate:()=>false},URL,TextDecoder,TextEncoder,performance,setTimeout,clearTimeout,
    location:{href:'file://'+path.join(root,'jpeg-lossless-worker.js')},
    postMessage:message=>{if(message.error)waiting.reject(Error(message.error));else waiting.resolve(message);},
  });
  vm.runInContext('self=globalThis',context);
- context.importScripts=(...files)=>{for(const f of files)vm.runInContext(fs.readFileSync(path.resolve(root,f.split('?')[0]),'utf8'),context);};
+ context.importScripts=(...files)=>{for(const f of files){
+  if(reserveAbove4GiB&&f.includes('jpeg_worker64.js')){
+   const ready=context.Module.onRuntimeInitialized;
+   context.Module.onRuntimeInitialized=()=>{reservation=context.Module._malloc(4n*1024n**3n);assert(reservation,'64-bit address reservation failed');ready();};
+  }
+  vm.runInContext(fs.readFileSync(path.resolve(root,f.split('?')[0]),'utf8'),context);
+ }};
  vm.runInContext(fs.readFileSync(path.join(root,'jpeg-lossless-worker.js'),'utf8'),context);
- return {call:message=>new Promise((resolve,reject)=>{waiting={resolve,reject};context.onmessage({data:{...message,req:++req}}).catch(reject);})};
+ return {call:message=>new Promise((resolve,reject)=>{waiting={resolve,reject};context.onmessage({data:{...message,req:++req}}).catch(reject);}),dispose(){if(reservation)context.Module._free(BigInt(reservation));reservation=0;}};
 }
 
 test('JPEG header permits coefficient cropping for 4:2:0 and records chroma seam axes and EXIF rotation',()=>{
@@ -37,11 +43,11 @@ test('JPEG header permits coefficient cropping for 4:2:0 and records chroma seam
  assert.equal(J.info(Buffer.from(fixtures.orientation6,'base64')).eligible,false);
 });
 
-test('production JPEG worker runs vendored WASM, keeps dimensions/ICC, and rejects invalid crop boundaries',async()=>{
- const worker=workerHarness();
+for(const wide of [false,true])test(`production ${wide?'memory64':'wasm32'} JPEG worker keeps dimensions/ICC and rejects invalid crop boundaries`,async()=>{
+ const worker=workerHarness({reserveAbove4GiB:wide});
  for(const type of ['444','422','420']){
   const bytes=Buffer.from(fixtures[type],'base64'),meta=J.info(bytes),profile=L.jpegProfile(bytes);
-  await worker.call({type:'open',buffer:bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength)});
+  const opened=await worker.call({type:'open',wide,buffer:bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength)});if(wide)assert(opened.heapBytes>4*1024**3);
   for(const count of [2,4,8])for(const rect of L.dyadicRegions(meta.width,meta.height,count,J.cropAlignment(meta))){
    const result=await worker.call({type:'crop',rect}),out=new Uint8Array(result.buffer),outputMeta=J.info(out);
    assert.equal(outputMeta.width,rect.width);assert.equal(outputMeta.height,rect.height);
@@ -57,7 +63,7 @@ test('production JPEG worker runs vendored WASM, keeps dimensions/ICC, and rejec
   assert.deepEqual(new Uint8Array(after.buffer),new Uint8Array(before.buffer),'Cached coefficients must survive other crops and rejected boundaries');
   await worker.call({type:'close'});
  }
- await assert.rejects(worker.call({type:'crop',rect:{x:0,y:0,width:32,height:32}}),/not open/);
+ await assert.rejects(worker.call({type:'crop',rect:{x:0,y:0,width:32,height:32}}),/not open/);worker.dispose();
 });
 
 test('EXIF thumbnail offsets address the original bytes and malformed optional thumbnails are ignored',()=>{
@@ -98,7 +104,7 @@ test('4:2:2 prefers exact horizontal seams but can cut across chroma when pixel 
  assert.ok(forced.every(r=>r.width===8192&&r.height===4096));
 });
 
-test('4 GiB preflight accepts large 16K inputs and rejects sources exceeding the rebuilt heap',async()=>{
+test('workspace routing keeps small files on wasm32, accepts 32K with reserve and rejects oversized working sets',async()=>{
  const {jpeg}=require('./large-jpeg-fixture');
  for(const sampling of ['420','444']){
   const bytes=jpeg(16384,16384,sampling),meta=J.info(bytes);
@@ -108,8 +114,12 @@ test('4 GiB preflight accepts large 16K inputs and rejects sources exceeding the
  }
  const strip=jpeg(32768,4096),stripMeta=J.info(strip);assert.ok(J.assertWorkspace(stripMeta,strip.length)<J.HEAP_BYTES);
  const square=jpeg(32768,32768,'444'),squareMeta=J.info(square);assert.equal(squareMeta.coefficientBytes,6*1024**3);
- assert.throws(()=>J.assertWorkspace(squareMeta,square.length),/4 GiB/);
- const worker=workerHarness();await assert.rejects(worker.call({type:'open',buffer:square.buffer}),/4 GiB/);
+ assert(J.needsMemory64(squareMeta,square.length));assert(J.assertWorkspace(squareMeta,2*1024**3)<J.HEAP_BYTES);
+ const reserve=J.info(jpeg(36864,36864,'444'));assert(J.assertWorkspace(reserve,3*1024**3)<J.HEAP_BYTES);
+ assert(!J.needsMemory64(J.info(jpeg(4096,4096,'444')),18000000));
+ const enormous=jpeg(65500,65500,'444'),enormousMeta=J.info(enormous);assert.throws(()=>J.assertWorkspace(enormousMeta,enormous.length),/16 GiB/);
+ const worker=workerHarness();await assert.rejects(worker.call({type:'open',buffer:enormous.buffer}),/16 GiB/);
+ const unsupported=workerHarness({memory64Supported:false});await assert.rejects(unsupported.call({type:'open',buffer:square.buffer}),/does not support 64-bit/);
 });
 
 test('large JPEG close terminates the native worker to release its grown WASM heap',async()=>{
@@ -132,4 +142,13 @@ test('large preparation gets ten minutes while ordinary tiles keep the two-minut
  require('../tile-preparation');
  assert.equal(globalThis.TilePreparation.timeoutFor({size:28000000},{width:4096,height:4096,jpeg:{coefficientBytes:96*1024**2}}),120000);
  assert.equal(globalThis.TilePreparation.timeoutFor({size:300000000},{width:16384,height:16384,jpeg:{coefficientBytes:1536*1024**2}}),600000);
+});
+
+
+test('local JPEG loading uses bounded File slices without a complete outside-WASM read',async()=>{
+ const bytes=Buffer.from(fixtures['444'],'base64'),blob=new Blob([bytes,new Uint8Array(17*1024**2)]),reads=[];
+ const file={size:blob.size,arrayBuffer(){throw Error('Full source read is forbidden');},slice(start,end){reads.push(end-start);return blob.slice(start,end);}};
+ const worker=workerHarness();await worker.call({type:'open',file});
+ const result=await worker.call({type:'crop',rect:{x:0,y:0,width:32,height:32}});
+ assert.equal(J.info(new Uint8Array(result.buffer)).width,32);assert(reads.length>=3);assert(Math.max(...reads)<=16*1024**2);await worker.call({type:'close'});
 });

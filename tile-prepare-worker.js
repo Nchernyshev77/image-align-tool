@@ -1,10 +1,22 @@
 'use strict';
-importScripts('./lossless-upload.js?v=63','./jpeg-lossless.js?v=63');
+importScripts('./lossless-upload.js?v=64','./jpeg-lossless.js?v=64');
 const jpeg=JpegLossless.create();
-async function tone(file,info){
+async function coefficientPreview(meta){
+ const canvas=new OffscreenCanvas(50,50),ctx=canvas.getContext('2d');
+ for(let y=0;y<5;y++)for(let x=0;x<5;x++){
+  const width=Math.min(128,meta.width),height=Math.min(128,meta.height);
+  const sx=Math.floor(Math.max(0,Math.min(meta.width-width,(x+0.5)*meta.width/5-width/2))/meta.mcuX)*meta.mcuX;
+  const sy=Math.floor(Math.max(0,Math.min(meta.height-height,(y+0.5)*meta.height/5-height/2))/meta.mcuY)*meta.mcuY;
+  const blob=await jpeg.crop({x:sx,y:sy,width,height}),image=await createImageBitmap(blob,{resizeWidth:10,resizeHeight:10});
+  try{ctx.drawImage(image,x*10,y*10,10,10);}finally{image.close();}
+ }
+ return canvas.transferToImageBitmap();
+}
+async function tone(file,info,preview){
  let image;
  const thumbnail=info.jpeg?.thumbnail;
  if(thumbnail)try{image=await createImageBitmap(file.slice(thumbnail.offset,thumbnail.offset+thumbnail.length,'image/jpeg'),{resizeWidth:50,resizeHeight:50});}catch{}
+ if(!image&&preview)image=await preview();
  if(!image)image=await createImageBitmap(file,{resizeWidth:50,resizeHeight:50});
  try{
   const canvas=new OffscreenCanvas(50,50),ctx=canvas.getContext('2d',{willReadFrequently:true});ctx.drawImage(image,0,0,50,50);
@@ -35,7 +47,11 @@ self.onmessage=async e=>{
    JpegLossless.assertWorkspace(meta,file.size);
   }
   progress(info.jpeg?.thumbnail?'Reading embedded preview…':'Reading image preview…');
-  const toneStarted=performance.now(),colors=await tone(file,info);
+  const preview=needsTransform&&meta&&meta.coefficientBytes>=512*1024**2?async()=>{
+   if(!jpegOpened){progress('Reading JPEG coefficients once…');meta=await jpeg.open(file,meta);jpegOpened=true;}
+   progress('Preparing a small JPEG preview…');return coefficientPreview(meta);
+  }:null;
+  const toneStarted=performance.now(),colors=await tone(file,info,preview);
   timings.toneMs=performance.now()-toneStarted;
   for(const job of jobs){
    const full=job.kind==='full',width=full?job.width:job.sw,height=full?job.height:job.sh;

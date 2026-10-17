@@ -1,8 +1,8 @@
 // JPEG coefficient cropping client. All image processing stays on this device.
 (function(root){
   'use strict';
-  // Leave one WASM page below 4 GiB, matching Emscripten's usable heap maximum.
-  const HEAP_BYTES=4294901760,WORKSPACE_HEADROOM=512*1024*1024;
+  // Memory is grown on demand. Retain the wasm32 runtime for ordinary files.
+  const SMALL_HEAP_BYTES=4294901760,HEAP_BYTES=16*1024**3-65536,WORKSPACE_HEADROOM=512*1024**2;
   function info(bytes){
     if(bytes[0]!==255||bytes[1]!==216)throw Error('Invalid JPEG');
     let result,orientation=1,thumbnail;
@@ -62,17 +62,39 @@
     return {mcuX:meta.mcuX,mcuY:meta.mcuY,safeX:true,safeY:true,
       preferredAxis:!meta.safeX&&meta.safeY?'y':meta.safeX&&!meta.safeY?'x':null};
   }
-  function workspaceBytes(meta,fileBytes=0){return (meta.coefficientBytes??meta.width*meta.height*6)+fileBytes+WORKSPACE_HEADROOM;}
+  async function readHeader(file){
+    let size=Math.min(file.size,65536);
+    while(true){
+      const bytes=new Uint8Array(await file.slice(0,size).arrayBuffer());
+      if(bytes[0]!==255||bytes[1]!==216)throw Error('Invalid JPEG');
+      let p=2,complete=false;
+      while(p+4<=bytes.length){
+        if(bytes[p++]!==255)throw Error('Invalid JPEG marker');while(bytes[p]===255)p++;
+        const marker=bytes[p++];if(marker===0xda||marker===0xd9){complete=true;break;}
+        if(marker===1||(marker>=0xd0&&marker<=0xd7))continue;
+        const length=(bytes[p]<<8)|bytes[p+1];if(length<2)throw Error('Invalid JPEG marker');
+        if(p+length>bytes.length)break;p+=length;
+      }
+      if(complete)return {bytes,meta:info(bytes)};
+      if(size>=file.size)throw Error('Truncated JPEG header');size=Math.min(file.size,size*4);
+    }
+  }
+  function workspaceBytes(meta,fileBytes=0){
+    const base=(meta.coefficientBytes??meta.width*meta.height*6)+fileBytes;
+    return base+(base+WORKSPACE_HEADROOM>SMALL_HEAP_BYTES?1024**3:WORKSPACE_HEADROOM);
+  }
+  function needsMemory64(meta,fileBytes=0){return workspaceBytes(meta,fileBytes)>SMALL_HEAP_BYTES;}
   function assertWorkspace(meta,fileBytes=0){
     const bytes=workspaceBytes(meta,fileBytes);
-    if(bytes>HEAP_BYTES)throw Error(`Estimated workspace for JPEG ${meta.width}×${meta.height} exceeds the current 4 GiB processing limit; resolution was not reduced`);
+    if(bytes>HEAP_BYTES)throw Error(`Estimated workspace for JPEG ${meta.width}×${meta.height} exceeds the 16 GiB processing limit; resolution was not reduced`);
     return bytes;
   }
-  function create({workerUrl='./jpeg-lossless-worker.js?v=63'}={}){
-    let worker,req=0,releaseOnClose=false,peakHeapBytes=0;const pending=new Map();
+  function create({workerUrl='./jpeg-lossless-worker.js?v=64'}={}){
+    let worker,workerWide=false,req=0,releaseOnClose=false,peakHeapBytes=0;const pending=new Map();
     function dispose(){if(worker)worker.terminate();worker=null;for(const p of pending.values())p.reject(Error('JPEG worker disposed'));pending.clear();releaseOnClose=false;}
     function call(message,transfer=[]){
-      if(!worker){worker=new Worker(workerUrl);
+      if(message.type==='open'&&worker&&workerWide!==message.wide)dispose();
+      if(!worker){workerWide=!!message.wide;worker=new Worker(workerUrl);
         worker.onmessage=e=>{const waiter=pending.get(e.data.req);if(!waiter)return;pending.delete(e.data.req);peakHeapBytes=Math.max(peakHeapBytes,e.data.heapBytes||0);e.data.error?waiter.reject(Error(e.data.error)):waiter.resolve(e.data);};
         worker.onerror=e=>{for(const p of pending.values())p.reject(Error(e.message||'JPEG worker failed'));pending.clear();worker.terminate();worker=null;};}
       return new Promise((resolve,reject)=>{const id=++req;pending.set(id,{resolve,reject});worker.postMessage({...message,req:id},transfer);});
@@ -81,15 +103,15 @@
       async open(file,scannedMeta){
         peakHeapBytes=0;
         if(scannedMeta)assertWorkspace(scannedMeta,file.size);
-        const buffer=await file.arrayBuffer(),meta=info(new Uint8Array(buffer));
-        assertWorkspace(meta,buffer.byteLength);
-        releaseOnClose=meta.coefficientBytes+buffer.byteLength>=512*1024*1024;
-        if(meta.eligible)await call({type:'open',buffer},[buffer]);return meta;},
+        const meta=scannedMeta||(await readHeader(file)).meta;
+        assertWorkspace(meta,file.size);
+        releaseOnClose=meta.coefficientBytes+file.size>=512*1024*1024;
+        if(meta.eligible)try{await call({type:'open',file,wide:needsMemory64(meta,file.size)});}finally{releaseOnClose=meta.coefficientBytes+file.size>=512*1024*1024;}return meta;},
       async crop(rect){const result=await call({type:'crop',rect});return new Blob([result.buffer],{type:'image/jpeg'});},
       async close(){if(releaseOnClose)dispose();else if(worker)await call({type:'close'});},
       get peakHeapBytes(){return peakHeapBytes;},
       dispose,
     };
   }
-  root.JpegLossless={info,create,cropAlignment,workspaceBytes,assertWorkspace,HEAP_BYTES};
+  root.JpegLossless={info,create,cropAlignment,workspaceBytes,assertWorkspace,readHeader,needsMemory64,HEAP_BYTES,SMALL_HEAP_BYTES};
 })(typeof window==='undefined'?globalThis:window);
