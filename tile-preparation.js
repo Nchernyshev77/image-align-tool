@@ -1,6 +1,6 @@
 (function(root){
  'use strict';
- function create({workerUrl='./tile-prepare-worker.js?v=59'}={}){
+ function create({workerUrl='./tile-prepare-worker.js?v=60'}={}){
   let worker,req=0,pending,timer;
   return {
    prepare(file,info,jobs){

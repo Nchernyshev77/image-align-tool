@@ -1,5 +1,5 @@
 'use strict';
-importScripts('./lossless-upload.js?v=59','./jpeg-lossless.js?v=55');
+importScripts('./lossless-upload.js?v=60','./jpeg-lossless.js?v=60');
 const jpeg=JpegLossless.create();
 async function tone(file){
  const image=await createImageBitmap(file,{resizeWidth:50,resizeHeight:50});
@@ -25,7 +25,12 @@ self.onmessage=async e=>{
   const colors=await tone(file);
   timings.toneMs=performance.now()-started;
   const needsTransform=jobs.some(j=>j.kind!=='full'||!LosslessUpload.fits(file.size,file.type||'application/octet-stream')||!LosslessUpload.dimensionsFit(j.width,j.height));
-  if(needsTransform&&/image\/jpe?g/i.test(file.type)){meta=info.jpeg;if(!meta){meta=await jpeg.open(file);jpegOpened=true;}}
+  const isJpeg=!!info.jpeg||/image\/jpe?g/i.test(file.type)||(!file.type&&/\.(jpe?g|jfif)$/i.test(file.name||''));
+  if(needsTransform&&isJpeg){
+   meta=info.jpeg;if(!meta){meta=await jpeg.open(file);jpegOpened=meta.eligible;}
+   if(!meta.eligible)throw Error(meta.reason||'Unsupported JPEG slicing; no PNG conversion is used');
+   if(meta.width!==info.width||meta.height!==info.height)throw Error('JPEG dimensions differ; refusing to resize or convert');
+  }
   for(const job of jobs){
    const full=job.kind==='full',width=full?job.width:job.sw,height=full?job.height:job.sh;
    const sourceX=full?0:job.sx,sourceY=full?0:job.sy;
@@ -40,13 +45,10 @@ self.onmessage=async e=>{
    let mode='original',parts,reason,attempts=[];
    if(full&&LosslessUpload.fits(file.size,file.type||'application/octet-stream')&&LosslessUpload.dimensionsFit(width,height))parts=[{x:0,y:0,width,height,original:true,size:file.size,mime:file.type}];
    else{
-    const safe=meta&&meta.eligible&&meta.width===info.width&&meta.height===info.height&&
-     (width<=LosslessUpload.MAX_IMAGE_WIDTH||meta.safeX)&&(height<=LosslessUpload.MAX_IMAGE_HEIGHT||meta.safeY)&&
-     (meta.safeX||(sourceX===0&&width===meta.width))&&(meta.safeY||(sourceY===0&&height===meta.height));
-    if(safe){if(!jpegOpened){meta=await jpeg.open(file);jpegOpened=true;}mode='lossless-jpeg';parts=await LosslessUpload.planParts(width,height,measured(r=>jpeg.crop({...r,x:r.x+sourceX,y:r.y+sourceY})),
-     {...limits,mime:'image/jpeg',alignment:meta,priority,firstCount:full?2:1,onAttempt:n=>attempts.push(n)});}
+    if(isJpeg){if(!jpegOpened){meta=await jpeg.open(file);jpegOpened=true;}mode='lossless-jpeg';parts=await LosslessUpload.planParts(width,height,measured(r=>jpeg.crop({...r,x:r.x+sourceX,y:r.y+sourceY})),
+     {...limits,mime:'image/jpeg',alignment:JpegLossless.cropAlignment(meta),priority,firstCount:full?2:1,onAttempt:n=>attempts.push(n)});}
     else{
-     mode='lossless-png';reason=meta&&(meta.reason||'Crop edges require PNG');
+     mode='lossless-png';
      if(!source){source=await LosslessUpload.openSource(file);if(source.image.width!==info.width||source.image.height!==info.height)throw Error('Decoded dimensions differ; refusing to resize');}
      parts=await LosslessUpload.planParts(width,height,measured(r=>LosslessUpload.encodeRegion(source,{...r,x:r.x+sourceX,y:r.y+sourceY})),
       {...limits,priority,firstCount:full?2:1,onAttempt:n=>attempts.push(n)});

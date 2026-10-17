@@ -26,7 +26,7 @@
     });
   }
 
-  function dyadicRegions(width,height,count,{mcuX=1,mcuY=1,safeX=true,safeY=true,maxWidth=Infinity,maxHeight=Infinity}={}) {
+  function dyadicRegions(width,height,count,{mcuX=1,mcuY=1,safeX=true,safeY=true,maxWidth=Infinity,maxHeight=Infinity,preferredAxis=null}={}) {
     if(![width,height,count,mcuX,mcuY].every(Number.isSafeInteger)||width<1||height<1||count<1||(count&(count-1)))throw Error('Invalid binary partition');
     let rects=[{x:0,y:0,width,height}];
     while(rects.length<count){
@@ -35,7 +35,7 @@
         const xCut=Math.floor((r.x+r.width/2)/mcuX)*mcuX;
         const yCut=Math.floor((r.y+r.height/2)/mcuY)*mcuY;
         const xOk=safeX&&xCut>r.x&&xCut<r.x+r.width,yOk=safeY&&yCut>r.y&&yCut<r.y+r.height;
-        const preferX=r.width>maxWidth?(r.height<=maxHeight||r.width/maxWidth>=r.height/maxHeight):(r.height<=maxHeight&&r.width>=r.height);
+        const preferX=r.width>maxWidth?(r.height<=maxHeight||r.width/maxWidth>=r.height/maxHeight):r.height>maxHeight?false:preferredAxis?preferredAxis==='x':r.width>=r.height;
         const axis=xOk&&(!yOk||preferX)?'x':yOk?'y':null;
         if(!axis)throw Error('No further lossless block-aligned split is possible');
         if(axis==='x')next.push({...r,width:xCut-r.x},{...r,x:xCut,width:r.x+r.width-xCut});

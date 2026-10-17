@@ -30,11 +30,17 @@
     }
     if(!result)throw Error('JPEG dimensions missing');
     result.orientation=orientation;
-    result.eligible=orientation===1&&(result.safeX||result.safeY);
-    result.reason=orientation!==1?'EXIF orientation requires PNG':!result.eligible?'Subsampled chroma needs PNG to preserve seam pixels':null;
+    // All supported sampling modes can be cropped in the coefficient domain.
+    // safeX/safeY describe exact RGB seam rendering, not transform eligibility.
+    result.eligible=orientation===1;
+    result.reason=orientation!==1?'JPEG slicing with EXIF rotation is not supported; no PNG conversion is used':null;
     return result;
   }
-  function create({workerUrl='./jpeg-lossless-worker.js?v=55'}={}){
+  function cropAlignment(meta){
+    return {mcuX:meta.mcuX,mcuY:meta.mcuY,safeX:true,safeY:true,
+      preferredAxis:!meta.safeX&&meta.safeY?'y':meta.safeX&&!meta.safeY?'x':null};
+  }
+  function create({workerUrl='./jpeg-lossless-worker.js?v=60'}={}){
     let worker,req=0;const pending=new Map();
     function call(message,transfer=[]){
       if(!worker){worker=new Worker(workerUrl);
@@ -50,5 +56,5 @@
       dispose(){if(worker)worker.terminate();worker=null;for(const p of pending.values())p.reject(Error('JPEG worker disposed'));pending.clear();},
     };
   }
-  root.JpegLossless={info,create};
+  root.JpegLossless={info,create,cropAlignment};
 })(typeof window==='undefined'?globalThis:window);

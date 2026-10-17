@@ -1,5 +1,5 @@
 'use strict';
-importScripts('./lossless-upload.js?v=55','./jpeg-lossless.js?v=55');
+importScripts('./lossless-upload.js?v=60','./jpeg-lossless.js?v=60');
 let runtime,inputPtr=0,inputSize=0,sourceInfo,profile;
 function load(){
   if(runtime)return runtime;
