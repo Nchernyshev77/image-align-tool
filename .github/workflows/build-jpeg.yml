@@ -1,0 +1,39 @@
+name: Build native JPEG codec
+on:
+  push:
+    branches: [test/original-upload-52]
+    paths: [codec/**, .github/workflows/build-jpeg.yml]
+permissions:
+  contents: write
+concurrency:
+  group: jpeg-codec-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Emscripten SDK
+        shell: bash
+        run: |
+          git clone --depth 1 --branch 4.0.21 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/image-align-emsdk"
+          test "$(git -C "$RUNNER_TEMP/image-align-emsdk" rev-parse HEAD)" = b2436aafa7351ee1b581f15841f1b45ed716a279
+          "$RUNNER_TEMP/image-align-emsdk/emsdk" install 4.0.21
+          "$RUNNER_TEMP/image-align-emsdk/emsdk" activate 4.0.21
+      - name: Build 4 GiB coefficient crop module
+        shell: bash
+        run: |
+          source "$RUNNER_TEMP/image-align-emsdk/emsdk_env.sh"
+          bash codec/build.sh
+      - name: Verify native JPEG quality and memory above 2 GiB
+        run: |
+          node --test tests/*.test.cjs
+          node codec/verify-build.cjs
+      - name: Commit verified generated codec
+        shell: bash
+        run: |
+          git add vendor/jpegcropscale/jpeg_worker.js vendor/jpegcropscale/jpeg_worker.wasm
+          if git diff --cached --quiet; then exit 0; fi
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Build verified 4 GiB native JPEG coefficient crop codec'
+          git push origin HEAD:refs/heads/test/original-upload-52
